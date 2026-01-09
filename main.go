@@ -79,9 +79,8 @@ var (
 	procAttachThreadInput = user32.NewProc("AttachThreadInput")
 
 	procPostMessage = user32.NewProc("PostMessageW")
-	
-	procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 
+	procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 )
 
 /* ---------------- Constants ---------------- */
@@ -107,13 +106,12 @@ const (
 	WM_MBUTTONDOWN = 0x0207
 	HWND_BOTTOM    = uintptr(1) // good
 	//HWND_TOP       = ^uintptr(1) // (HWND)-1  bad AI
-	HWND_TOP        = uintptr(0) // good
-	
-    HWND_TOPMOST   = ^uintptr(0) // (HWND)-1
-    HWND_NOTOPMOST = ^uintptr(1) // (HWND)-2
-    //HWND_TOP       = ^uintptr(2) // (HWND)-3 bad 
-    //HWND_BOTTOM    = ^uintptr(3) // (HWND)-4 bad, gg AI
+	HWND_TOP = uintptr(0) // good
 
+	HWND_TOPMOST   = ^uintptr(0) // (HWND)-1
+	HWND_NOTOPMOST = ^uintptr(1) // (HWND)-2
+	//HWND_TOP       = ^uintptr(2) // (HWND)-3 bad
+	//HWND_BOTTOM    = ^uintptr(3) // (HWND)-4 bad, gg AI
 
 )
 
@@ -749,35 +747,35 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			return 1 // swallow MMB
 		} else {
 			if winAndShiftOnlyAreDown() {
-				hwnd := windowFromPoint(info.Pt)
+				//hwnd := windowFromPoint(info.Pt) // window under cursor
+				hwnd, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
 				if hwnd != 0 {
 					//logf("oh yea")
 					// Bring to front, no activation, works only for the currently focused window which was sent to back before
-					//has no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 ! 
+					//has no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 !
 					procSetWindowPos.Call(
-					uintptr(hwnd),
-					HWND_TOP,
-					0, 0, 0, 0,
-					SWP_NOMOVE|SWP_NOSIZE,//|SWP_NOACTIVATE,
+						uintptr(hwnd),
+						HWND_TOP,
+						0, 0, 0, 0,
+						SWP_NOMOVE|SWP_NOSIZE, //|SWP_NOACTIVATE,
 					)
-					
+
 					// // Step 1: temporarily force topmost
-// procSetWindowPos.Call(
-    // uintptr(hwnd),
-    // HWND_TOPMOST,
-    // 0, 0, 0, 0,
-    // SWP_NOMOVE|SWP_NOSIZE,
-// )
+					// procSetWindowPos.Call(
+					// uintptr(hwnd),
+					// HWND_TOPMOST,
+					// 0, 0, 0, 0,
+					// SWP_NOMOVE|SWP_NOSIZE,
+					// )
 
-// // Step 2: immediately remove topmost
-// procSetWindowPos.Call(
-    // uintptr(hwnd),
-    // HWND_NOTOPMOST,
-    // 0, 0, 0, 0,
-    // SWP_NOMOVE|SWP_NOSIZE,
-// )
+					// // Step 2: immediately remove topmost
+					// procSetWindowPos.Call(
+					// uintptr(hwnd),
+					// HWND_NOTOPMOST,
+					// 0, 0, 0, 0,
+					// SWP_NOMOVE|SWP_NOSIZE,
+					// )
 
-					
 					// // Step 1: Activate desktop, ie. defocus current window.
 					// desktop, _, _ := procGetDesktopWindow.Call()
 					//logf("desktop hwnd = 0x%x", desktop)
