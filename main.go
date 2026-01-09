@@ -316,6 +316,8 @@ var (
 	shiftDown atomic.Bool
 	ctrlDown  atomic.Bool
 	altDown   atomic.Bool
+
+	winGestureUsed atomic.Bool //false initially
 )
 
 var (
@@ -657,6 +659,10 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		//if winKeyDown() {
 		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
 		if winOnlyIsDown() { // only if winkey without any modifiers
+			if !winGestureUsed.Load() { //wasn't set already
+				winGestureUsed.Store(true) // we used at least once of our gestures
+			}
+
 			// we don't want to trigger our drag if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
 			// if !swallowNextWinUp.Load() {
 			// swallowNextWinUp.Store(true)
@@ -733,6 +739,9 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		//if winKeyDown() {
 		//if winDownSeen.Load() {
 		if winOnlyIsDown() {
+			if !winGestureUsed.Load() { //wasn't set already
+				winGestureUsed.Store(true) // we used at least once of our gestures
+			}
 			hwnd := windowFromPoint(info.Pt)
 			if hwnd != 0 {
 				// Send to back, no activation
@@ -745,8 +754,12 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				)
 			}
 			return 1 // swallow MMB
-		} else {
+		} else { //FIXME, obviously DRY these two 'if' branches into one! soon!
 			if winAndShiftOnlyAreDown() {
+				if !winGestureUsed.Load() { //wasn't set already
+					winGestureUsed.Store(true) // we used at least once of our gestures
+				}
+
 				//hwnd := windowFromPoint(info.Pt) // window under cursor
 				hwnd, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
 				if hwnd != 0 {
@@ -1305,6 +1318,12 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 				*/
 				winDown.Store(false)
+				if !winGestureUsed.Load() {
+					// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
+					return 0 // pass thru the winkeyUP
+				}
+				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
+				winGestureUsed.Store(false) // gesture ends with winkey_UP
 				// • Injecting input from inside a WH_KEYBOARD_LL hook is documented as undefined.
 				// great, it was correct and other do it before, but now it's bad!
 				//injectShiftTapThenWinUp(uint16(vk)) // it's correct casting, as per AI.
