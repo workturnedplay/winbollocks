@@ -736,29 +736,30 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
-		//if winKeyDown() {
-		//if winDownSeen.Load() {
-		if winOnlyIsDown() {
+		if winDown.Load() && !ctrlDown.Load() && !altDown.Load() {
+			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
 			if !winGestureUsed.Load() { //wasn't set already
 				winGestureUsed.Store(true) // we used at least once of our gestures
 			}
-			hwnd := windowFromPoint(info.Pt)
-			if hwnd != 0 {
-				// Send to back, no activation
-				// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
-				procSetWindowPos.Call(
-					uintptr(hwnd),
-					HWND_BOTTOM,
-					0, 0, 0, 0,
-					SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-				)
-			}
-			return 1 // swallow MMB
-		} else { //FIXME, obviously DRY these two 'if' branches into one! soon!
-			if winAndShiftOnlyAreDown() {
-				if !winGestureUsed.Load() { //wasn't set already
-					winGestureUsed.Store(true) // we used at least once of our gestures
+			if !shiftDown.Load() {
+				// winkey_DOWN but no other modifiers(including shift) is down
+				// and LMB is down, ofc, then we start move window gesture:
+
+				hwnd := windowFromPoint(info.Pt)
+				if hwnd != 0 {
+					// Send to back, no activation
+					// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
+					procSetWindowPos.Call(
+						uintptr(hwnd),
+						HWND_BOTTOM,
+						0, 0, 0, 0,
+						SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+					)
 				}
+			} else {
+				// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
+				// but no other modifiers like ctrl or alt are down
+				// then we start the bring focused window to front gesture:
 
 				//hwnd := windowFromPoint(info.Pt) // window under cursor
 				hwnd, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
@@ -797,11 +798,11 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					// // Step 2: Activate the same window that was focused.
 					// procSetForegroundWindow.Call(uintptr(hwnd))
 				}
-				return 1 // swallow MMB
-			}
-		}
+			} // else
+			return 1 // swallow MMB
+		} // the 'if' in MMB
 
-	}
+	} //switch
 
 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
 	return ret
