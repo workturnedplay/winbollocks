@@ -729,9 +729,6 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			targetWnd = 0
 			procReleaseCapture.Call()
 
-			// swallowNextWinUp.Store(false) // 🔥 REQUIRED
-			// winDownSeen.Store(false)       // optional but sane
-
 			return 0 //0 is to let it thru (1 was to swallow)
 		}
 
@@ -931,8 +928,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam 
 })
 
 func exit(code int) {
-	//swallowNextWinUp.Store(false)
-	//winDownSeen.Store(false)
+
 	//TODO: add the others?
 	capturing.Store(false)
 	procReleaseCapture.Call()
@@ -1255,7 +1251,7 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 		case VK_LWIN, VK_RWIN:
 			winDown.Store(true)
-		//case VK_SHIFT: // Low-level keyboard hooks do NOT reliably deliver VK_SHIFT. VK_SHIFT is a virtual aggregation key used by higher-level APIs (like GetKeyState), not by the LL hook stream.
+		//case VK_SHIFT: // Low-level keyboard hooks do NOT reliably(read: at all) deliver VK_SHIFT. VK_SHIFT is a virtual aggregation key used by higher-level APIs (like GetKeyState), not by the LL hook stream.
 		case VK_LSHIFT, VK_RSHIFT:
 			shiftDown.Store(true)
 		case VK_LCONTROL, VK_RCONTROL:
@@ -1271,36 +1267,27 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		case VK_LWIN, VK_RWIN:
 			/*
 			   You now have this pipeline:
-
 			   Detect real Win-UP
-
 			   If no other modifiers are physically down:
-
 			   Inject RShift down
-
 			   Inject RShift up
-
 			   Inject the swallowed Win-UP
-
 			   Return 1 from the hook to suppress the original Win-UP
-
 			   Ignore injected events via LLKHF_INJECTED
-
 			   This satisfies all constraints:
-
 			   Start menu suppressed
-
 			   Win state restored
-
 			   No stuck modifiers
-
 			   No dependence on timers
-
 			   No reliance on Explorer heuristics
-
 			   Deterministic behavior
 			*/
-			if winOnlyIsDown() {
+
+			//nolint:staticcheck,QF1011 // QF1011: could omit type bool from declaration; it will be inferred
+			var checkBefore bool = winOnlyIsDown()
+			winDown.Store(false)
+
+			if checkBefore {
 				//was winkey DOWN (ie. held/pressed) until now and no other modifiers like alt/shift/ctrl were too?!
 				//then we can insert a shift DOWN then shift UP which would cause the winkey UP to not trigger Start menu popup!
 				/*“Could another key sneak in during the injection?”
@@ -1318,7 +1305,7 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				the user pressed and held shift and now we cancelled it so he has to repress it to be seen as held again.
 
 				*/
-				winDown.Store(false)
+
 				if !winGestureUsed.Load() {
 					// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
 					return 0 // pass thru the winkeyUP
@@ -1374,7 +1361,7 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				“Ah, Win wasn’t alone — suppress Start.”
 				*/
 			}
-			winDown.Store(false)
+
 		//case VK_SHIFT:
 		case VK_LSHIFT, VK_RSHIFT:
 			shiftDown.Store(false)
