@@ -600,12 +600,11 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	//selfIL, e2 := processIntegrityLevel(uint32(windows.GetCurrentProcessId())) //bugged it said, it noticed.
 	selfPID := uint32(os.Getpid())
 	selfIL, e2 := processIntegrityLevel(selfPID)
-	manual := forceManual.Load()
 	if e1 == nil && e2 == nil && targetIL > selfIL {
-		showTrayInfo("winbollocks", "Cannot use native drag on elevated window") //FIXME: this isn't showing.
-
+		showTrayInfo("winbollocks", "Cannot use native drag on elevated window")
 		return
 	}
+	manual := forceManual.Load()
 	usedManual = manual
 	if manual {
 		startManualDrag(hwnd, pt)
