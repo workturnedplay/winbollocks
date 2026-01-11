@@ -771,6 +771,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// 0, 0,
 			// windows.SWP_NOSIZE|windows.SWP_NOZORDER|windows.SWP_NOACTIVATE,
 			// )
+			//FIXME: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
 			procSetWindowPos.Call(
 				uintptr(targetWnd),
 				0,
@@ -1389,6 +1390,17 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				The only remaining risk window is the micro-interval between your modifier check and the injected tap, which is operationally negligible and unavoidable in any design that is not kernel-mode.
 
 				That is as good as it gets in user-mode.
+				*/
+				/*
+						PostMessage is asynchronous.
+
+					Semantics:
+
+					• The message is placed into the target thread’s message queue.
+					• The function returns immediately.
+					• No reentrancy, no waiting for processing.
+					• If the queue is full or the window is gone, the post can fail, but it does not block.
+					chatgpt5.2
 				*/
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
