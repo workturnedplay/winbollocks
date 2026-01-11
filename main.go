@@ -486,16 +486,17 @@ func getWindowPID(hwnd windows.Handle) uint32 {
 }
 
 func isMaximized(hwnd windows.Handle) bool {
-	//var wp windows.WINDOWPLACEMENT
-	//wp.Length = uint32(unsafe.Sizeof(wp))
-	//	windows.GetWindowPlacement(hwnd, &wp)
 	var wp WINDOWPLACEMENT
 	wp.Length = uint32(unsafe.Sizeof(wp))
-	procGetWindowPlacement.Call(
+	//"GetWindowPlacement is a synchronous query into USER32, but it does not send a message to the target window. It reads window state maintained by the window manager (the same data used by the shell for task switching)." -chatgpt5.2
+	// so GetWindowPlacement does not block on a hung window.
+	r, _, _ := procGetWindowPlacement.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&wp)),
 	)
-
+	if r == 0 {
+		return false
+	}
 	return wp.ShowCmd == windows.SW_MAXIMIZE
 }
 
@@ -589,6 +590,7 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 }
 
 func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
+	logf("startDrag")
 	if isMaximized(hwnd) {
 		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
 		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
@@ -603,6 +605,12 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	if e1 == nil && e2 == nil && targetIL > selfIL {
 		showTrayInfo("winbollocks", "Cannot use native drag on elevated window")
 		return
+	}
+	if e1 != nil {
+		logf("e1: %v", e1)
+	}
+	if e2 != nil {
+		logf("e2: %v", e2)
 	}
 	manual := forceManual.Load()
 	usedManual = manual
