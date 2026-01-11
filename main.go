@@ -592,7 +592,7 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	if isMaximized(hwnd) {
 		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
 		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
-
+		//TODO: should I re-maximize if it was maximized, after drag/move is done?
 	}
 
 	pid := getWindowPID(hwnd)
@@ -601,13 +601,15 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	selfPID := uint32(os.Getpid())
 	selfIL, e2 := processIntegrityLevel(selfPID)
 	manual := forceManual.Load()
-	if (manual) || (e1 == nil && e2 == nil && targetIL > selfIL) {
+	if e1 == nil && e2 == nil && targetIL > selfIL {
 		showTrayInfo("winbollocks", "Cannot use native drag on elevated window") //FIXME: this isn't showing.
-		startManualDrag(hwnd, pt)
-		usedManual = true
+
 		return
-	} else {
-		usedManual = false
+	}
+	usedManual = manual
+	if manual {
+		startManualDrag(hwnd, pt)
+		return
 	}
 
 	// procSetForegroundWindow.Call(uintptr(hwnd))
