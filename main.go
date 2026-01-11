@@ -86,12 +86,14 @@ var (
 /* ---------------- Constants ---------------- */
 
 const (
-	// Modifier virtual keys
-	VK_CONTROL = 0x11
-	VK_MENU    = 0x12 // Alt key
 
 	// Low-level keyboard hook flag
 	LLKHF_INJECTED = 0x00000010
+)
+
+const (
+	NOTIFYICON_VERSION_4 = 4
+	NIM_SETVERSION       = 0x00000004
 )
 
 const (
@@ -124,9 +126,6 @@ const (
 	WM_NCLBUTTONDOWN = 0x00A1
 
 	HTCAPTION = 2
-
-	VK_LWIN = 0x5B
-	VK_RWIN = 0x5C
 
 	GA_ROOT      = 2
 	GA_ROOTOWNER = 3
@@ -190,14 +189,25 @@ const (
 	KEYEVENTF_SCANCODE = 0x0008
 	KEYEVENTF_EXTENDED = 0x0001
 
-	VK_SHIFT    = 0x10
-	VK_LSHIFT   = 0xA0
-	VK_RSHIFT   = 0xA1
+	// Modifier virtual keys
+	VK_SHIFT   = 0x10
+	VK_CONTROL = 0x11
+	VK_MENU    = 0x12 // Alt key
+	//no VK_WIN exists, must OR the two manually
+
+	VK_LBUTTON = 0x01
+	VK_RBUTTON = 0x02
+	VK_MBUTTON = 0x04
+	VK_LWIN    = 0x5B
+	VK_RWIN    = 0x5C
+
+	VK_LSHIFT = 0xA0
+	VK_RSHIFT = 0xA1
+
 	VK_LCONTROL = 0xA2
 	VK_RCONTROL = 0xA3
-
-	VK_LMENU = 0xA4 // Left Alt
-	VK_RMENU = 0xA5 // Right Alt
+	VK_LMENU    = 0xA4 // Left Alt
+	VK_RMENU    = 0xA5 // Right Alt
 
 	VK_E   = 0x45
 	VK_F   = 0x46
@@ -537,13 +547,22 @@ func initTray(hwnd windows.Handle) {
 
 	trayIcon.UCallbackMessage = WM_TRAY
 	trayIcon.UFlags |= 0x00000001 // NIF_MESSAGE
+	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
 	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks"))
+	procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
 	procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 }
 
 func showTrayInfo(title, msg string) {
+	logf("systray info: %s", msg)
+	//the tray notification shows differently than a tooltip on win11 (didn't test it on anything else tho)
+	//and I think you've to turn it on like(this only if you have Do Not Disturn 'on' already) System->Notifications->Set priority notifications, Add Apps(button) and pick winbollocks.exe
+	// then you see it slide from the right, on top of systray, as a notifcation rectangle.
+	//if you don't have Do not disturb on, it shows the same and you don't have to add it as priority notif. at all.
+	// because it is already turned on in System->Notifications, Notifications from apps and other senders
 	trayIcon.UFlags |= NIF_INFO
+	trayIcon.UTimeoutOrVersion = 5000 //5sec, though Win11 ignores it and uses system accessibility settings)
 	copy(trayIcon.SzInfoTitle[:], windows.StringToUTF16(title))
 	copy(trayIcon.SzInfo[:], windows.StringToUTF16(msg))
 	procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon)))
@@ -628,12 +647,12 @@ func winOnlyIsDown() bool {
 		!altDown.Load()
 }
 
-func winAndShiftOnlyAreDown() bool {
-	return winDown.Load() &&
-		shiftDown.Load() &&
-		!ctrlDown.Load() &&
-		!altDown.Load()
-}
+// func winAndShiftOnlyAreDown() bool {
+// 	return winDown.Load() &&
+// 		shiftDown.Load() &&
+// 		!ctrlDown.Load() &&
+// 		!altDown.Load()
+// }
 
 // the current state of mod keys, works.
 func winOnlyIsDown_viaState() bool {
@@ -643,8 +662,42 @@ func winOnlyIsDown_viaState() bool {
 		!keyDown(VK_MENU)
 }
 
+func hardResetIfDesynced() {
+	if winDown.Load() {
+		if !keyDown(VK_LWIN) && !keyDown(VK_RWIN) {
+			hardReset()
+		}
+	}
+
+	if capturing.Load() {
+		// LMB not physically down anymore
+		if !keyDown(VK_LBUTTON) {
+			hardReset()
+		}
+	}
+}
+
+func hardReset() {
+	winDown.Store(keyDown(VK_LWIN) || keyDown(VK_RWIN))
+	shiftDown.Store(keyDown(VK_SHIFT))
+	ctrlDown.Store(keyDown(VK_CONTROL))
+	altDown.Store(keyDown(VK_MENU))
+
+	winGestureUsed.Store(false)
+	capturing.Store(false)
+	currentDrag = nil
+	targetWnd = 0
+
+	procReleaseCapture.Call()
+}
+
 /* ---------------- Mouse Hook ---------------- */
 
+/*
+"High-input scenarios (gaming, rapid typing) may queue many events, but your callbacks still run one-by-one — the queue just grows temporarily. If you take too long in a callback (> ~1 second, controlled by LowLevelHooksTimeout registry key), Windows may drop or timeout subsequent calls, but it won't parallelize them." - Grok
+
+"When a qualifying input event occurs (e.g., a mouse move or key press), the system detects installed low-level hooks and posts a special internal message (not a standard WM_ message) to the message queue of the thread that installed the hook. Your message loop then retrieves and dispatches this message, and during dispatch, Windows invokes your hook callback (mouseProc or keyboardProc)." - Grok
+*/
 func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	if nCode < 0 {
 		ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
@@ -1154,6 +1207,8 @@ What a non-zero return does is:
 • but other hooks still run
 
 ffs, AI, chatgpt 5.2 make up ur gdammn mind already, what is true and what isn't!!!
+
+"No, your low-level hooks (WH_KEYBOARD_LL and WH_MOUSE_LL) will not be called in parallel in any realistic scenario that would require atomics for shared state." - Grok
 */
 func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	/*
@@ -1394,10 +1449,9 @@ func assertStructSizes() {
 }
 
 func main() {
+	runtime.LockOSThread() // first!
 	assertStructSizes()
 	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
-
-	runtime.LockOSThread()
 
 	forceManual.Store(true)
 
@@ -1407,12 +1461,13 @@ func main() {
 	mouseCallback = windows.NewCallback(mouseProc)
 	h, _, err := procSetWindowsHookEx.Call(WH_MOUSE_LL, mouseCallback, 0, 0)
 	if h == 0 {
-		fmt.Println("Got error:", err) // has no console!
+		logf("Got error:", err) // has no console!
 		//os.Exit(1)
 		exit(1)
+	} else {
+		hHook = windows.Handle(h)
+		defer procUnhookWindowsHookEx.Call(uintptr(hHook))
 	}
-	hHook = windows.Handle(h)
-	defer procUnhookWindowsHookEx.Call(uintptr(hHook))
 
 	kbdCB := windows.NewCallback(keyboardProc)
 	hk, _, err := procSetWindowsHookEx.Call(
@@ -1422,11 +1477,13 @@ func main() {
 		0,
 	)
 	if hk == 0 {
-		// FIXME: handle error
+		logf("Got error:", err) // has no console!
+
 		exit(2)
+	} else {
+		kbdHook = windows.Handle(hk)
+		defer procUnhookWindowsHookEx.Call(uintptr(kbdHook))
 	}
-	kbdHook = windows.Handle(hk)
-	defer procUnhookWindowsHookEx.Call(uintptr(kbdHook))
 
 	hwnd := createMessageWindow()
 	initTray(hwnd)
