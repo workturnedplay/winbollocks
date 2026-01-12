@@ -64,7 +64,7 @@ var (
 
 	procSetCapture = user32.NewProc("SetCapture")
 
-	procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
+	//procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
 
 	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
 
@@ -80,7 +80,7 @@ var (
 
 	procPostMessage = user32.NewProc("PostMessageW")
 
-	procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
+	//procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 )
 
 /* ---------------- Constants ---------------- */
@@ -198,8 +198,10 @@ const (
 	VK_LBUTTON = 0x01
 	VK_RBUTTON = 0x02
 	VK_MBUTTON = 0x04
-	VK_LWIN    = 0x5B
-	VK_RWIN    = 0x5C
+	//left winkey
+	VK_LWIN = 0x5B
+	//right winkey
+	VK_RWIN = 0x5C
 
 	VK_LSHIFT = 0xA0
 	VK_RSHIFT = 0xA1
@@ -322,10 +324,10 @@ var (
 )
 
 var (
-	winDown   atomic.Bool
-	shiftDown atomic.Bool
-	ctrlDown  atomic.Bool
-	altDown   atomic.Bool
+	// winDown   atomic.Bool
+	// shiftDown atomic.Bool
+	// ctrlDown  atomic.Bool
+	// altDown   atomic.Bool
 
 	winGestureUsed atomic.Bool //false initially
 )
@@ -649,12 +651,12 @@ func keyDown(vk uintptr) bool {
 }
 
 // the state of mod keys that my keyboard hook sees, now works.
-func winOnlyIsDown() bool {
-	return winDown.Load() &&
-		!shiftDown.Load() &&
-		!ctrlDown.Load() &&
-		!altDown.Load()
-}
+// func winOnlyIsDown() bool {
+// 	return winDown.Load() &&
+// 		!shiftDown.Load() &&
+// 		!ctrlDown.Load() &&
+// 		!altDown.Load()
+// }
 
 // func winAndShiftOnlyAreDown() bool {
 // 	return winDown.Load() &&
@@ -664,19 +666,19 @@ func winOnlyIsDown() bool {
 // }
 
 // the current state of mod keys, works.
-func winOnlyIsDown_viaState() bool {
-	return (keyDown(VK_LWIN) || keyDown(VK_RWIN)) &&
-		!keyDown(VK_SHIFT) &&
-		!keyDown(VK_CONTROL) &&
-		!keyDown(VK_MENU)
-}
+// func winOnlyIsDown() bool {
+// 	return (keyDown(VK_LWIN) || keyDown(VK_RWIN)) &&
+// 		!keyDown(VK_SHIFT) &&
+// 		!keyDown(VK_CONTROL) &&
+// 		!keyDown(VK_MENU)
+// }
 
 func hardResetIfDesynced() {
-	if winDown.Load() {
-		if !keyDown(VK_LWIN) && !keyDown(VK_RWIN) {
-			hardReset()
-		}
-	}
+	// if winDown.Load() {
+	// 	if !keyDown(VK_LWIN) && !keyDown(VK_RWIN) {
+	// 		hardReset()
+	// 	}
+	// }
 
 	if capturing.Load() {
 		// LMB not physically down anymore
@@ -687,12 +689,12 @@ func hardResetIfDesynced() {
 }
 
 func hardReset() {
-	winDown.Store(keyDown(VK_LWIN) || keyDown(VK_RWIN))
-	shiftDown.Store(keyDown(VK_SHIFT))
-	ctrlDown.Store(keyDown(VK_CONTROL))
-	altDown.Store(keyDown(VK_MENU))
+	// winDown.Store(keyDown(VK_LWIN) || keyDown(VK_RWIN))
+	// shiftDown.Store(keyDown(VK_SHIFT))
+	// ctrlDown.Store(keyDown(VK_CONTROL))
+	// altDown.Store(keyDown(VK_MENU))
 
-	winGestureUsed.Store(false)
+	//winGestureUsed.Store(false)
 	capturing.Store(false)
 	currentDrag = nil
 	targetWnd = 0
@@ -716,11 +718,16 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	//nolint:govet
 	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam))
 
+	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	var shiftDown bool = keyDown(VK_SHIFT)
+	var ctrlDown bool = keyDown(VK_CONTROL)
+	var altDown bool = keyDown(VK_MENU)
+
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed.
 		//if winKeyDown() {
 		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
-		if winOnlyIsDown() { // only if winkey without any modifiers
+		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
 			if !winGestureUsed.Load() { //wasn't set already
 				winGestureUsed.Store(true) // we used at least once of our gestures
 			}
@@ -796,12 +803,12 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
-		if winDown.Load() && !ctrlDown.Load() && !altDown.Load() {
+		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
 			if !winGestureUsed.Load() { //wasn't set already
 				winGestureUsed.Store(true) // we used at least once of our gestures
 			}
-			if !shiftDown.Load() {
+			if !shiftDown {
 				// winkey_DOWN but no other modifiers(including shift) is down
 				// and LMB is down, ofc, then we start move window gesture:
 
@@ -1258,6 +1265,33 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
+	/*
+			The sequence for a key release is effectively:
+
+		Hardware generates a key-up interrupt
+
+		Windows constructs the keyboard event
+
+		Low-level keyboard hooks are called
+
+		Windows updates the global async key state
+
+		The event is delivered to higher layers (message queues, hotkeys, etc.)
+
+		So when you are inside keyboardProc handling WM_KEYUP for VK_LWIN:
+
+		The event means “Win is being released”
+
+		But the async key state has not yet been updated
+
+		Therefore GetAsyncKeyState(VK_LWIN) still reports the key as down (0x8000 set)
+		- chatgpt 5.2
+	*/
+	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	var shiftDown bool = keyDown(VK_SHIFT)
+	var ctrlDown bool = keyDown(VK_CONTROL)
+	var altDown bool = keyDown(VK_MENU)
+
 	// switch wParam {
 	// case WM_KEYDOWN, WM_SYSKEYDOWN:
 	// if vk == VK_LWIN || vk == VK_RWIN {
@@ -1311,20 +1345,20 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	// }
 
 	// Key DOWN
-	if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
-		switch vk {
+	// if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
+	// 	switch vk {
 
-		case VK_LWIN, VK_RWIN:
-			winDown.Store(true)
-		//case VK_SHIFT: // Low-level keyboard hooks do NOT reliably(read: at all) deliver VK_SHIFT. VK_SHIFT is a virtual aggregation key used by higher-level APIs (like GetKeyState), not by the LL hook stream.
-		case VK_LSHIFT, VK_RSHIFT:
-			shiftDown.Store(true)
-		case VK_LCONTROL, VK_RCONTROL:
-			ctrlDown.Store(true)
-		case VK_LMENU, VK_RMENU: // Alt
-			altDown.Store(true)
-		}
-	}
+	// 	case VK_LWIN, VK_RWIN:
+	// 		winDown.Store(true)
+	// 	//case VK_SHIFT: // Low-level keyboard hooks do NOT reliably(read: at all) deliver VK_SHIFT. VK_SHIFT is a virtual aggregation key used by higher-level APIs (like GetKeyState), not by the LL hook stream.
+	// 	case VK_LSHIFT, VK_RSHIFT:
+	// 		shiftDown.Store(true)
+	// 	case VK_LCONTROL, VK_RCONTROL:
+	// 		ctrlDown.Store(true)
+	// 	case VK_LMENU, VK_RMENU: // Alt
+	// 		altDown.Store(true)
+	// 	}
+	// }
 
 	// Key UP
 	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
@@ -1349,10 +1383,15 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			*/
 
 			//nolint:staticcheck,QF1011 // QF1011: could omit type bool from declaration; it will be inferred
-			var checkBefore bool = winOnlyIsDown()
-			winDown.Store(false)
-
-			if checkBefore {
+			//var checkBefore bool = winDown && !shiftDown && !altDown && !ctrlDown
+			if winDown {
+				// so this always triggers here, unclear as to why.
+				// "Short version: inside a low-level keyboard hook, GetAsyncKeyState still reflects the previous global key state, not the transition you are currently handling." - chatgpt5.2
+				logf("desync of winkey(is down but should be up) detected in keyboardProc.")
+			}
+			//winDown.Store(false)
+			//XXX: so winDown is true here even though we're handling the winUp in this here block.
+			if winDown && !shiftDown && !altDown && !ctrlDown {
 				//was winkey DOWN (ie. held/pressed) until now and no other modifiers like alt/shift/ctrl were too?!
 				//then we can insert a shift DOWN then shift UP which would cause the winkey UP to not trigger Start menu popup!
 				/*“Could another key sneak in during the injection?”
@@ -1438,13 +1477,13 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				*/
 			}
 
-		//case VK_SHIFT:
-		case VK_LSHIFT, VK_RSHIFT:
-			shiftDown.Store(false)
-		case VK_LCONTROL, VK_RCONTROL:
-			ctrlDown.Store(false)
-		case VK_LMENU, VK_RMENU:
-			altDown.Store(false)
+			// //case VK_SHIFT:
+			// case VK_LSHIFT, VK_RSHIFT:
+			// 	shiftDown.Store(false)
+			// case VK_LCONTROL, VK_RCONTROL:
+			// 	ctrlDown.Store(false)
+			// case VK_LMENU, VK_RMENU:
+			// 	altDown.Store(false)
 		}
 	}
 
