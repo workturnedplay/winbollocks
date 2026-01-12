@@ -1384,11 +1384,11 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 			//nolint:staticcheck,QF1011 // QF1011: could omit type bool from declaration; it will be inferred
 			//var checkBefore bool = winDown && !shiftDown && !altDown && !ctrlDown
-			if winDown {
-				// so this always triggers here, unclear as to why.
-				// "Short version: inside a low-level keyboard hook, GetAsyncKeyState still reflects the previous global key state, not the transition you are currently handling." - chatgpt5.2
-				logf("desync of winkey(is down but should be up) detected in keyboardProc.")
-			}
+			// if winDown {
+			// 	// so this always triggers here, unclear as to why.
+			// 	//XXX: "Short version: inside a low-level keyboard hook, GetAsyncKeyState still reflects the previous global key state, not the transition you are currently handling." - chatgpt5.2
+			// 	logf("desync of winkey(is down but should be up) detected in keyboardProc.")
+			// }
 			//winDown.Store(false)
 			//XXX: so winDown is true here even though we're handling the winUp in this here block.
 			if winDown && !shiftDown && !altDown && !ctrlDown {
