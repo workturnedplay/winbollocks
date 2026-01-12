@@ -76,7 +76,7 @@ var (
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDpiAwareness        = shcore.NewProc("SetProcessDpiAwareness")
 
-	procAttachThreadInput = user32.NewProc("AttachThreadInput")
+	//procAttachThreadInput = user32.NewProc("AttachThreadInput")
 
 	procPostMessage = user32.NewProc("PostMessageW")
 
@@ -86,9 +86,20 @@ var (
 /* ---------------- Constants ---------------- */
 
 const (
+	MOUSEEVENTF_LEFTDOWN   = 0x0002
+	MOUSEEVENTF_LEFTUP     = 0x0004
+	MOUSEEVENTF_RIGHTDOWN  = 0x0008
+	MOUSEEVENTF_RIGHTUP    = 0x0010
+	MOUSEEVENTF_MIDDLEDOWN = 0x0020
+	MOUSEEVENTF_MIDDLEUP   = 0x0040
+)
+
+const (
 
 	// Low-level keyboard hook flag
 	LLKHF_INJECTED = 0x00000010
+	// mouse:
+	LLMHF_INJECTED = 0x00000001
 )
 
 const (
@@ -163,6 +174,7 @@ const (
 	WM_START_NATIVE_DRAG = WM_USER + 1
 	WM_TRAY              = WM_USER + 2
 	WM_INJECT_SEQUENCE   = WM_USER + 100
+	WM_INJECT_LMB_CLICK  = WM_USER + 101
 )
 const (
 	MENU_FORCE_MANUAL  = 1
@@ -184,6 +196,7 @@ const (
 )
 
 const (
+	INPUT_MOUSE        = 0
 	INPUT_KEYBOARD     = 1
 	KEYEVENTF_KEYUP    = 0x0002
 	KEYEVENTF_SCANCODE = 0x0008
@@ -221,6 +234,15 @@ const (
 type KEYBDINPUT struct {
 	WVk         uint16
 	WScan       uint16
+	DwFlags     uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+type MOUSEINPUT struct {
+	Dx          int32
+	Dy          int32
+	MouseData   uint32
 	DwFlags     uint32
 	Time        uint32
 	DwExtraInfo uintptr
@@ -380,67 +402,96 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 		},
 	}
 
-	procSendInput.Call(
+	ret, _, err := procSendInput.Call(
 		uintptr(len(inputs)),
 		uintptr(unsafe.Pointer(&inputs[0])),
 		unsafe.Sizeof(inputs[0]),
 	)
-}
-
-func activateWindow(hwnd windows.Handle) {
-	// Get target window thread
-	var pid uint32
-	targetTID, _, _ := procGetWindowThreadProcessId.Call(
-		uintptr(hwnd),
-		uintptr(unsafe.Pointer(&pid)),
-	)
-
-	// Get our thread
-	selfTID := windows.GetCurrentThreadId()
-
-	if targetTID != uintptr(selfTID) {
-		// Attach threads
-		procAttachThreadInput.Call(
-			uintptr(selfTID),
-			targetTID,
-			1,
-		)
-	}
-
-	// Activate
-	//procSetForegroundWindow.Call(uintptr(hwnd))
-	//XXX: doesn't work, well only in the first 1-2 seconds, then flashes taskbar button for that window instead!
-
-	//temp-start:
-	// 1️⃣ Bring to top WITHOUT activation
-	procSetWindowPos.Call(
-		uintptr(hwnd),
-		HWND_TOP,
-		0, 0, 0, 0,
-		SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-	)
-
-	// 2️⃣ Attempt activation
-	//procSetForegroundWindow.Call(uintptr(hwnd))
-
-	// 3️⃣ Reinforce Z-order (still no activate)
-	// procSetWindowPos.Call(
-	// uintptr(hwnd),
-	// HWND_TOP,
-	// 0, 0, 0, 0,
-	// SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-	// )
-	//temp-end
-
-	if targetTID != uintptr(selfTID) {
-		// Detach threads
-		procAttachThreadInput.Call(
-			uintptr(selfTID),
-			targetTID,
-			0,
-		)
+	if ret == 0 {
+		logf("SendInput for injectShiftTapThenWinUp failed: %v", err)
 	}
 }
+func injectLMBClick() {
+	inputs := []INPUT{
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{}, // union placeholder
+		},
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{}, // union placeholder
+		},
+	}
+
+	// Fill the union as MOUSEINPUT
+	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
+	(*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
+
+	ret, _, err := procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+
+	if ret == 0 {
+		logf("SendInput mouse click failed: %v", err)
+	}
+}
+
+// func activateWindow(hwnd windows.Handle) {
+// 	// Get target window thread
+// 	var pid uint32
+// 	targetTID, _, _ := procGetWindowThreadProcessId.Call(
+// 		uintptr(hwnd),
+// 		uintptr(unsafe.Pointer(&pid)),
+// 	)
+
+// 	// Get our thread
+// 	selfTID := windows.GetCurrentThreadId()
+
+// 	if targetTID != uintptr(selfTID) {
+// 		// Attach threads
+// 		procAttachThreadInput.Call(
+// 			uintptr(selfTID),
+// 			targetTID,
+// 			1,
+// 		)
+// 	}
+
+// 	// Activate
+// 	//procSetForegroundWindow.Call(uintptr(hwnd))
+// 	//XXX: doesn't work, well only in the first 1-2 seconds, then flashes taskbar button for that window instead!
+
+// 	//temp-start:
+// 	// 1️⃣ Bring to top WITHOUT activation
+// 	procSetWindowPos.Call(
+// 		uintptr(hwnd),
+// 		HWND_TOP,
+// 		0, 0, 0, 0,
+// 		SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+// 	)
+
+// 	// 2️⃣ Attempt activation
+// 	//procSetForegroundWindow.Call(uintptr(hwnd))
+
+// 	// 3️⃣ Reinforce Z-order (still no activate)
+// 	// procSetWindowPos.Call(
+// 	// uintptr(hwnd),
+// 	// HWND_TOP,
+// 	// 0, 0, 0, 0,
+// 	// SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+// 	// )
+// 	//temp-end
+
+// 	if targetTID != uintptr(selfTID) {
+// 		// Detach threads
+// 		procAttachThreadInput.Call(
+// 			uintptr(selfTID),
+// 			targetTID,
+// 			0,
+// 		)
+// 	}
+// }
 
 func initDPIAwareness() {
 	// Try modern API first (Win10 1607+)
@@ -702,6 +753,14 @@ func hardReset() {
 	procReleaseCapture.Call()
 }
 
+func isWindowForeground(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return false
+	}
+	fg, _, _ := procGetForegroundWindow.Call()
+	return windows.Handle(fg) == hwnd
+}
+
 /* ---------------- Mouse Hook ---------------- */
 
 /*
@@ -718,9 +777,20 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	//nolint:govet
 	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam))
 
+	if info.Flags&LLMHF_INJECTED != 0 {
+		// This mouse event was generated by SendInput
+		// Do NOT treat it as user input
+		ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+		return ret
+	}
+
+	//nolint:staticcheck,QF1011
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	//nolint:staticcheck,QF1011
 	var shiftDown bool = keyDown(VK_SHIFT)
+	//nolint:staticcheck,QF1011
 	var ctrlDown bool = keyDown(VK_CONTROL)
+	//nolint:staticcheck,QF1011
 	var altDown bool = keyDown(VK_MENU)
 
 	switch wParam {
@@ -753,13 +823,24 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			manual := startDrag(hwnd, info.Pt)
 			if manual {
 
-				if activateOnMove.Load() {
-					activateWindow(hwnd)
-					// AttachThreadInput(self, target, TRUE)
-					// procSetForegroundWindow.Call(uintptr(hwnd))
-					// AttachThreadInput(self, target, FALSE)
-				}
+				// if activateOnMove.Load() {
+				// 	activateWindow(hwnd)
+				// 	// AttachThreadInput(self, target, TRUE)
+				// 	// procSetForegroundWindow.Call(uintptr(hwnd))
+				// 	// AttachThreadInput(self, target, FALSE)
+				// }
 				capturing.Store(true)
+				if activateOnMove.Load() && !isWindowForeground(targetWnd) {
+					logf("injecting LMB click")
+					// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
+					// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow
+					procPostMessage.Call(
+						uintptr(trayIcon.HWnd),
+						WM_INJECT_LMB_CLICK,
+						0, // no args to that function
+						0,
+					)
+				}
 				return 1 // swallow LMB only for manual
 			} else {
 				return 0 // let native move receive input
@@ -934,6 +1015,10 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam 
 		//avoids injecting from the hook
 		which := uint16(wParam)        // ie. uint16(vk))
 		injectShiftTapThenWinUp(which) // it's correct casting, as per AI.
+		return 0
+	case WM_INJECT_LMB_CLICK:
+		//avoids injecting from the hook
+		injectLMBClick()
 		return 0
 	case WM_TRAY:
 		if lparam == WM_RBUTTONUP {
@@ -1287,9 +1372,14 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		Therefore GetAsyncKeyState(VK_LWIN) still reports the key as down (0x8000 set)
 		- chatgpt 5.2
 	*/
+
+	//nolint:staticcheck,QF1011
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	//nolint:staticcheck,QF1011
 	var shiftDown bool = keyDown(VK_SHIFT)
+	//nolint:staticcheck,QF1011
 	var ctrlDown bool = keyDown(VK_CONTROL)
+	//nolint:staticcheck,QF1011
 	var altDown bool = keyDown(VK_MENU)
 
 	// switch wParam {
@@ -1513,7 +1603,9 @@ func main() {
 	assertStructSizes()
 	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
 
+	//defaults:
 	forceManual.Store(true)
+	activateOnMove.Store(true)
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
