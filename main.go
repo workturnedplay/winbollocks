@@ -523,7 +523,7 @@ func windowFromPoint(pt POINT) windows.Handle {
 	if ret == 0 {
 		return 0
 	}
-	root, _, _ := procGetAncestor.Call(ret, GA_ROOTOWNER)
+	root, _, _ := procGetAncestor.Call(ret, GA_ROOT)
 	return windows.Handle(root)
 }
 
@@ -665,6 +665,7 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	if e2 != nil {
 		logf("e2: %v", e2)
 	}
+	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
 	manual := forceManual.Load()
 	usedManual = manual
 	if manual {
@@ -724,7 +725,7 @@ func keyDown(vk uintptr) bool {
 // 		!keyDown(VK_MENU)
 // }
 
-func hardResetIfDesynced() {
+func hardResetIfDesynced(winDownInHook bool) {
 	// if winDown.Load() {
 	// 	if !keyDown(VK_LWIN) && !keyDown(VK_RWIN) {
 	// 		hardReset()
@@ -733,7 +734,8 @@ func hardResetIfDesynced() {
 
 	if capturing.Load() {
 		// LMB not physically down anymore
-		if !keyDown(VK_LBUTTON) {
+		if !keyDown(VK_LBUTTON) && !winDownInHook {
+			logf("Desync detected: Capture/LMB state reset")
 			hardReset()
 		}
 	}
@@ -745,7 +747,7 @@ func hardReset() {
 	// ctrlDown.Store(keyDown(VK_CONTROL))
 	// altDown.Store(keyDown(VK_MENU))
 
-	//winGestureUsed.Store(false)
+	winGestureUsed = false
 	capturing.Store(false)
 	currentDrag = nil
 	targetWnd = 0
@@ -784,6 +786,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
+	//TODO: move these so they don't get set even for mouse movements.
 	//nolint:staticcheck,QF1011
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 	//nolint:staticcheck,QF1011
@@ -792,6 +795,9 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	var ctrlDown bool = keyDown(VK_CONTROL)
 	//nolint:staticcheck,QF1011
 	var altDown bool = keyDown(VK_MENU)
+
+	//logf("in mouseProc")//spammy on mouse movements!
+	//hardResetIfDesynced()
 
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed.
@@ -815,7 +821,8 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			//hwnd := windows.Handle(hwndRaw)
 			hwnd := windowFromPoint(info.Pt)
 			if hwnd == 0 {
-				break
+				logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(unless you LMB on a higher integrity eg. admin window before you release winkey)")
+				return 1 // swallow LMB
 			}
 			//if hwnd != 0 {
 			//capturing.Store(true)
@@ -1375,14 +1382,14 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		- chatgpt 5.2
 	*/
 
-	//nolint:staticcheck,QF1011
-	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	//nolint:staticcheck,QF1011
-	var shiftDown bool = keyDown(VK_SHIFT)
-	//nolint:staticcheck,QF1011
-	var ctrlDown bool = keyDown(VK_CONTROL)
-	//nolint:staticcheck,QF1011
-	var altDown bool = keyDown(VK_MENU)
+	// //nolint:staticcheck,QF1011
+	// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	// //nolint:staticcheck,QF1011
+	// var shiftDown bool = keyDown(VK_SHIFT)
+	// //nolint:staticcheck,QF1011
+	// var ctrlDown bool = keyDown(VK_CONTROL)
+	// //nolint:staticcheck,QF1011
+	// var altDown bool = keyDown(VK_MENU)
 
 	// switch wParam {
 	// case WM_KEYDOWN, WM_SYSKEYDOWN:
@@ -1456,6 +1463,8 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
 		switch vk {
 		case VK_LWIN, VK_RWIN:
+			//logf("winUP")
+			//hardResetIfDesynced(false)
 			/*
 			   You now have this pipeline:
 			   Detect real Win-UP
@@ -1483,93 +1492,93 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// }
 			//winDown.Store(false)
 			//XXX: so winDown is true here even though we're handling the winUp in this here block.
-			if winDown && !shiftDown && !altDown && !ctrlDown {
-				//was winkey DOWN (ie. held/pressed) until now and no other modifiers like alt/shift/ctrl were too?!
-				//then we can insert a shift DOWN then shift UP which would cause the winkey UP to not trigger Start menu popup!
-				/*“Could another key sneak in during the injection?”
+			//if true { //winDown && !shiftDown && !altDown && !ctrlDown {
+			//was winkey DOWN (ie. held/pressed) until now and no other modifiers like alt/shift/ctrl were too?!
+			//then we can insert a shift DOWN then shift UP which would cause the winkey UP to not trigger Start menu popup!
+			/*“Could another key sneak in during the injection?”
 
-				In theory, yes.
-				In practice, it’s vanishingly unlikely.
+			In theory, yes.
+			In practice, it’s vanishingly unlikely.
 
-				Why:
+			Why:
 
-				SendInput enqueues events atomically
+			SendInput enqueues events atomically
 
-				The time window is microseconds
+			The time window is microseconds
 
-				Even if it happens, worst case:
-				the user pressed and held shift and now we cancelled it so he has to repress it to be seen as held again.
+			Even if it happens, worst case:
+			the user pressed and held shift and now we cancelled it so he has to repress it to be seen as held again.
 
+			*/
+
+			if !winGestureUsed {
+				// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
+				return 0 // pass thru the winkeyUP
+			} else {
+				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
+				winGestureUsed = false // gesture ends with winkey_UP
+
+				// • Injecting input from inside a WH_KEYBOARD_LL hook is documented as undefined.
+				// great, it was correct and other do it before, but now it's bad!
+				//injectShiftTapThenWinUp(uint16(vk)) // it's correct casting, as per AI.
+
+				/* Using Right Shift is a defensible and, in this context, slightly superior choice. The edge cases you walked through are the right ones to think about, and you resolved them correctly:
+
+				If the user is already holding any modifier (including RShift), you suppress injection entirely.
+
+				Therefore you will never undo a user-held modifier.
+
+				The only remaining risk window is the micro-interval between your modifier check and the injected tap, which is operationally negligible and unavoidable in any design that is not kernel-mode.
+
+				That is as good as it gets in user-mode.
 				*/
+				/*
+						PostMessage is asynchronous.
 
-				if !winGestureUsed {
-					// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
-					return 0 // pass thru the winkeyUP
-				} else {
-					//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
-					winGestureUsed = false // gesture ends with winkey_UP
+					Semantics:
 
-					// • Injecting input from inside a WH_KEYBOARD_LL hook is documented as undefined.
-					// great, it was correct and other do it before, but now it's bad!
-					//injectShiftTapThenWinUp(uint16(vk)) // it's correct casting, as per AI.
+					• The message is placed into the target thread’s message queue.
+					• The function returns immediately.
+					• No reentrancy, no waiting for processing.
+					• If the queue is full or the window is gone, the post can fail, but it does not block.
+					chatgpt5.2
+				*/
+				procPostMessage.Call(
+					uintptr(trayIcon.HWnd),
+					WM_INJECT_SEQUENCE,
+					uintptr(vk), // VK_LWIN or VK_RWIN,
+					0,
+				)
 
-					/* Using Right Shift is a defensible and, in this context, slightly superior choice. The edge cases you walked through are the right ones to think about, and you resolved them correctly:
+				return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
+				/* well crap:
+								Explorer / the shell ignores injected keyboard events when deciding whether to open Start.
+								That’s why:
 
-					If the user is already holding any modifier (including RShift), you suppress injection entirely.
+				Your injected Shift DOWN → Shift UP does nothing for Start suppression
 
-					Therefore you will never undo a user-held modifier.
+				Even though the same physical sequence (real Shift) works perfectly
 
-					The only remaining risk window is the micro-interval between your modifier check and the injected tap, which is operationally negligible and unavoidable in any design that is not kernel-mode.
+				Even though SendInput does update key state and does generate hooks
 
-					That is as good as it gets in user-mode.
-					*/
-					/*
-							PostMessage is asynchronous.
+				Your intention
 
-						Semantics:
+				At Win UP:
 
-						• The message is placed into the target thread’s message queue.
-						• The function returns immediately.
-						• No reentrancy, no waiting for processing.
-						• If the queue is full or the window is gone, the post can fail, but it does not block.
-						chatgpt5.2
-					*/
-					procPostMessage.Call(
-						uintptr(trayIcon.HWnd),
-						WM_INJECT_SEQUENCE,
-						uintptr(vk), // VK_LWIN or VK_RWIN,
-						0,
-					)
+				Inject Shift DOWN
 
-					return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
-					/* well crap:
-									Explorer / the shell ignores injected keyboard events when deciding whether to open Start.
-									That’s why:
+				Inject Shift UP
 
-					Your injected Shift DOWN → Shift UP does nothing for Start suppression
+				Inject Win UP
 
-					Even though the same physical sequence (real Shift) works perfectly
+				Eat the real Win UP
 
-					Even though SendInput does update key state and does generate hooks
+				You expect Explorer to think:
 
-					Your intention
-
-					At Win UP:
-
-					Inject Shift DOWN
-
-					Inject Shift UP
-
-					Inject Win UP
-
-					Eat the real Win UP
-
-					You expect Explorer to think:
-
-					“Ah, Win wasn’t alone — suppress Start.”
-					*/
-				}
+				“Ah, Win wasn’t alone — suppress Start.”
+				*/
 			}
+			//}
 
 			// //case VK_SHIFT:
 			// case VK_LSHIFT, VK_RSHIFT:
