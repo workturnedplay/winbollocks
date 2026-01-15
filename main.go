@@ -355,8 +355,9 @@ var (
 )
 
 var (
-	hHook       windows.Handle
-	capturing   atomic.Bool
+	hHook windows.Handle
+	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
+	capturing   bool
 	targetWnd   windows.Handle
 	currentDrag *dragState
 
@@ -732,7 +733,7 @@ func hardResetIfDesynced(winDownInHook bool) {
 	// 	}
 	// }
 
-	if capturing.Load() {
+	if capturing {
 		// LMB not physically down anymore
 		if !keyDown(VK_LBUTTON) && !winDownInHook {
 			logf("Desync detected: Capture/LMB state reset")
@@ -748,7 +749,7 @@ func hardReset() {
 	// altDown.Store(keyDown(VK_MENU))
 
 	winGestureUsed = false
-	capturing.Store(false)
+	capturing = false
 	currentDrag = nil
 	targetWnd = 0
 
@@ -834,7 +835,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				// 	// procSetForegroundWindow.Call(uintptr(hwnd))
 				// 	// AttachThreadInput(self, target, FALSE)
 				// }
-				capturing.Store(true)
+				capturing = true
 				if activateOnMove.Load() && !isWindowForeground(targetWnd) {
 					//logf("injecting LMB click")
 					// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
@@ -854,7 +855,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_MOUSEMOVE:
-		if capturing.Load() && currentDrag != nil && currentDrag.manual {
+		if capturing && currentDrag != nil && currentDrag.manual {
 			dx := info.Pt.X - currentDrag.startPt.X
 			dy := info.Pt.Y - currentDrag.startPt.Y
 			r := currentDrag.startRect
@@ -879,8 +880,8 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_LBUTTONUP: //LMB released
-		if capturing.Load() {
-			capturing.Store(false)
+		if capturing {
+			capturing = false
 			currentDrag = nil
 			targetWnd = 0
 			procReleaseCapture.Call()
@@ -1097,8 +1098,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam 
 
 func exit(code int) {
 
-	//TODO: add the others?
-	capturing.Store(false)
+	//TODO: add the others? or perhaps there's no point?!
+	capturing = false
 	procReleaseCapture.Call()
 	os.Exit(code) // Hooks are removed after this. Your state must already be sane.
 }
