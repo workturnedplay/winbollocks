@@ -81,6 +81,7 @@ var (
 	procPostMessage = user32.NewProc("PostMessageW")
 
 	//procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
+	procGetLastError = kernel32.NewProc("GetLastError")
 )
 
 /* ---------------- Constants ---------------- */
@@ -175,6 +176,7 @@ const (
 	WM_TRAY              = WM_USER + 2
 	WM_INJECT_SEQUENCE   = WM_USER + 100
 	WM_INJECT_LMB_CLICK  = WM_USER + 101
+	WM_DO_WINDOW_MOVE    = WM_USER + 200 // arbitrary, just unique
 )
 const (
 	MENU_FORCE_MANUAL  = 1
@@ -866,14 +868,23 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// windows.SWP_NOSIZE|windows.SWP_NOZORDER|windows.SWP_NOACTIVATE,
 			// )
 			//FIXME: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
-			procSetWindowPos.Call(
-				uintptr(targetWnd),
-				0,
-				uintptr(r.Left+dx),
-				uintptr(r.Top+dy),
-				0,
-				0,
-				SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
+			newX := r.Left + dx
+			newY := r.Top + dy
+			// procSetWindowPos.Call(
+			// 	uintptr(targetWnd),
+			// 	0,
+			// 	uintptr(r.Left+dx),
+			// 	uintptr(r.Top+dy),
+			// 	0,
+			// 	0,
+			// 	SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
+			// )
+			// Post the move request instead of doing it here
+			procPostMessage.Call(
+				uintptr(trayIcon.HWnd), // your message window hwnd
+				WM_DO_WINDOW_MOVE,
+				uintptr(targetWnd),              // wParam = hwnd to move
+				uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data)
 			)
 
 			return 0 //0 = let thru
@@ -1010,8 +1021,29 @@ func mustUTF16(s string) *uint16 {
 
 var mouseCallback uintptr
 
-var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam uintptr) uintptr {
+var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case WM_DO_WINDOW_MOVE:
+		target := windows.Handle(wParam)
+		x := int32(lParam >> 16)
+		y := int32(lParam & 0xFFFF)
+
+		ret, _, _ := procSetWindowPos.Call(
+			uintptr(target),
+			0, //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below
+			uintptr(x), uintptr(y),
+			0, 0,
+			SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER,
+		)
+		if ret == 0 {
+			errCode, _, _ := procGetLastError.Call()
+			logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
+			// Optional: fallback to native drag simulation
+			pt := POINT{X: x, Y: y} // or current cursor
+			lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
+			procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
+		}
+		return 0
 	case WM_START_NATIVE_DRAG:
 		target := windows.Handle(wParam)
 		if target != 0 {
@@ -1035,7 +1067,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam 
 		injectLMBClick()
 		return 0
 	case WM_TRAY:
-		if lparam == WM_RBUTTONUP {
+		if lParam == WM_RBUTTONUP {
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
 			manualText, _ := windows.UTF16PtrFromString("Manual move (no focus)")
@@ -1092,7 +1124,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lparam 
 		procUnhookWindowsHookEx.Call(uintptr(hHook))
 		exit(0)
 	}
-	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lparam)
+	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
 	return ret
 })
 
