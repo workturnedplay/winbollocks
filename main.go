@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"sync/atomic"
+
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -365,8 +365,8 @@ var (
 
 	trayIcon NOTIFYICONDATA
 )
-var forceManual atomic.Bool // Default is false, if left like this.
-var activateOnMove atomic.Bool
+var forceManual bool // Default is false, if left like this.
+var activateOnMove bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -669,9 +669,9 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 		logf("e2: %v", e2)
 	}
 	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
-	manual := forceManual.Load()
-	usedManual = manual
-	if manual {
+
+	usedManual = forceManual
+	if forceManual {
 		startManualDrag(hwnd, pt)
 		return
 	}
@@ -808,6 +808,10 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			if !winGestureUsed { //wasn't set already
 				winGestureUsed = true // we used at least once of our gestures
 			}
+			if capturing {
+				//FIXME: happens when winkey+LMB then winkey+L to lock, release both, unlock, move mouse (still drag/moves window), hold winkey and press LMB and u're here.
+				logf("already capturing")
+			}
 
 			// we don't want to trigger our drag if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
 			// if !swallowNextWinUp.Load() {
@@ -838,7 +842,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				// 	// AttachThreadInput(self, target, FALSE)
 				// }
 				capturing = true
-				if activateOnMove.Load() && !isWindowForeground(targetWnd) {
+				if activateOnMove && !isWindowForeground(targetWnd) {
 					//logf("injecting LMB click")
 					// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 					// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow
@@ -1028,6 +1032,10 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		x := int32(lParam >> 16)
 		y := int32(lParam & 0xFFFF)
 
+		//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
+		//TODO: Add WH_SHELL Hook for Focus Change Detection
+		//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — post them too.
+		//TODO: make into function and use it for MMB too!
 		ret, _, _ := procSetWindowPos.Call(
 			uintptr(target),
 			0, //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below
@@ -1038,7 +1046,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		if ret == 0 {
 			errCode, _, _ := procGetLastError.Call()
 			logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
-			// Optional: fallback to native drag simulation
+			// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
 			pt := POINT{X: x, Y: y} // or current cursor
 			lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 			procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
@@ -1074,14 +1082,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			exitText, _ := windows.UTF16PtrFromString("Exit")
 
 			flags := MF_STRING
-			if forceManual.Load() {
+			if forceManual {
 				flags |= MF_CHECKED
 			}
 
 			procAppendMenu.Call(hMenu, uintptr(flags), MENU_FORCE_MANUAL, uintptr(unsafe.Pointer(manualText)))
 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
-			if activateOnMove.Load() {
+			if activateOnMove {
 				actFlags |= MF_CHECKED
 			}
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
@@ -1108,9 +1116,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			switch cmd {
 			case MENU_FORCE_MANUAL:
-				forceManual.Store(!forceManual.Load())
+				forceManual = !forceManual
 			case MENU_ACTIVATE_MOVE:
-				activateOnMove.Store(!activateOnMove.Load())
+				activateOnMove = !activateOnMove
 
 			case MENU_EXIT:
 				procUnhookWindowsHookEx.Call(uintptr(hHook))
@@ -1656,8 +1664,8 @@ func main() {
 	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
 
 	//defaults:
-	forceManual.Store(true)
-	activateOnMove.Store(true)
+	forceManual = true
+	activateOnMove = true
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
