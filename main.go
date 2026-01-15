@@ -118,9 +118,9 @@ const (
 
 const (
 	WM_MBUTTONDOWN = 0x0207
-	HWND_BOTTOM    = uintptr(1) // good
+	HWND_BOTTOM    = windows.Handle(uintptr(1)) // good
 	//HWND_TOP       = ^uintptr(1) // (HWND)-1  bad AI
-	HWND_TOP = uintptr(0) // good
+	HWND_TOP = windows.Handle(uintptr(0)) // good
 
 	HWND_TOPMOST   = ^uintptr(0) // (HWND)-1
 	HWND_NOTOPMOST = ^uintptr(1) // (HWND)-2
@@ -176,7 +176,7 @@ const (
 	WM_TRAY              = WM_USER + 2
 	WM_INJECT_SEQUENCE   = WM_USER + 100
 	WM_INJECT_LMB_CLICK  = WM_USER + 101
-	WM_DO_WINDOW_MOVE    = WM_USER + 200 // arbitrary, just unique
+	WM_DO_SETWINDOWPOS   = WM_USER + 200 // arbitrary, just unique
 )
 const (
 	MENU_FORCE_MANUAL  = 1
@@ -233,6 +233,16 @@ const (
 )
 
 /* ---------------- Types ---------------- */
+
+type WindowMoveData struct {
+	Hwnd        windows.Handle // Target window
+	X           int32          // New X (full 32-bit)
+	Y           int32          // New Y
+	InsertAfter windows.Handle // ← this one: HWND_TOP, HWND_BOTTOM, etc.
+	Flags       uint32         // Optional: extra SWP_ flags
+	// Add more if needed (e.g., Width, Height for resize)
+}
+
 type KEYBDINPUT struct {
 	WVk         uint16
 	WScan       uint16
@@ -883,13 +893,28 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// 	0,
 			// 	SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
 			// )
-			// Post the move request instead of doing it here
+
+			data := new(WindowMoveData) // Heap-allocated
+			data.Hwnd = targetWnd
+			data.X = newX // int32, full range
+			data.Y = newY
+			data.InsertAfter = 0 // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
+
+			data.Flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER // Or dynamic
+
+			// Post the move request instead of doing the windows move/drag motion here
 			procPostMessage.Call(
-				uintptr(trayIcon.HWnd), // your message window hwnd
-				WM_DO_WINDOW_MOVE,
-				uintptr(targetWnd),              // wParam = hwnd to move
-				uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data)
+				uintptr(trayIcon.HWnd),
+				WM_DO_SETWINDOWPOS,
+				0,                             // unused, target is in the struct!
+				uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
 			)
+			// procPostMessage.Call(
+			// 	uintptr(trayIcon.HWnd), // your message window hwnd
+			// 	WM_DO_WINDOW_MOVE,
+			// 	//uintptr(targetWnd),              // wParam = hwnd to move
+			// 	uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data), bad: loses sign - grok made it initially.
+			// )
 
 			return 0 //0 = let thru
 		}
@@ -918,64 +943,83 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			if !winGestureUsed { //wasn't set already
 				winGestureUsed = true // we used at least once of our gestures
 			}
+			data := new(WindowMoveData) // Heap-allocated
+			var hwnd windows.Handle
 			if !shiftDown {
 				// winkey_DOWN but no other modifiers(including shift) is down
 				// and LMB is down, ofc, then we start move window gesture:
 
-				hwnd := windowFromPoint(info.Pt)
-				if hwnd != 0 {
-					// Send to back, no activation
-					// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
-					procSetWindowPos.Call(
-						uintptr(hwnd),
-						HWND_BOTTOM,
-						0, 0, 0, 0,
-						SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-					)
-				}
+				data.InsertAfter = HWND_BOTTOM
+				data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+				hwnd = windowFromPoint(info.Pt)
+
 			} else {
 				// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
 				// but no other modifiers like ctrl or alt are down
 				// then we start the bring focused window to front gesture:
-
+				data.InsertAfter = HWND_TOP
+				data.Flags = SWP_NOMOVE | SWP_NOSIZE //|SWP_NOACTIVATE,
 				//hwnd := windowFromPoint(info.Pt) // window under cursor
-				hwnd, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
-				if hwnd != 0 {
-					//logf("oh yea")
-					// Bring to front, no activation, works only for the currently focused window which was sent to back before
-					//has no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 !
-					procSetWindowPos.Call(
-						uintptr(hwnd),
-						HWND_TOP,
-						0, 0, 0, 0,
-						SWP_NOMOVE|SWP_NOSIZE, //|SWP_NOACTIVATE,
-					)
+				ret, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
+				hwnd = windows.Handle(ret)                  // ← explicit cast
+				//if hwnd != 0 {
+				//logf("oh yea")
+				// Bring to front, no activation, works only for the currently focused window which was sent to back before
+				//had no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 !
+				// procSetWindowPos.Call(
+				// 	uintptr(hwnd),
+				// 	uintptr(HWND_TOP),
+				// 	0, 0, 0, 0,
+				// 	SWP_NOMOVE|SWP_NOSIZE, //|SWP_NOACTIVATE,
+				// ) //last good
 
-					// // Step 1: temporarily force topmost
-					// procSetWindowPos.Call(
-					// uintptr(hwnd),
-					// HWND_TOPMOST,
-					// 0, 0, 0, 0,
-					// SWP_NOMOVE|SWP_NOSIZE,
-					// )
+				// // Step 1: temporarily force topmost
+				// procSetWindowPos.Call(
+				// uintptr(hwnd),
+				// HWND_TOPMOST,
+				// 0, 0, 0, 0,
+				// SWP_NOMOVE|SWP_NOSIZE,
+				// )
 
-					// // Step 2: immediately remove topmost
-					// procSetWindowPos.Call(
-					// uintptr(hwnd),
-					// HWND_NOTOPMOST,
-					// 0, 0, 0, 0,
-					// SWP_NOMOVE|SWP_NOSIZE,
-					// )
+				// // Step 2: immediately remove topmost
+				// procSetWindowPos.Call(
+				// uintptr(hwnd),
+				// HWND_NOTOPMOST,
+				// 0, 0, 0, 0,
+				// SWP_NOMOVE|SWP_NOSIZE,
+				// )
 
-					// // Step 1: Activate desktop, ie. defocus current window.
-					// desktop, _, _ := procGetDesktopWindow.Call()
-					//logf("desktop hwnd = 0x%x", desktop)
-					// procSetForegroundWindow.Call(desktop)
+				// // Step 1: Activate desktop, ie. defocus current window.
+				// desktop, _, _ := procGetDesktopWindow.Call()
+				//logf("desktop hwnd = 0x%x", desktop)
+				// procSetForegroundWindow.Call(desktop)
 
-					// // Step 2: Activate the same window that was focused.
-					// procSetForegroundWindow.Call(uintptr(hwnd))
-				}
+				// // Step 2: Activate the same window that was focused.
+				// procSetForegroundWindow.Call(uintptr(hwnd))
+				//}
 			} // else
+			if hwnd != 0 {
+				// Send to back, no activation
+				// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
+				// procSetWindowPos.Call(
+				// 	uintptr(hwnd),
+				// 	HWND_BOTTOM,
+				// 	0, 0, 0, 0,
+				// 	SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+				// )
+
+				data.Hwnd = hwnd
+				data.X = 0 // int32, full range
+				data.Y = 0
+
+				// Post the move request instead of doing the windows move/drag motion here
+				procPostMessage.Call(
+					uintptr(trayIcon.HWnd),
+					WM_DO_SETWINDOWPOS,
+					0,                             // unused, target is in the struct!
+					uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
+				)
+			}
 			return 1 // swallow MMB
 		} // the 'if' in MMB
 
@@ -1027,22 +1071,32 @@ var mouseCallback uintptr
 
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
-	case WM_DO_WINDOW_MOVE:
-		target := windows.Handle(wParam)
-		x := int32(lParam >> 16)
-		y := int32(lParam & 0xFFFF)
-
+	case WM_DO_SETWINDOWPOS:
+		// target := windows.Handle(wParam)
+		// x := int32(lParam >> 16)
+		// y := int32(lParam & 0xFFFF)
+		dataPtr := (*WindowMoveData)(unsafe.Pointer(lParam))
+		// Access fields safely
+		target := dataPtr.Hwnd
+		x := dataPtr.X
+		y := dataPtr.Y
+		ret, _, _ := procSetWindowPos.Call(
+			uintptr(target),
+			uintptr(dataPtr.InsertAfter), //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below means it's not used
+			uintptr(x), uintptr(y),
+			0, 0,
+			uintptr(dataPtr.Flags),
+		)
 		//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
 		//TODO: Add WH_SHELL Hook for Focus Change Detection
 		//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — post them too.
-		//TODO: make into function and use it for MMB too!
-		ret, _, _ := procSetWindowPos.Call(
-			uintptr(target),
-			0, //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below
-			uintptr(x), uintptr(y),
-			0, 0,
-			SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER,
-		)
+		// ret, _, _ := procSetWindowPos.Call(
+		// 	uintptr(target),
+		// 	0, //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below means it's not used
+		// 	uintptr(x), uintptr(y),
+		// 	0, 0,
+		// 	SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER,
+		// )
 		if ret == 0 {
 			errCode, _, _ := procGetLastError.Call()
 			logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
