@@ -786,21 +786,19 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
-	//TODO: move these so they don't get set even for mouse movements.
-	//nolint:staticcheck,QF1011
-	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	//nolint:staticcheck,QF1011
-	var shiftDown bool = keyDown(VK_SHIFT)
-	//nolint:staticcheck,QF1011
-	var ctrlDown bool = keyDown(VK_CONTROL)
-	//nolint:staticcheck,QF1011
-	var altDown bool = keyDown(VK_MENU)
-
 	//logf("in mouseProc")//spammy on mouse movements!
 	//hardResetIfDesynced()
 
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed.
+		//nolint:staticcheck,QF1011
+		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		//nolint:staticcheck,QF1011
+		var shiftDown bool = keyDown(VK_SHIFT)
+		//nolint:staticcheck,QF1011
+		var ctrlDown bool = keyDown(VK_CONTROL)
+		//nolint:staticcheck,QF1011
+		var altDown bool = keyDown(VK_MENU)
 		//if winKeyDown() {
 		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
@@ -891,6 +889,14 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
+		//nolint:staticcheck,QF1011
+		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		//nolint:staticcheck,QF1011
+		var shiftDown bool = keyDown(VK_SHIFT)
+		//nolint:staticcheck,QF1011
+		var ctrlDown bool = keyDown(VK_CONTROL)
+		//nolint:staticcheck,QF1011
+		var altDown bool = keyDown(VK_MENU)
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
 			if !winGestureUsed { //wasn't set already
