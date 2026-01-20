@@ -1,0 +1,116 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  skip-dirs-use-default: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: true
+#  exclude-rules:
+    #- linters: 
+      #- revive
+      #text: "omit"
+
+linters:
+  disable-all: true
+  enable:
+    # --- correctness & bugs ---
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - nilerr
+    - nilnil
+    - bodyclose
+    - rowserrcheck
+
+    # --- security / footguns ---
+    - gosec
+    - sqlclosecheck
+
+    # --- error handling & logic ---
+    - errorlint
+    - wrapcheck
+    - exhaustive
+    - copyloopvar
+
+    # --- concurrency ---
+    - gocritic
+    - prealloc
+
+    # --- style (light, not pedantic) ---
+    - revive
+    - misspell
+    - unconvert
+    - whitespace
+
+    # --- unused / dead code ---
+    - unused
+
+linters-settings:
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # good to know, rarely worth the churn
+
+  staticcheck:
+    checks:
+      enabled:
+        - all
+#noeffect        - -QF1011
+
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  errorlint:
+    asserts: true
+    comparison: true
+
+  wrapcheck:
+    ignoreSigs:
+      - .Errorf(
+      - errors.New(
+      - fmt.Errorf(
+    ignorePackageGlobs:
+      - net/http
+      - database/sql
+
+  revive:
+    severity: warning
+#noeffecct    enable-all-rules: false
+    rules:
+      - name: var-naming
+      - name: early-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+      - name: unexported-return
+      - name: unused-parameter
+      - name: empty-lines
+        
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+      - opinionated
+    disabled-checks:
+      - unnamedResult       # you *intentionally* use named returns
+      - ifElseChain
+      - octalLiteral
+      - hugeParam
+
+  gosec:
+    severity: medium
+    confidence: medium
+    excludes:
+      - G104  # ignoring errors from deferred Close is often fine
+
+  exhaustive:
+    check-generated: false
+
