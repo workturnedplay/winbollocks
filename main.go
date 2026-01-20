@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// CRAPitkillsallfromrevive//nolint:revive,var-declaration
 package main
 
 import (
@@ -21,12 +22,27 @@ import (
 	"os"
 	"runtime"
 
-	"unsafe"
-
 	"golang.org/x/sys/windows"
+	"time"
+	"unsafe"
 )
 
 /* ---------------- DLLs & Procs ---------------- */
+
+var (
+	moveCounter     int       // how many move events we saw since last log
+	lastRateLogTime time.Time // when we last printed the rate
+	rateLogInterval = 1 * time.Second
+)
+var actualPostCounter int
+
+// Globals
+var (
+	lastMovePostedTime       time.Time
+	lastPostedX, lastPostedY int32
+)
+
+const MIN_MOVE_INTERVAL = 33 * time.Millisecond // ~30 fps – very pleasant
 
 var (
 	user32   = windows.NewLazySystemDLL("user32.dll")
@@ -179,11 +195,17 @@ const (
 	WM_DO_SETWINDOWPOS   = WM_USER + 200 // arbitrary, just unique
 )
 const (
-	MENU_FORCE_MANUAL  = 1
-	MENU_ACTIVATE_MOVE = 2
-	MENU_EXIT          = 3
-	MF_STRING          = 0x0000
-	MF_CHECKED         = 0x0008
+	MENU_EXIT              = 1
+	MENU_FORCE_MANUAL      = 2
+	MENU_ACTIVATE_MOVE     = 3
+	MENU_RATELIMIT_MOVES   = 4
+	MENU_LOG_RATE_OF_MOVES = 5
+
+	MF_STRING = 0x0000
+
+	MF_GRAYED   = 0x00000001
+	MF_DISABLED = 0x00000002
+	MF_CHECKED  = 0x00000008
 )
 
 const (
@@ -377,6 +399,8 @@ var (
 )
 var forceManual bool // Default is false, if left like this.
 var activateOnMove bool
+var ratelimitOnMove bool
+var shouldLogDragRate bool // but only when ratelimitOnMove is true
 
 /* ---------------- Utilities ---------------- */
 
@@ -872,6 +896,14 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 	case WM_MOUSEMOVE:
 		if capturing && currentDrag != nil && currentDrag.manual {
+			// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
+			var now time.Time
+			if ratelimitOnMove {
+				now = time.Now()
+				// Count every potential move (even if we skip due to debounce)
+				moveCounter++
+			}
+
 			dx := info.Pt.X - currentDrag.startPt.X
 			dy := info.Pt.Y - currentDrag.startPt.Y
 			r := currentDrag.startRect
@@ -881,7 +913,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// 0, 0,
 			// windows.SWP_NOSIZE|windows.SWP_NOZORDER|windows.SWP_NOACTIVATE,
 			// )
-			//FIXME: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
+			//XXX: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
 			newX := r.Left + dx
 			newY := r.Top + dy
 			// procSetWindowPos.Call(
@@ -894,30 +926,70 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// 	SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
 			// )
 
-			data := new(WindowMoveData) // Heap-allocated
-			data.Hwnd = targetWnd
-			data.X = newX // int32, full range
-			data.Y = newY
-			data.InsertAfter = 0 // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
+			//THISIGNORESALLfrom_staticcheck//nolint:staticcheck,QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
+			var willPostMessage bool = !ratelimitOnMove || (newX != lastPostedX || newY != lastPostedY) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
+			// Optional: Also count only the ones that would have posted (uncomment if you want both stats)
+			if ratelimitOnMove && shouldLogDragRate && willPostMessage {
+				actualPostCounter++
+			}
 
-			data.Flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER // Or dynamic
+			// Periodic logging every ~1 second
+			if ratelimitOnMove && shouldLogDragRate && now.Sub(lastRateLogTime) >= rateLogInterval {
+				var secondsElapsed float64 = now.Sub(lastRateLogTime).Seconds()
+				if secondsElapsed > 0 {
+					rate := float64(moveCounter) / secondsElapsed
+					// logf("Drag move rate: %d events in %.2fs → %.1f moves/sec",
+					// 	moveCounter, secondsElapsed, rate)
+					// In the periodic log block:
+					logf("Drag move rate: %d potential / %d actual moves in %.2fs → %.1f / %.1f per sec",
+						moveCounter, actualPostCounter, secondsElapsed,
+						rate, //float64(moveCounter)/secondsElapsed,
+						float64(actualPostCounter)/secondsElapsed)
+				}
 
-			// Post the move request instead of doing the windows move/drag motion here
-			procPostMessage.Call(
-				uintptr(trayIcon.HWnd),
-				WM_DO_SETWINDOWPOS,
-				0,                             // unused, target is in the struct!
-				uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
-			)
-			// procPostMessage.Call(
-			// 	uintptr(trayIcon.HWnd), // your message window hwnd
-			// 	WM_DO_WINDOW_MOVE,
-			// 	//uintptr(targetWnd),              // wParam = hwnd to move
-			// 	uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data), bad: loses sign - grok made it initially.
-			// )
+				// Reset counters
+				moveCounter = 0
+				actualPostCounter = 0
+				lastRateLogTime = now
+			}
 
-			return 0 //0 = let thru
-		}
+			// Then proceed with your existing debounce/post logic...
+			if willPostMessage { //(newX != lastPostedX || newY != lastPostedY) &&
+				//now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL {
+				// Inside the if (debounce condition):
+				//actualPostCounter++
+				// prepare data & procPostMessage.Call(...)
+
+				data := new(WindowMoveData) // Heap-allocated
+				data.Hwnd = targetWnd
+				data.X = newX // int32, full range
+				data.Y = newY
+				data.InsertAfter = 0 // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
+
+				data.Flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER // Or dynamic
+
+				// Post the move request instead of doing the windows move/drag motion here
+				procPostMessage.Call(
+					uintptr(trayIcon.HWnd),
+					WM_DO_SETWINDOWPOS,
+					0,                             // unused, target is in the struct!
+					uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
+				)
+				// procPostMessage.Call(
+				// 	uintptr(trayIcon.HWnd), // your message window hwnd
+				// 	WM_DO_WINDOW_MOVE,
+				// 	//uintptr(targetWnd),              // wParam = hwnd to move
+				// 	uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data), bad: loses sign - grok made it initially.
+				// )
+
+				if ratelimitOnMove {
+					lastMovePostedTime = now
+					lastPostedX = newX
+					lastPostedY = newY
+				}
+				return 0 //0 = let thru
+			}
+		} //main 'if'
 
 	case WM_LBUTTONUP: //LMB released
 		if capturing {
@@ -1062,6 +1134,7 @@ func createMessageWindow() windows.Handle {
 func mustUTF16(s string) *uint16 {
 	p, err := windows.UTF16PtrFromString(s)
 	if err != nil {
+		logf("failed in mustUTF16, err:%v", err)
 		panic(err)
 	}
 	return p
@@ -1132,8 +1205,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		if lParam == WM_RBUTTONUP {
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
-			manualText, _ := windows.UTF16PtrFromString("Manual move (no focus)")
-			exitText, _ := windows.UTF16PtrFromString("Exit")
+			exitText := mustUTF16("Exit")
+			manualText := mustUTF16("Manual move (no focus)")
+			focusText := mustUTF16("Activate(focus) window on move")
+			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
+			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 
 			flags := MF_STRING
 			if forceManual {
@@ -1147,7 +1223,25 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				actFlags |= MF_CHECKED
 			}
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
-				uintptr(unsafe.Pointer(mustUTF16("Activate window on move"))))
+				uintptr(unsafe.Pointer(focusText)))
+
+			var rlFlags uintptr = MF_STRING
+			if ratelimitOnMove {
+				rlFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, rlFlags, MENU_RATELIMIT_MOVES,
+				uintptr(unsafe.Pointer(ratelimitText)))
+
+			var sldrFlags uintptr = MF_STRING
+			if shouldLogDragRate {
+				sldrFlags |= MF_CHECKED
+			}
+			// Disable (grey) the "Log rate of moves" item when rate-limit is off
+			if !ratelimitOnMove {
+				sldrFlags |= MF_DISABLED | MF_GRAYED
+			}
+			procAppendMenu.Call(hMenu, sldrFlags, MENU_LOG_RATE_OF_MOVES,
+				uintptr(unsafe.Pointer(sldrText)))
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
@@ -1173,6 +1267,19 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				forceManual = !forceManual
 			case MENU_ACTIVATE_MOVE:
 				activateOnMove = !activateOnMove
+			case MENU_RATELIMIT_MOVES:
+				ratelimitOnMove = !ratelimitOnMove
+				if !ratelimitOnMove {
+					moveCounter = 0
+					actualPostCounter = 0
+					now := time.Now()
+					lastRateLogTime = now
+					lastMovePostedTime = now
+					lastPostedX = -1
+					lastPostedY = -1
+				}
+			case MENU_LOG_RATE_OF_MOVES:
+				shouldLogDragRate = !shouldLogDragRate
 
 			case MENU_EXIT:
 				procUnhookWindowsHookEx.Call(uintptr(hHook))
@@ -1720,6 +1827,15 @@ func main() {
 	//defaults:
 	forceManual = true
 	activateOnMove = true
+	ratelimitOnMove = true
+	shouldLogDragRate = false
+
+	lastPostedX = -1
+	lastPostedY = -1
+	now := time.Now()
+	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
+	lastRateLogTime = now
+	lastMovePostedTime = now
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
