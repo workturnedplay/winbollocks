@@ -831,13 +831,9 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed.
-		//nolint:staticcheck,QF1011
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		//nolint:staticcheck,QF1011
 		var shiftDown bool = keyDown(VK_SHIFT)
-		//nolint:staticcheck,QF1011
 		var ctrlDown bool = keyDown(VK_CONTROL)
-		//nolint:staticcheck,QF1011
 		var altDown bool = keyDown(VK_MENU)
 		//if winKeyDown() {
 		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
@@ -1005,13 +1001,9 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
-		//nolint:staticcheck,QF1011
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		//nolint:staticcheck,QF1011
 		var shiftDown bool = keyDown(VK_SHIFT)
-		//nolint:staticcheck,QF1011
 		var ctrlDown bool = keyDown(VK_CONTROL)
-		//nolint:staticcheck,QF1011
 		var altDown bool = keyDown(VK_MENU)
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
@@ -1548,8 +1540,7 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
-	//nolint:unsafeptr // Win32 hook lParam is OS-owned pointer valid for callback duration
-	//nolint:govet,unsafeptr
+	//no effect: //nolint:govet,unsafeptr // Win32 hook lParam is OS-owned pointer valid for callback duration
 	k := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
 	vk := k.VkCode
 	// You see here even modifiers repeat just like letters, when held down!
@@ -1593,13 +1584,9 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		- chatgpt 5.2
 	*/
 
-	// //nolint:staticcheck,QF1011
 	// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	// //nolint:staticcheck,QF1011
 	// var shiftDown bool = keyDown(VK_SHIFT)
-	// //nolint:staticcheck,QF1011
 	// var ctrlDown bool = keyDown(VK_CONTROL)
-	// //nolint:staticcheck,QF1011
 	// var altDown bool = keyDown(VK_MENU)
 
 	// switch wParam {
@@ -1694,7 +1681,6 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			   Deterministic behavior
 			*/
 
-			//nolint:staticcheck,QF1011 // QF1011: could omit type bool from declaration; it will be inferred
 			//var checkBefore bool = winDown && !shiftDown && !altDown && !ctrlDown
 			// if winDown {
 			// 	// so this always triggers here, unclear as to why.
