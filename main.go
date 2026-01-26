@@ -15,6 +15,8 @@
 // limitations under the License.
 
 // CRAPitkillsallfromrevive//nolint:revive,var-declaration
+//
+// XXX: yes this works too, here: //revive:disable:var-declaration
 package main
 
 import (
@@ -42,6 +44,7 @@ var (
 	lastPostedX, lastPostedY int32
 )
 
+// XXX: yes this works too, here: //revive:disable:var-naming
 const MIN_MOVE_INTERVAL = 33 * time.Millisecond // ~30 fps – very pleasant
 
 var (

@@ -10,9 +10,8 @@ issues:
   max-same-issues: 0
   exclude-use-default: true
 #  exclude-rules:
-    #- linters: 
-      #- revive
-      #text: "omit"
+#    - linters: [revive]
+#      text: "ALL_CAPS"
 
 linters:
   disable-all: true
@@ -49,68 +48,75 @@ linters:
 
     # --- unused / dead code ---
     - unused
+  settings:
+    #gocritic:
+    #  disabled-checks:
+    #    - commentFormatting #found where to place it correctly by Gemini 3 Fast! (yes, really) ie. must be in linters: settings: not linters-settings:
 
-linters-settings:
+#linters-settings:
 
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment  # good to know, rarely worth the churn
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # good to know, rarely worth the churn
 
-  staticcheck:
-    checks:
-      enabled:
-        - all
-#noeffect        - -QF1011
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1003"
 
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
 
-  errorlint:
-    asserts: true
-    comparison: true
+    errorlint:
+      asserts: true
+      comparison: true
 
-  wrapcheck:
-    ignoreSigs:
-      - .Errorf(
-      - errors.New(
-      - fmt.Errorf(
-    ignorePackageGlobs:
-      - net/http
-      - database/sql
+    wrapcheck:
+      ignoreSigs:
+        - .Errorf(
+        - errors.New(
+        - fmt.Errorf(
+      ignorePackageGlobs:
+        - net/http
+        - database/sql
 
-  revive:
-    severity: warning
-#noeffecct    enable-all-rules: false
-    rules:
-      - name: var-naming
-      - name: early-return
-      - name: error-strings
-      - name: error-naming
-      - name: exported
-      - name: unexported-return
-      - name: unused-parameter
-      - name: empty-lines
-        
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-      - performance
-      - opinionated
-    disabled-checks:
-      - unnamedResult       # you *intentionally* use named returns
-      - ifElseChain
-      - octalLiteral
-      - hugeParam
+    revive:
+      #enable-all-rules: false
+      severity: warning
+      rules:
+        - name: var-naming
+          disabled: true
+        - name: early-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: unexported-return
+        - name: unused-parameter
+        - name: empty-lines
+        - name: var-declaration
+          disabled: true
 
-  gosec:
-    severity: medium
-    confidence: medium
-    excludes:
-      - G104  # ignoring errors from deferred Close is often fine
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        - unnamedResult       # you *intentionally* use named returns
+        - ifElseChain
+        - octalLiteral
+        - hugeParam
+        - commentFormatting
 
-  exhaustive:
-    check-generated: false
+    gosec:
+      severity: medium
+      confidence: medium
+      excludes:
+        - G104  # ignoring errors from deferred Close is often fine
+
+    exhaustive:
+      check-generated: false
 
