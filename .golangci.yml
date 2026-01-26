@@ -63,7 +63,8 @@ linters:
     staticcheck:
       checks:
         - "all"
-        - "-ST1003"
+        - "-ST1003" #ST1003: should not use ALL_CAPS in Go names; use CamelCase instead (staticcheck)go-golangci-lint-v2
+        - "-QF1011" #QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
 
     errcheck:
       check-type-assertions: true
@@ -109,7 +110,7 @@ linters:
         - ifElseChain
         - octalLiteral
         - hugeParam
-        - commentFormatting
+        - commentFormatting #commentFormatting: put a space between `//` and comment text (gocritic)go-golangci-lint-v2
 
     gosec:
       severity: medium
