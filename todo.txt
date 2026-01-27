@@ -1,3 +1,4 @@
 * make an option which when on then when currently focused window is fullscreen or borderless fullscreen (if detectable ofc) then don't try to use the gestures ie. bypass the code checking for them, so for example: winkey held down code won't activate, this way, any kind of theoretical slowdown on input(due to calls to getasyncstate or saving/reading atomic bools) will be removed. - it's more expensive than just checking for keys to activate, if I do it in the same place (in hooks), but maybe if I do it in some specific on focus hook then it would work.
-* see if child windows or dialogs like the LAN adapter config. can be moved and how.
+//they can be moved * see if child windows or dialogs like the LAN adapter config. can be moved and how.
 //* FIXME: winkey+L will make prog think winkey is held after unlock!
+* ensure when runasadmin.bat and LMB-dragging scrollbar of that cmd.exe (admin) the mouse movements aren't 500ms delayed - probably need to use separate thread for hooks(+ their own msg.loop).

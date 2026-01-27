@@ -20,6 +20,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -2162,14 +2163,30 @@ func ensureSingleInstance(name string) {
 	namePtr, _ := windows.UTF16PtrFromString("Global\\" + name)
 
 	// CreateMutex(lpMutexAttributes, bInitialOwner, lpName)
-	ret, _, _ := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
+	ret, _, callErr := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
 
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// We don't want to pause here usually, just die quietly or alert user.
-		// fmt.Printf("Application '%s' is already running.\n", name)
-		// os.Exit(0)
-		// Use our new exit logic to ensure the defer pause happens
-		exitf(0, "Application '%s' is already running.", name)
+	// if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+	// 	// We don't want to pause here usually, just die quietly or alert user.
+	// 	// fmt.Printf("Application '%s' is already running.\n", name)
+	// 	// os.Exit(0)
+	// 	// Use our new exit logic to ensure the defer pause happens
+	// 	exitf(0, "Application '%s' is already running.", name)
+	// }
+
+	// Normalize to an error we can use with errors.Is.
+	var err error
+	if callErr != nil && !errors.Is(callErr, windows.Errno(0)) {
+		err = callErr
+	} else if last := windows.GetLastError(); last != nil && !errors.Is(last, windows.Errno(0)) {
+		err = last
+	}
+
+	if err != nil {
+		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			exitf(0, "Application '%s' is already running.", name)
+		}
+		// other error handling if needed:
+		// exitf(1, "CreateMutex failed: %v", err)
 	}
 
 	// Note: We don't technically need to close this handle manually.
