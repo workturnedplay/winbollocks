@@ -1,6 +1,18 @@
 @echo off
+echo Running go vet...
+:: ./... means “Walk the directory tree from here, find every Go package, and apply vet to each.”
+:: 'go vet' does:
+:: Full static analysis of the package
+:: Including unreachable code
+:: Including dead branches
+:: Including code not exercised by tests
+::go vet -mod=vendor ./...
+go vet -mod=vendor -unsafeptr=false
+if errorlevel 1 goto :fail
+
 go build -mod=vendor .
-pause
+if errorlevel 1 goto :fail
+::pause
 
 ::When you build with: -ldflags "-H=windowsgui"
 ::your binary is linked as a GUI subsystem executable (/SUBSYSTEM:WINDOWS), not a console subsystem one.
@@ -31,3 +43,13 @@ pause
 ::No input differences.
 ::
 ::This flag affects only how Windows initializes the process.
+
+echo Build succeeded.
+pause
+goto :eof
+
+:fail
+echo.
+echo *** BUILD FAILED ***
+pause
+exit /b 1
