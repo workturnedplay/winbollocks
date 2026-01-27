@@ -1,5 +1,8 @@
 @echo off
 
+::if running as admin must get back to current dir:
+cd /d %~dp0
+
 echo Running go vet...
 :: ./... means “Walk the directory tree from here, find every Go package, and apply vet to each.”
 :: 'go vet' does:

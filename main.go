@@ -33,7 +33,9 @@ import (
 )
 
 /* ---------------- DLLs & Procs ---------------- */
-//var shellHook windows.Handle
+var procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+
+// var shellHook windows.Handle
 var (
 	// The Data Pipe (2048 is plenty for lag spikes)
 	moveDataChan = make(chan WindowMoveData, 2048)
@@ -2152,6 +2154,11 @@ var (
 
 func ensureSingleInstance(name string) {
 	// Create a global mutex. The "Global\" prefix works across terminal sessions.
+	/*
+		Global\: The mutex is visible to all users on the machine. If User A is logged in and User B fast-switches to their account, User B cannot run the app.
+
+		Local\: The mutex is visible only to the current session. User A and User B can both run the app simultaneously in their own sessions.
+	*/
 	namePtr, _ := windows.UTF16PtrFromString("Global\\" + name)
 
 	// CreateMutex(lpMutexAttributes, bInitialOwner, lpName)
@@ -2188,26 +2195,47 @@ func main() {
 				currentExitCode = status.Code
 				// This was an intentional exit(code)
 				//if code != 0 {
-				logf("\nProgram intentionally exited with code: '%d' and error message: '%s'\n", currentExitCode, status.Message)
+				logf("Program intentionally exited with code: '%d' and error message: '%s'\n", currentExitCode, status.Message)
 				//}
 			} else {
 				currentExitCode = 1
 				stack := debug.Stack()
-				logf("\n--- CRASH: %v ---\nStack: %s\n--- END---\n", r, stack)
+				logf("--- CRASH: %v ---\nStack: %s\n--- END---\n", r, stack)
 				//debug.PrintStack()
 			}
 		}
-		logf("\nExecution finished.")
+		logf("Execution finished.")
 		// 2. Use your high-quality "clrbuf" waiter
 		detectConsole() // updated global bool
+		// Only pause if we have an actual console window and an error occurred
+		// hConsole, _, _ := procGetConsoleWindow.Call()
+		// // 2. If no handle, try to attach to the parent's console
+		// if hConsole == 0 {
+		// 	var (
+		// 		procAttachConsole     = kernel32.NewProc("AttachConsole")
+		// 		ATTACH_PARENT_PROCESS = uintptr(^uint32(0)) // -1
+		// 	)
+		// 	ret, _, _ := procAttachConsole.Call(ATTACH_PARENT_PROCESS)
+		// 	if ret != 0 {
+		// 		hConsole, _, _ = procGetConsoleWindow.Call()
+		// 	}
+		// }
+		// // 2. Check if Stdin is actually a terminal (not a pipe/null)
+		// stat, _ := os.Stdin.Stat()
+		// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
+		// logf("s1")
+		//if hasConsole || hConsole != 0 || isTerminal || true {
 		if hasConsole {
+			//logf("s2")
 			todo()
+			//logf("s3")
 			//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this.
 		}
 		//logf("\nExecution finished. Press any key to exit...")
 		//var input string
 		//fmt.Scanln(&input)
 		//fmt.Scanln()             //FIXME: pending, it should wait for key not Enter. (won't use this after copying the code for the above)
+		//logf("s4")
 		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
 	}()
 
@@ -2396,9 +2424,10 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 // Separate function to keep the loop readable
 func drainMoveChannel() {
 	for {
-		// Task 15: Track High-Water Mark
+		// Track High-Water Mark
 		currentFill := int64(len(moveDataChan))
 		if currentFill > maxChannelFill.Load() {
+			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
 			maxChannelFill.Store(currentFill)
 			logf("New Channel Peak: %d events queued (Dropped: %d)",
 				currentFill, droppedEvents.Load())
