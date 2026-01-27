@@ -26,12 +26,27 @@ import (
 	"runtime/debug"
 
 	"golang.org/x/sys/windows"
+
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
 
 /* ---------------- DLLs & Procs ---------------- */
 //var shellHook windows.Handle
+var (
+	// The Data Pipe (2048 is plenty for lag spikes)
+	moveDataChan = make(chan WindowMoveData, 2048)
+
+	// Modern Atomic tracking
+	droppedEvents  atomic.Uint32
+	maxChannelFill atomic.Int64 // To track how "full" it got
+
+	// To tell the hook where to send the "Doorbell"
+	mainThreadId uint32
+
+	procPostThreadMessage = user32.NewProc("PostThreadMessageW")
+)
 
 var (
 	procSetWinEventHook = user32.NewProc("SetWinEventHook")
@@ -204,9 +219,10 @@ const (
 const (
 	WM_START_NATIVE_DRAG = WM_USER + 1
 	WM_TRAY              = WM_USER + 2
-	WM_INJECT_SEQUENCE   = WM_USER + 100
-	WM_INJECT_LMB_CLICK  = WM_USER + 101
-	WM_DO_SETWINDOWPOS   = WM_USER + 200 // arbitrary, just unique
+	//WM_WAKE_UP           = WM_USER + 3
+	WM_INJECT_SEQUENCE  = WM_USER + 100
+	WM_INJECT_LMB_CLICK = WM_USER + 101
+	WM_DO_SETWINDOWPOS  = WM_USER + 200 // arbitrary, just unique
 )
 const (
 	MENU_EXIT              = 1
@@ -1012,6 +1028,8 @@ func isWindowForeground(hwnd windows.Handle) bool {
 "When a qualifying input event occurs (e.g., a mouse move or key press), the system detects installed low-level hooks and posts a special internal message (not a standard WM_ message) to the message queue of the thread that installed the hook. Your message loop then retrieves and dispatches this message, and during dispatch, Windows invokes your hook callback (mouseProc or keyboardProc)." - Grok
 */
 func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
+	// Standard Win32 Hook practice: If nCode < 0, we must pass it
+	// to the next hook immediately and stay out of the way.
 	if nCode < 0 {
 		ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
 		return ret
@@ -1092,9 +1110,10 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					)
 				}
 				return 1 // swallow LMB only for manual
-			} else {
-				return 0 // let native move receive input
+				//} else {
+				//	return 0 // let native move receive input
 			}
+			//XXX: else, let it fall thru(let native move receive input) so CallNextHookEx is called too
 			//}
 		}
 
@@ -1164,34 +1183,56 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				//actualPostCounter++
 				// prepare data & procPostMessage.Call(...)
 
-				data := new(WindowMoveData) // Heap-allocated, TODO: avoid heap allocation somehow.
-				data.Hwnd = targetWnd
-				data.X = newX // int32, full range
-				data.Y = newY
-				data.InsertAfter = 0 // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
+				//data := new(WindowMoveData) // Heap-allocated, TODO: avoid heap allocation somehow.
+				// Create a local copy of the data.
+				// This stays on the STACK, so it's lightning fast.
+				data := WindowMoveData{
+					Hwnd:        targetWnd,
+					X:           newX,
+					Y:           newY,
+					InsertAfter: 0, // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
+					Flags:       SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+				}
+				//data.Hwnd = targetWnd
+				//data.X = newX // int32, full range
+				//data.Y = newY
+				//data.InsertAfter = 0 // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
 
-				data.Flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER // Or dynamic
+				//data.Flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER // Or dynamic
 
-				// Post the move request instead of doing the windows move/drag motion here
-				procPostMessage.Call(
-					uintptr(trayIcon.HWnd),
-					WM_DO_SETWINDOWPOS,
-					0,                             // unused, target is in the struct!
-					uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
-				)
+				//// Post the move request instead of doing the windows move/drag motion here
 				// procPostMessage.Call(
-				// 	uintptr(trayIcon.HWnd), // your message window hwnd
-				// 	WM_DO_WINDOW_MOVE,
-				// 	//uintptr(targetWnd),              // wParam = hwnd to move
-				// 	uintptr(newX)<<16|uintptr(newY), // lParam = packed x,y (or use a struct if more data), bad: loses sign - grok made it initially.
+				// 	uintptr(trayIcon.HWnd),
+				// 	WM_DO_SETWINDOWPOS,
+				// 	0,                             // unused, target is in the struct!
+				// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
 				// )
+
+				/* THE SELECT BLOCK:
+				   This is Go's magic for non-blocking communication.
+				*/
+				select {
+				case moveDataChan <- data:
+					// SUCCESS: The data was copied into the buffered channel.
+					// Now we ring the "Doorbell" to wake up the Main Thread.
+					// PostThreadMessage is an asynchronous "fire and forget" call.
+					procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+
+				default:
+					// FAIL: The channel (2048 slots) is completely full.
+					// This happens if the Main Thread is frozen (e.g., Admin console lag).
+					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+					// We just increment our "shame counter" and move on.
+					droppedEvents.Add(1)
+				}
 
 				if ratelimitOnMove {
 					lastMovePostedTime = now
 					lastPostedX = newX
 					lastPostedY = newY
 				}
-				return 0 //0 = let thru
+				//return 0 //0 = let it thru
+				//XXX: let it fall thru so CallNextHookEx is also called!
 			}
 		} //main 'if'
 
@@ -1202,7 +1243,8 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			targetWnd = 0
 			procReleaseCapture.Call()
 
-			return 0 //0 is to let it thru (1 was to swallow)
+			//return 0 //0 is to let it thru (1 was to swallow)
+			//XXX: let it fall thru so CallNextHookEx is also called!
 		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
@@ -1210,66 +1252,41 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		var shiftDown bool = keyDown(VK_SHIFT)
 		var ctrlDown bool = keyDown(VK_CONTROL)
 		var altDown bool = keyDown(VK_MENU)
+
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
 			if !winGestureUsed { //wasn't set already
 				winGestureUsed = true // we used at least once of our gestures
 			}
-			data := new(WindowMoveData) // Heap-allocated
+
+			//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
+			var data WindowMoveData // stack allocated — zero cost
+
 			var hwnd windows.Handle
 			if !shiftDown {
+				// winkey + MMB → send active window to bottom
+
 				// winkey_DOWN but no other modifiers(including shift) is down
 				// and LMB is down, ofc, then we start move window gesture:
 
 				data.InsertAfter = HWND_BOTTOM
 				data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-				hwnd = windowFromPoint(info.Pt)
+				hwnd = windowFromPoint(info.Pt) // window under cursor
 
 			} else {
+				// winkey + shift + MMB → bring focused window to top
+
 				// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
 				// but no other modifiers like ctrl or alt are down
 				// then we start the bring focused window to front gesture:
 				data.InsertAfter = HWND_TOP
-				data.Flags = SWP_NOMOVE | SWP_NOSIZE //|SWP_NOACTIVATE,
-				//hwnd := windowFromPoint(info.Pt) // window under cursor
+				data.Flags = SWP_NOMOVE | SWP_NOSIZE        //|SWP_NOACTIVATE,
 				ret, _, _ := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
 				hwnd = windows.Handle(ret)                  // ← explicit cast
-				//if hwnd != 0 {
-				//logf("oh yea")
 				// Bring to front, no activation, works only for the currently focused window which was sent to back before
 				//had no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 !
-				// procSetWindowPos.Call(
-				// 	uintptr(hwnd),
-				// 	uintptr(HWND_TOP),
-				// 	0, 0, 0, 0,
-				// 	SWP_NOMOVE|SWP_NOSIZE, //|SWP_NOACTIVATE,
-				// ) //last good
-
-				// // Step 1: temporarily force topmost
-				// procSetWindowPos.Call(
-				// uintptr(hwnd),
-				// HWND_TOPMOST,
-				// 0, 0, 0, 0,
-				// SWP_NOMOVE|SWP_NOSIZE,
-				// )
-
-				// // Step 2: immediately remove topmost
-				// procSetWindowPos.Call(
-				// uintptr(hwnd),
-				// HWND_NOTOPMOST,
-				// 0, 0, 0, 0,
-				// SWP_NOMOVE|SWP_NOSIZE,
-				// )
-
-				// // Step 1: Activate desktop, ie. defocus current window.
-				// desktop, _, _ := procGetDesktopWindow.Call()
-				//logf("desktop hwnd = 0x%x", desktop)
-				// procSetForegroundWindow.Call(desktop)
-
-				// // Step 2: Activate the same window that was focused.
-				// procSetForegroundWindow.Call(uintptr(hwnd))
-				//}
 			} // else
+
 			if hwnd != 0 {
 				// Send to back, no activation
 				// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
@@ -1285,18 +1302,33 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				data.Y = 0
 
 				// Post the move request instead of doing the windows move/drag motion here
-				procPostMessage.Call(
-					uintptr(trayIcon.HWnd),
-					WM_DO_SETWINDOWPOS,
-					0,                             // unused, target is in the struct!
-					uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
-				)
+				// procPostMessage.Call(
+				// 	uintptr(trayIcon.HWnd),
+				// 	WM_DO_SETWINDOWPOS,
+				// 	0,                             // unused, target is in the struct!
+				// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct, XXX: this was bad, it would get GC-ed, Grok figured it out after i was mid-refactoring via Gemini(which didn't)
+				// )
+				select {
+				case moveDataChan <- data:
+					// SUCCESS: The data was copied into the buffered channel.
+					// Now we ring the "Doorbell" to wake up the Main Thread.
+					// PostThreadMessage is an asynchronous "fire and forget" call.
+					procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+
+				default:
+					// FAIL: The channel (2048 slots) is completely full.
+					// This happens if the Main Thread is frozen (e.g., Admin console lag).
+					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+					// We just increment our "shame counter" and move on.
+					droppedEvents.Add(1)
+				}
 			}
 			return 1 // swallow MMB
 		} // the 'if' in MMB
 
 	} //switch
 
+	// Always pass the event down the chain so other apps don't break
 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
 	return ret
 }
@@ -1342,43 +1374,62 @@ func mustUTF16(s string) *uint16 {
 
 var mouseCallback uintptr
 
+func handleActualMove(data WindowMoveData) {
+	target := data.Hwnd
+	x := data.X
+	y := data.Y
+
+	ret, _, _ := procSetWindowPos.Call(
+		uintptr(target),
+		uintptr(data.InsertAfter),
+		uintptr(x), uintptr(y),
+		0, 0,
+		uintptr(data.Flags),
+	)
+
+	if ret == 0 {
+		errCode, _, _ := procGetLastError.Call()
+		logf("SetWindowPos failed(from within main message loop): hwnd=0x%x error=%d", target, errCode)
+
+		// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
+		pt := POINT{X: x, Y: y}
+		lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
+		procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
+	}
+}
+
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
+	//TODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
+	//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
 	case WM_DO_SETWINDOWPOS:
-		// target := windows.Handle(wParam)
-		// x := int32(lParam >> 16)
-		// y := int32(lParam & 0xFFFF)
-		dataPtr := (*WindowMoveData)(unsafe.Pointer(lParam))
-		// Access fields safely
-		target := dataPtr.Hwnd
-		x := dataPtr.X
-		y := dataPtr.Y
-		ret, _, _ := procSetWindowPos.Call(
-			uintptr(target),
-			uintptr(dataPtr.InsertAfter), //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below means it's not used
-			uintptr(x), uintptr(y),
-			0, 0,
-			uintptr(dataPtr.Flags),
-		)
-		//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
-		//TODO: Add WH_SHELL Hook for Focus Change Detection
-		//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — post them too.
-		// ret, _, _ := procSetWindowPos.Call(
-		// 	uintptr(target),
-		// 	0, //HWND_TOP, // top is 0 btw, but SWP_NOZORDER below means it's not used
-		// 	uintptr(x), uintptr(y),
-		// 	0, 0,
-		// 	SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER,
-		// )
-		if ret == 0 {
-			errCode, _, _ := procGetLastError.Call()
-			logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
-			// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
-			pt := POINT{X: x, Y: y} // or current cursor
-			lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
-			procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
-		}
-		return 0
+		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS even in wndProc!")
+	// 	// target := windows.Handle(wParam)
+	// 	// x := int32(lParam >> 16)
+	// 	// y := int32(lParam & 0xFFFF)
+	// 	dataPtr := (*WindowMoveData)(unsafe.Pointer(lParam))
+	// 	// Access fields safely
+	// 	target := dataPtr.Hwnd
+	// 	x := dataPtr.X
+	// 	y := dataPtr.Y
+	// 	ret, _, _ := procSetWindowPos.Call(
+	// 		uintptr(target),
+	// 		uintptr(dataPtr.InsertAfter),
+	// 		uintptr(x), uintptr(y),
+	// 		0, 0,
+	// 		uintptr(dataPtr.Flags),
+	// 	)
+
+	// 	if ret == 0 {
+	// 		errCode, _, _ := procGetLastError.Call()
+	// 		logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
+	// 		// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
+	// 		pt := POINT{X: x, Y: y} // or current cursor
+	// 		lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
+	// 		procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
+	// 	}
+	// 	return 0
 	case WM_START_NATIVE_DRAG:
 		target := windows.Handle(wParam)
 		if target != 0 {
@@ -1492,7 +1543,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_CLOSE: //case 0x0010: // WM_CLOSE
 		procUnhookWindowsHookEx.Call(uintptr(hHook))
 		exit(0)
-	}
+	} //switch
+
+	//let the default window proc handle the rest:
 	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
 	return ret
 })
@@ -1925,10 +1978,12 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 			*/
 
-			if !winGestureUsed {
-				// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
-				return 0 // pass thru the winkeyUP
-			} else {
+			//if !winGestureUsed {
+			// don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu
+			//return 0 // pass thru the winkeyUP
+			//XXX: let it fall thru(aka pass thru the winkeyUP), so that procCallNextHookEx is called!
+			//} else
+			if winGestureUsed {
 				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
 				winGestureUsed = false // gesture ends with winkey_UP
 
@@ -1991,16 +2046,8 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 				“Ah, Win wasn’t alone — suppress Start.”
 				*/
-			}
-			//}
+			} // XXX: else, don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu, so let it fall thru(aka pass thru the winkeyUP), so that procCallNextHookEx is called!
 
-			// //case VK_SHIFT:
-			// case VK_LSHIFT, VK_RSHIFT:
-			// 	shiftDown.Store(false)
-			// case VK_LCONTROL, VK_RCONTROL:
-			// 	ctrlDown.Store(false)
-			// case VK_LMENU, VK_RMENU:
-			// 	altDown.Store(false)
 		}
 	}
 
@@ -2127,7 +2174,7 @@ func ensureSingleInstance(name string) {
 type theILockedMainThreadToken struct{}
 
 func main() {
-	runtime.LockOSThread() // first! in main() not in init() !
+	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
 	token := theILockedMainThreadToken{}
 	defer func() {
 		currentExitCode := 0
@@ -2309,16 +2356,63 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	hwnd := createMessageWindow()
 	initTray(hwnd)
 
+	mainThreadId = windows.GetCurrentThreadId() // Set the global for the hook
 	var msg MSG
 	for {
+		/* GetMessage is the "Event-Driven" king.
+		   It puts this thread to sleep at 0% CPU.
+		   It only wakes up if:
+		   1. A real Windows message (Key, Exit, Window Move) arrives.
+		   2. Our Hook sends the WM_WAKE_UP "Doorbell".
+		*/
 		r, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
 		if int32(r) <= 0 {
 			break
 		}
+		/*
+					Why not handle WM_WAKE_UP in wndProc?
+
+			This is a technical nuance of Win32: When we use PostThreadMessage, the message is sent to the thread, but it doesn't have a window handle (hwnd is 0).
+
+			    DispatchMessage only sends messages to a wndProc if they have a valid hwnd.
+
+			    If hwnd is 0, DispatchMessage does nothing.
+
+			    Therefore, you must catch WM_WAKE_UP directly in the GetMessage loop before it hits the dispatcher.
+		*/
+		// Catch the Doorbell before DispatchMessage sees it
+		if msg.Message == WM_DO_SETWINDOWPOS {
+			drainMoveChannel() // Pull everything from the channel
+			continue           // Skip Dispatching this custom message
+		}
+		// Handle System Tray / Window Messages
+		// This ensures your wndProc gets called!
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 	return nil // no error
+}
+
+// Separate function to keep the loop readable
+func drainMoveChannel() {
+	for {
+		// Task 15: Track High-Water Mark
+		currentFill := int64(len(moveDataChan))
+		if currentFill > maxChannelFill.Load() {
+			maxChannelFill.Store(currentFill)
+			logf("New Channel Peak: %d events queued (Dropped: %d)",
+				currentFill, droppedEvents.Load())
+		}
+
+		select {
+		case data := <-moveDataChan:
+			// Use the data (the struct copy) to move the window.
+			// No heap pointers, no garbage collector stress!
+			handleActualMove(data) // Move the window
+		default:
+			return // Channel empty, go back to GetMessage
+		}
+	}
 }
 
 var (
@@ -2387,8 +2481,10 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		eventName = "EVENT_SYSTEM_MENUEND"
 	case 0x8000:
 		eventName = "EVENT_OBJECT_CREATE"
+		return 0
 	case 0x8001:
 		eventName = "EVENT_OBJECT_DESTROY"
+		return 0
 	case 0x8002:
 		eventName = "EVENT_OBJECT_SHOW"
 	case 0x8003:
@@ -2433,8 +2529,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			logf("PID=%d IL=0x%x err=%v", pid, il, err)
 			//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
 		}
-	} else {
-		logf("event: %v hwnd=0x%x", event, hwnd)
+		//} else {
+		//	logf("event: %v hwnd=0x%x", event, hwnd)
 	}
 	return 0 // WinEvent callbacks return 0 (no chaining)
 }
