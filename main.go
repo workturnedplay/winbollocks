@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 
 	"golang.org/x/sys/windows"
 	"time"
@@ -30,6 +31,16 @@ import (
 )
 
 /* ---------------- DLLs & Procs ---------------- */
+//var shellHook windows.Handle
+
+var (
+	procSetWinEventHook = user32.NewProc("SetWinEventHook")
+	procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
+
+	winEventHook windows.Handle
+)
+
+var winEventCallback = windows.NewCallback(winEventProc)
 
 var (
 	moveCounter     int       // how many move events we saw since last log
@@ -595,7 +606,169 @@ func isMaximized(hwnd windows.Handle) bool {
 
 /* ---------------- Integrity ---------------- */
 
-func processIntegrityLevel(pid uint32) (uint32, error) {
+// func processIntegrityLevel(pid uint32) (uint32, error) { // chatgpt made, gpt-5.2 likely (on Free tier)
+// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer windows.CloseHandle(hProc)
+
+// 	var token windows.Token
+// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
+// 		return 0, err
+// 	}
+// 	defer token.Close()
+
+// 	var needed uint32
+// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+
+// 	buf := make([]byte, needed)
+// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
+// 		return 0, err
+// 	}
+
+// 	sid := (*windows.SID)(unsafe.Pointer(&buf[8]))
+// 	subAuthCount := *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + 1))
+// 	rid := *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + uintptr(8+4*(subAuthCount-1))))
+// 	return rid, nil
+// }
+
+// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made.
+// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer windows.CloseHandle(hProc)
+
+// 	var token windows.Token
+// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
+// 		return 0, err
+// 	}
+// 	defer token.Close()
+
+// 	var needed uint32
+// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+
+// 	buf := make([]byte, needed)
+// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
+// 		return 0, err
+// 	}
+
+// 	// TOKEN_MANDATORY_LABEL header: Sid pointer (uintptr) + Attributes (uint32)
+// 	// SID starts after the header (skip sizeof(uintptr) + sizeof(uint32))
+// 	sidPtrOffset := unsafe.Sizeof(uintptr(0)) + unsafe.Sizeof(uint32(0))
+// 	sid := (*windows.SID)(unsafe.Pointer(&buf[sidPtrOffset]))
+
+// 	// SubAuthorityCount (byte at offset 1 in SID)
+// 	subCount := *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + 1))
+
+// 	// First SubAuthority at offset 8; last (RID) at 8 + 4*(count-1)
+// 	if subCount == 0 {
+// 		return 0, fmt.Errorf("invalid SID")
+// 	}
+// 	ridOffset := uintptr(8 + 4*(subCount-1))
+// 	rid := *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + ridOffset))
+
+// 	return rid, nil
+// }
+
+// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, second try
+// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer windows.CloseHandle(hProc)
+
+// 	var token windows.Token
+// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
+// 		return 0, err
+// 	}
+// 	defer token.Close()
+
+// 	var needed uint32
+// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+
+// 	buf := make([]byte, needed)
+// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
+// 		return 0, err
+// 	}
+
+// 	// Add debug log
+// 	logf("Integrity buf len=%d for PID %d", len(buf), pid)
+
+// 	// TOKEN_MANDATORY_LABEL: Sid (*SID as uintptr) + Attributes (uint32) + padding for alignment
+// 	type tokenMandatoryLabel struct {
+// 		SidPtr     uintptr // pointer to SID
+// 		Attributes uint32
+// 		Padding    uint32 // 64-bit alignment padding
+// 	}
+
+// 	if len(buf) < unsafe.Sizeof(tokenMandatoryLabel{}) {
+// 		return 0, fmt.Errorf("buffer too small: %d", len(buf))
+// 	}
+
+// 	tml := (*tokenMandatoryLabel)(unsafe.Pointer(&buf[0]))
+
+// 	if tml.SidPtr == 0 {
+// 		return 0, fmt.Errorf("nil SID pointer")
+// 	}
+
+// 	sid := (*windows.SID)(unsafe.Pointer(tml.SidPtr))
+
+// 	subCount := sid.SubAuthorityCount
+// 	if subCount == 0 {
+// 		return 0, fmt.Errorf("invalid subauthority count")
+// 	}
+
+// 	// RID is last subauthority
+// 	ridOffset := uintptr(8) + uintptr(subCount-1)*4
+// 	ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + ridOffset))
+// 	rid := *ridPtr
+
+// 	return rid, nil
+// }
+
+// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, 3rd try
+// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+// 	if err != nil {
+// 		return 0, err
+// 	}
+// 	defer windows.CloseHandle(hProc)
+
+// 	var token windows.Token
+// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
+// 		return 0, err
+// 	}
+// 	defer token.Close()
+
+// 	var needed uint32
+// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+
+// 	buf := make([]byte, needed)
+// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
+// 		return 0, err
+// 	}
+
+// 	// Fixed offset for 64-bit (header 16 bytes aligned)
+// 	const sidOffset = 16
+// 	if len(buf) < sidOffset+12 { // min SID size
+// 		return 0, fmt.Errorf("buffer too small: %d", len(buf))
+// 	}
+
+// 	sid := (*windows.SID)(unsafe.Pointer(&buf[sidOffset]))
+
+// 	subCount := sid.SubAuthorityCount
+// 	if subCount == 0 {
+// 		return 0, fmt.Errorf("invalid SID subcount=0")
+// 	}
+
+// 	// RID is last SubAuthority (integrity levels have subCount=1)
+// 	ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&sid.SubAuthority[0])) + uintptr(subCount-1)*4))
+// 	rid := *ridPtr
+
+//		return rid, nil
+//	}
+func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, 4th try
 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return 0, err
@@ -616,16 +789,44 @@ func processIntegrityLevel(pid uint32) (uint32, error) {
 		return 0, err
 	}
 
-	sid := (*windows.SID)(unsafe.Pointer(&buf[8]))
-	subAuthCount := *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + 1))
-	rid := *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + uintptr(8+4*(subAuthCount-1))))
+	// Debug: log buffer size (should be ~28-40 bytes)
+	logf("Integrity buf len=%d for PID %d", len(buf), pid)
+
+	// TOKEN_MANDATORY_LABEL header is 16 bytes on 64-bit (pointer + attributes + padding)
+	const headerSize = 16
+	if len(buf) < headerSize+8 { // + min SID header
+		return 0, fmt.Errorf("buffer too small: %d", len(buf))
+	}
+
+	// SID starts after header
+	//sidBase := uintptr(unsafe.Pointer(&buf[headerSize]))
+
+	// SID fixed header: Revision (1) + SubAuthorityCount (1) + IdentifierAuthority (6) = offset 8 for SubAuthority array
+	//subCountPtr := (*uint8)(unsafe.Pointer(sidBase + 1)) // SubAuthorityCount at offset 1
+	//subCountPtr := (*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[headerSize])) + 1))
+	subCountPtr := (*uint8)(unsafe.Add(unsafe.Pointer(&buf[headerSize]), 1))
+	subCount := *subCountPtr
+	if subCount == 0 {
+		return 0, fmt.Errorf("invalid subauthority count")
+	}
+
+	// SubAuthority array starts at offset 8 from SID base
+	//subAuthBase := sidBase + 8
+
+	// RID is the last SubAuthority
+	//ridOffset := uintptr(subCount-1) * 4
+	//ridPtr := (*uint32)(unsafe.Pointer(subAuthBase + ridOffset))
+	//ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[headerSize])) + 8 + (uintptr(subCount-1) * 4))) //this is fine
+	offset := uintptr(8 + (subCount-1)*4)
+	ridPtr := (*uint32)(unsafe.Add(unsafe.Pointer(&buf[headerSize]), offset))
+	rid := *ridPtr
+
 	return rid, nil
 }
 
 /* ---------------- Tray ---------------- */
 
 func initTray(hwnd windows.Handle) {
-
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.HWnd = hwnd
 	trayIcon.UID = 1
@@ -816,8 +1017,12 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
-	//nolint:govet
-	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam))
+	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam)) // XXX: warns without the .\.vscode\settings.json the unsafeptr false part.
+	// Trick the linter: convert to pointer via an interface or a helper
+	// that doesn't trigger the "unsafeptr" heuristic.
+	// var p interface{} = lParam
+	// //nolint:govet,unsafeptr
+	// info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(p.(uintptr)))
 
 	if info.Flags&LLMHF_INJECTED != 0 {
 		// This mouse event was generated by SendInput
@@ -959,7 +1164,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				//actualPostCounter++
 				// prepare data & procPostMessage.Call(...)
 
-				data := new(WindowMoveData) // Heap-allocated
+				data := new(WindowMoveData) // Heap-allocated, TODO: avoid heap allocation somehow.
 				data.Hwnd = targetWnd
 				data.X = newX // int32, full range
 				data.Y = newY
@@ -1292,12 +1497,22 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	return ret
 })
 
+// type exitCode int // Custom type so recover knows it's an intentional exit
 func exit(code int) {
 
 	//TODO: add the others? or perhaps there's no point?!
 	capturing = false
 	procReleaseCapture.Call()
-	os.Exit(code) // Hooks are removed after this. Your state must already be sane.
+	// if code == 0 {
+	// 	return // Just return and let main finish naturally, so bad Gemini 3 Fast!
+	// }
+	//os.Exit(code) // Hooks are removed after this. Your state must already be sane.
+	// Panic with our custom type so main's defer can catch it
+	// panic(exitStatus{
+	// 	Code:    code,
+	// 	Message: "express exit with that exit code",
+	// })
+	exitf(code, "express exit")
 }
 
 // var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
@@ -1368,9 +1583,10 @@ func initLogFile() {
 
 func logf(format string, args ...any) {
 	detectConsole()
-
+	s := fmt.Sprintf(format, args...)
 	if hasConsole {
-		fmt.Fprintf(os.Stdout, format+"\n", args...)
+		//fmt.Fprintf(os.Stdout, format+"\n", args...)
+		fmt.Fprintf(os.Stdout, "[%s] %s\n", time.Now().Format("15:04:05.000"), s)
 		return
 	}
 
@@ -1381,7 +1597,8 @@ func logf(format string, args ...any) {
 		}
 	}
 	//if logFile != nil {
-	fmt.Fprintf(logFile, format+"\n", args...)
+	//fmt.Fprintf(logFile, format+"\n", args...)
+	fmt.Fprintf(logFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), s)
 	logFile.Sync()
 	//}
 }
@@ -1808,11 +2025,52 @@ func assertStructSizes() {
 	}
 }
 
-func main() {
-	runtime.LockOSThread() // first!
-	assertStructSizes()
-	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
+// func shellProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
+// 	if nCode >= 0 {
+// 		if nCode == 4 { // HSHELL_WINDOWACTIVATED
+// 			hwnd := windows.Handle(wParam)
+// 			var pid uint32
+// 			procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+// 			il, err := processIntegrityLevel(pid)
+// 			if err == nil && il >= 0x3000 { // high integrity or above
+// 				logf("Elevated window focused (IL=0x%x, hwnd=0x%x) → reconciling state", il, hwnd)
+// 				//hardResetIfDesynced() // your recovery
+// 			}
+// 		}
+// 	}
+// 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
+// 	return ret
+// }
 
+/*
+The init() Execution Flow
+
+	Variable Initialization: First, all variables declared at the package level (outside functions) are initialized to their values or zero-values.
+
+	init() execution: Then, any init() functions in the package run automatically.
+
+	main() execution: Finally, the main() function starts.
+
+Key Rules about init():
+
+	No Arguments/Returns: It must look exactly like func init() { ... }.
+
+	Multiple Inits: You can actually have multiple init() functions in the same file or package; they will run in the order they appear.
+
+	One-Time Use: It runs exactly once per program execution, no matter how many other packages import that package.
+
+Since you are doing Win32 stuff (message loops, handles, etc.), here is what you should avoid in init():
+
+	    Don't create Windows/UI Elements: If you create a Window handle (HWND) in init(), the thread that created it might not be the same thread that runs your main() message loop. In Win32, windows are "owned" by the thread that created them. If the threads mismatch, your message loop won't receive events for that window.
+
+	    Avoid heavy logic: init() blocks the startup of the entire program. If init() hangs, your app never reaches main().
+
+	    Order of execution: If you have multiple files, init() functions run in the order the files are presented to the compiler. This can lead to "initialization order" bugs that are very hard to debug.
+		- Gemini 3 Fast
+
+		also don't use logf() here because it calls windows stuff to detect if it has console!
+*/
+func init() {
 	//defaults:
 	forceManual = true
 	activateOnMove = true
@@ -1826,15 +2084,177 @@ func main() {
 	lastRateLogTime = now
 	lastMovePostedTime = now
 
+}
+
+var isAdmin bool // Package level
+func init() {
+	// This runs automatically before main()
+	//okthenTODO: is this gonna be a problem in init() before that lock in main happens?!
+	/*1. The init() vs. LockOSThread worry
+	No, it won't be a problem. The reason we lock the thread in main is specifically for the Message Loop and the Hook.
+	windows.GetCurrentProcessToken() is a standard system call that doesn't care which thread it runs on.
+	It just asks the OS for the current process's security context. You can safely call it in init() without any thread-locking prerequisites.
+	*/
+	token := windows.GetCurrentProcessToken()
+	isAdmin = token.IsElevated()
+}
+
+var (
+	procCreateMutex = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
+)
+
+func ensureSingleInstance(name string) {
+	// Create a global mutex. The "Global\" prefix works across terminal sessions.
+	namePtr, _ := windows.UTF16PtrFromString("Global\\" + name)
+
+	// CreateMutex(lpMutexAttributes, bInitialOwner, lpName)
+	ret, _, _ := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
+
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// We don't want to pause here usually, just die quietly or alert user.
+		// fmt.Printf("Application '%s' is already running.\n", name)
+		// os.Exit(0)
+		// Use our new exit logic to ensure the defer pause happens
+		exitf(0, "Application '%s' is already running.", name)
+	}
+
+	// Note: We don't technically need to close this handle manually.
+	// As long as the process is alive, the mutex is held.
+	// When the process dies, Windows cleans it up.
+	_ = ret
+}
+
+type theILockedMainThreadToken struct{}
+
+func main() {
+	runtime.LockOSThread() // first! in main() not in init() !
+	token := theILockedMainThreadToken{}
+	defer func() {
+		currentExitCode := 0
+		/*
+			What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
+			recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
+		*/
+		if r := recover(); r != nil {
+			//if code, ok := r.(exitCode); ok {
+			if status, ok := r.(exitStatus); ok {
+				currentExitCode = status.Code
+				// This was an intentional exit(code)
+				//if code != 0 {
+				logf("\nProgram intentionally exited with code: '%d' and error message: '%s'\n", currentExitCode, status.Message)
+				//}
+			} else {
+				currentExitCode = 1
+				stack := debug.Stack()
+				logf("\n--- CRASH: %v ---\nStack: %s\n--- END---\n", r, stack)
+				//debug.PrintStack()
+			}
+		}
+		logf("\nExecution finished.")
+		// 2. Use your high-quality "clrbuf" waiter
+		detectConsole() // updated global bool
+		if hasConsole {
+			todo()
+			//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this.
+		}
+		//logf("\nExecution finished. Press any key to exit...")
+		//var input string
+		//fmt.Scanln(&input)
+		//fmt.Scanln()             //FIXME: pending, it should wait for key not Enter. (won't use this after copying the code for the above)
+		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
+	}()
+
+	ensureSingleInstance("winbollocks_uniqueID_123lol")
+
+	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
+	if err := runApplication(token); err != nil {
+		logf("Error: %v\n", err)
+	}
+}
+
+func todo() {
+	panic("TODO: not yet implemented")
+}
+
+//	func exitErrorf(format string, a ...interface{}) {
+//		panic(fmt.Errorf(format, a...))
+//	}
+type exitStatus struct {
+	Code    int
+	Message string
+}
+
+// exitf allows you to provide a code and a formatted message
+func exitf(code int, format string, a ...interface{}) {
+	panic(exitStatus{
+		Code:    code,
+		Message: fmt.Sprintf(format, a...),
+	})
+}
+
+// This prevents the "click-to-pause" behavior that causes the 500ms lag.
+func disableQuickEdit() {
+	//without this, there's 500ms mouse movement lag for a few seconds when LMB-ing an Admin cmd.exe due to selection started (1 char is auto selected)
+	/*
+					The "Root Cause" of the Mouse Lag
+
+				It isn't actually anything you are doing wrong in your code. It is a fundamental "feature" of the Windows Console (conhost.exe).
+
+				    When you select text in a console, Windows freezes the process's execution so the buffer doesn't change while you're trying to copy.
+
+				    Since your program is the one that registered the Global Mouse Hook, and your program is now "frozen" by the console selection, the Windows Input Manager is waiting for your mouseProc to say "OK, continue."
+
+				    Windows waits for its internal timeout (around 500ms-2s) and then says "This hook is hung, bypass it."
+
+				    The "lag" you feel is the time it takes Windows to give up on your frozen process. disableQuickEdit is the industry-standard fix for this in CLI tools.
+					Gemini 3 Fast
+
+					Yes, disableQuickEdit makes it harder to copy/paste. You can still do it, but you have to right-click the title bar -> Edit -> Mark, which is annoying.
+
+		However, the "Root Cause" isn't your code—it's how Windows handles hooks. Because your program is the "hook provider,"
+		if your program's thread is paused (by a selection), the entire OS input chain for those specific events has to wait for you.
+		If you want to keep QuickEdit enabled, you have to move your hook logic into a separate thread/process that never has a visible console window,
+		so it can never be "paused" by a user click.
+	*/
+	hStdin := windows.Handle(os.Stdin.Fd())
+	var mode uint32
+	windows.GetConsoleMode(hStdin, &mode)
+
+	// ENABLE_QUICK_EDIT_MODE is 0x0040
+	// We use bitwise AND NOT to clear it
+	mode &^= 0x0040
+	// Also clear Extended Mode just to be sure
+	mode &^= 0x0080
+
+	windows.SetConsoleMode(hStdin, mode)
+	logf("disabled ENABLE_QUICK_EDIT_MODE to avoid 500ms mouse lag")
+}
+
+// XXX: in here, return errors like 'return fmt.Errorf("something went wrong")' instead of using log.Fatal or os.Exit(1)
+func runApplication(_token theILockedMainThreadToken) error { //XXX: must be called on main() and after that runtime.LockOSThread()
+	_ = _token // silence warning!
+	assertStructSizes()
+	logf("Started")
+
+	detectConsole() // updated global bool
+	if isAdmin && hasConsole {
+		disableQuickEdit()
+	}
+
+	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
+
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
 	//cb := windows.NewCallback(mouseProc)
 	mouseCallback = windows.NewCallback(mouseProc)
 	h, _, err := procSetWindowsHookEx.Call(WH_MOUSE_LL, mouseCallback, 0, 0)
 	if h == 0 {
-		logf("Got error:", err) // has no console!
+		//return
+		//logf("Got error: %v", err) // has no console!
 		//os.Exit(1)
-		exit(1)
+		// exit(1)
+		// exitErrorf()
+		exitf(1, "Got error: %v", err)
 	} else {
 		hHook = windows.Handle(h)
 		defer procUnhookWindowsHookEx.Call(uintptr(hHook))
@@ -1848,12 +2268,42 @@ func main() {
 		0,
 	)
 	if hk == 0 {
-		logf("Got error:", err) // has no console!
-
-		exit(2)
+		//logf("Got error: %v", err) // has no console!
+		exitf(2, "Got error: %v", err)
 	} else {
 		kbdHook = windows.Handle(hk)
 		defer procUnhookWindowsHookEx.Call(uintptr(kbdHook))
+	}
+
+	// shellH, _, err := procSetWindowsHookEx.Call(
+	// 	5, // WH_SHELL
+	// 	windows.NewCallback(shellProc),
+	// 	0, 0,
+	// )
+	// if shellH != 0 {
+	// 	shellHook = windows.Handle(shellH)
+	// 	defer procUnhookWindowsHookEx.Call(uintptr(shellHook))
+	// } else {
+	// 	//XXX: "WH_SHELL hook failed: Cannot set nonlocal hook without a module handle." - apparently needs to be done via a .dll, gg Grok /s
+	// 	logf("WH_SHELL hook failed: %v", err)
+	// }
+
+	// Global foreground change hook
+	h, _, err = procSetWinEventHook.Call(
+		0x0003, // EVENT_SYSTEM_FOREGROUND min
+		//0x0003, // max
+		0x8005, // EVENT_OBJECT_FOCUS (Catch lower-level focus shifts)
+		0,      // hmod = 0 (out-of-context callback)
+		winEventCallback,
+		0,             // idProcess = 0 (all)
+		0,             // idThread = 0 (all)
+		0x0000|0x0002, // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+	)
+	if h == 0 {
+		logf("SetWinEventHook failed: %v", err)
+	} else {
+		winEventHook = windows.Handle(h)
+		defer procUnhookWinEvent.Call(uintptr(winEventHook))
 	}
 
 	hwnd := createMessageWindow()
@@ -1868,4 +2318,123 @@ func main() {
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
+	return nil // no error
+}
+
+var (
+	// ... your existing procs ...
+	procGetWindowText       = user32.NewProc("GetWindowTextW")
+	procGetWindowTextLength = user32.NewProc("GetWindowTextLengthW")
+
+	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
+	procProcess32First           = kernel32.NewProc("Process32FirstW")
+	procProcess32Next            = kernel32.NewProc("Process32NextW")
+)
+
+func getWindowText(hwnd windows.Handle) string {
+	ret, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
+	if ret == 0 {
+		return ""
+	}
+	buf := make([]uint16, ret+1)
+	procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), ret+1)
+	return windows.UTF16ToString(buf)
+}
+
+func getProcessName(pid uint32) string {
+	// TH32CS_SNAPPROCESS = 0x00000002
+	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(0x00000002, 0)
+	if snapshot == uintptr(windows.InvalidHandle) {
+		return "unknown"
+	}
+	defer windows.CloseHandle(windows.Handle(snapshot))
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	ret, _, _ := procProcess32First.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
+	for ret != 0 {
+		if entry.ProcessID == pid {
+			return windows.UTF16ToString(entry.ExeFile[:])
+		}
+		ret, _, _ = procProcess32Next.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
+	}
+	return "not found"
+}
+
+var procGetClassName = user32.NewProc("GetClassNameW")
+
+func getClassName(hwnd windows.Handle) string {
+	buf := make([]uint16, 256)
+	ret, _, _ := procGetClassName.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if ret == 0 {
+		return ""
+	}
+	return windows.UTF16ToString(buf[:ret])
+}
+
+func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
+	//fmt.Println("DEBUG: hook called")
+
+	var eventName string
+
+	switch event {
+	case 0x0003:
+		eventName = "EVENT_SYSTEM_FOREGROUND"
+	case 0x0008:
+		eventName = "EVENT_SYSTEM_MENUSTART"
+	case 0x0009:
+		eventName = "EVENT_SYSTEM_MENUEND"
+	case 0x8000:
+		eventName = "EVENT_OBJECT_CREATE"
+	case 0x8001:
+		eventName = "EVENT_OBJECT_DESTROY"
+	case 0x8002:
+		eventName = "EVENT_OBJECT_SHOW"
+	case 0x8003:
+		eventName = "EVENT_OBJECT_HIDE"
+	case 0x8004:
+		eventName = "EVENT_OBJECT_REORDER"
+	case 0x8005:
+		eventName = "EVENT_OBJECT_FOCUS"
+	default:
+		// Return early if it's an event we aren't tracking to keep logs clean
+		return 0
+	}
+
+	// Get the top-level owner of this HWND to see if it belongs to CMD
+	// GA_ROOT (2) gets the "real" parent window
+	rootHwnd, _, _ := procGetAncestor.Call(uintptr(hwnd), 2)
+
+	var pid uint32
+	procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+
+	title := getWindowText(windows.Handle(rootHwnd))
+	procName := getProcessName(pid)
+	class := getClassName(hwnd)
+	logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
+		eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
+	// logf("[%s] hwnd=0x%x (Root=0x%x) objId=%d childId=%d",
+	// 	eventName, hwnd, rootHwnd, idObject, idChild)
+
+	if event == 0x0003 { // EVENT_SYSTEM_FOREGROUND
+		logf("Foreground changed to hwnd=0x%x", hwnd)
+
+		// Optional: Check for elevated
+		var pid uint32
+		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+		il, err := processIntegrityLevel(pid)
+		if err == nil && il >= 0x3000 {
+			logf("Elevated foreground (IL=0x%x) → reconciling state", il)
+			//hardResetIfDesynced() // your recovery function
+			// Or force suppression if Win held, etc.
+		} else {
+			//logf("Err: %v, IL=0x%x", err, il)
+			logf("PID=%d IL=0x%x err=%v", pid, il, err)
+			//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
+		}
+	} else {
+		logf("event: %v hwnd=0x%x", event, hwnd)
+	}
+	return 0 // WinEvent callbacks return 0 (no chaining)
 }
