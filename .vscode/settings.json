@@ -1,0 +1,35 @@
+{
+  "telemetry.telemetryLevel": "off",
+  "workbench.enableExperiments": false,
+  "workbench.settings.enableNaturalLanguageSearch": true,
+  "extensions.autoUpdate": false,
+  "extensions.autoCheckUpdates": false,
+  "update.mode": "none",
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit"
+  },
+  "[go]": {
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "never"
+    }
+  },
+  "go.lintTool": "golangci-lint-v2",
+  "go.lintOnSave": "package",
+  "gopls": {
+    "diagnosticsDelay": "0s",
+    "analyses": {
+      "unsafeptr": false,
+      "printf": true
+    },
+  },
+  "go.lintFlags": [
+  ],
+  "go.vetOnSave": "off",
+  "go.useLanguageServer": true,
+  "telemetry.editStats.enabled": false,
+  "telemetry.feedback.enabled": false,
+  "go.showWelcome": false,
+  "go.survey.prompt": false,
+  "go.toolsManagement.checkForUpdates": "off",
+  "go.trace.server": "verbose",
+}
