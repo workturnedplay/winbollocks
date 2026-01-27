@@ -55,7 +55,7 @@ set "ec=%ERRORLEVEL%"
 
 if "!ec!"=="0" (
 		:: ^( is ( but escaped, lame i kno.
-    echo started it successfully in a new cmd.exe^(as admin^) window(which lingers only if it's the devbuild and thus has a console).
+    echo started it successfully in a new cmd.exe^(as admin^) window^(which lingers only if it's the devbuild and thus has a console^).
 ) else (
     echo couldn't start it, exited with error code !ec!
 )
