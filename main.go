@@ -2420,7 +2420,7 @@ func disableQuickEdit() { //TODO: remove this then
 	mode &^= 0x0080
 
 	windows.SetConsoleMode(hStdin, mode)
-	logf("disabled ENABLE_QUICK_EDIT_MODE to avoid 500ms mouse lag")
+	logf("disabled ENABLE_QUICK_EDIT_MODE")
 }
 
 // XXX: in here, return errors like 'return fmt.Errorf("something went wrong")' instead of using log.Fatal or os.Exit(1)
@@ -2429,22 +2429,24 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	assertStructSizes()
 	logf("Started")
 
-	// In main(), before the GetMessage loop:
-	f, err := os.Create("cpu.prof")
-	if err != nil {
-		logf("Failed to create CPU profile: %v", err)
-		// or exitf if critical
-	} else {
-		if err := pprof.StartCPUProfile(f); err != nil {
-			logf("StartCPUProfile failed: %v", err)
-			f.Close()
+	if writeProfile {
+		// In main(), before the GetMessage loop:
+		f, err := os.Create("cpu.prof")
+		if err != nil {
+			logf("Failed to create CPU profile: %v", err)
+			// or exitf if critical
 		} else {
-			// Defer stop/write — put this in your main defer block
-			defer func() {
-				pprof.StopCPUProfile()
+			if err := pprof.StartCPUProfile(f); err != nil {
+				logf("StartCPUProfile failed: %v", err)
 				f.Close()
-				logf("CPU profile written to cpu.prof")
-			}()
+			} else {
+				// Defer stop/write — put this in your main defer block
+				defer func() {
+					pprof.StopCPUProfile()
+					f.Close()
+					logf("CPU profile written to cpu.prof")
+				}()
+			}
 		}
 	}
 
