@@ -2620,7 +2620,7 @@ func getClassName(hwnd windows.Handle) string {
 	return windows.UTF16ToString(buf[:ret])
 }
 
-var shouldLogFocusChanges = true
+var shouldLogFocusChanges = false
 
 func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
 	//fmt.Println("DEBUG: hook called")
