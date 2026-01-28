@@ -53,6 +53,10 @@ var (
 	procPostThreadMessage = user32.NewProc("PostThreadMessageW")
 )
 
+func init() {
+	maxChannelFill.Store(1) // avoid the first message: New Channel Peak: 1 events queued (Dropped: 0)
+}
+
 var (
 	procSetWinEventHook = user32.NewProc("SetWinEventHook")
 	procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
@@ -2337,9 +2341,9 @@ func main() {
 			//todo()
 			//logf("s3")
 			//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this.
-			logf("Press Enter to exit...")
+			logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
 			var dummy string
-			fmt.Scanln(&dummy)
+			_, _ = fmt.Scanln(&dummy)
 		}
 		//logf("\nExecution finished. Press any key to exit...")
 		//var input string
