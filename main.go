@@ -25,6 +25,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 
 	"golang.org/x/sys/windows"
 
@@ -42,8 +43,9 @@ var (
 	moveDataChan = make(chan WindowMoveData, 2048)
 
 	// Modern Atomic tracking
-	droppedEvents  atomic.Uint32
-	maxChannelFill atomic.Int64 // To track how "full" it got
+	droppedEvents    atomic.Uint32
+	droppedLogEvents atomic.Uint32 //FIXME: detect and 'log' somehow diffs(increases) to this!
+	maxChannelFill   atomic.Int64  // To track how "full" it got
 
 	// To tell the hook where to send the "Doorbell"
 	mainThreadId uint32
@@ -809,7 +811,7 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	}
 
 	// Debug: log buffer size (should be ~28-40 bytes)
-	logf("Integrity buf len=%d for PID %d", len(buf), pid)
+	//logf("Integrity buf len=%d for PID %d", len(buf), pid)
 
 	// TOKEN_MANDATORY_LABEL header is 16 bytes on 64-bit (pointer + attributes + padding)
 	const headerSize = 16
@@ -1407,7 +1409,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	//TODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
 	//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
 	case WM_DO_SETWINDOWPOS:
-		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS even in wndProc!")
+		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS in wndProc!")
 	// 	// target := windows.Handle(wParam)
 	// 	// x := int32(lParam >> 16)
 	// 	// y := int32(lParam & 0xFFFF)
@@ -1637,26 +1639,27 @@ func initLogFile() {
 	}
 }
 
+var (
+	// buffer size here matters only in the case where you used devbuild.bat AND are running as admin eg. runasadmin.bat AND you drag scrollbar or select text because that blocks the printf which blocks the hooks since this is single threaded at the moment (message loop and hooks are on same 1 thread)
+	logChan = make(chan string, 4096) // Buffer of this many log messages
+)
+
 func logf(format string, args ...any) {
-	detectConsole()
+
 	s := fmt.Sprintf(format, args...)
-	if hasConsole {
-		//fmt.Fprintf(os.Stdout, format+"\n", args...)
-		fmt.Fprintf(os.Stdout, "[%s] %s\n", time.Now().Format("15:04:05.000"), s)
-		return
+	now := time.Now().Format("15:04:05.000")
+	//timestamp := now.Format("15:04:05.000")
+	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
+
+	// select with default makes this NON-BLOCKING
+	select {
+	case logChan <- finalMsg:
+		// Message sent to the background worker
+	default:
+		// If the buffer is full, we drop the log so we don't lag the mouse
+		droppedLogEvents.Add(1)
 	}
 
-	if logFile == nil {
-		initLogFile()
-		if logFile == nil {
-			return
-		}
-	}
-	//if logFile != nil {
-	//fmt.Fprintf(logFile, format+"\n", args...)
-	fmt.Fprintf(logFile, "[%s] %s\n", time.Now().Format("15:04:05.000"), s)
-	logFile.Sync()
-	//}
 }
 
 func injectLetterE() {
@@ -2195,11 +2198,92 @@ func ensureSingleInstance(name string) {
 	_ = ret
 }
 
+const writeProfile bool = false
+
+var (
+	profileWritten atomic.Bool
+)
+
+// In your defer panic/recover block or in exitf / exit()
+func writeHeapProfileOnExit() {
+	if profileWritten.Load() {
+		return // already done
+	}
+	profileWritten.Store(true)
+
+	f, err := os.Create("heap_final.prof")
+	if err != nil {
+		logf("Failed to create heap profile: %v", err)
+		return
+	}
+	defer f.Close()
+
+	runtime.GC() // Force a full collection first (cleaner profile)
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		logf("WriteHeapProfile failed: %v", err)
+	} else {
+		logf("Heap profile written to heap_final.prof")
+	}
+}
+
+func logWorker() {
+	// This runs on Thread B.
+	// even If fmt.Fprint blocks for 10 seconds here, Thread A (your mouse hook)
+	// keeps spinning at 100% speed on its own CPU core.
+	for msg := range logChan {
+		internalLogger(msg)
+	}
+}
+
+func internalLogger(finalMsg string) {
+	detectConsole()
+	if hasConsole {
+		// --- START TIMING ---
+		startPrint := time.Now()
+		//fmt.Fprintf(os.Stderr, "[%s] %s\n", timestamp, s)
+		fmt.Fprintf(os.Stderr, "%s", finalMsg)
+		duration := time.Since(startPrint)
+		// --- END TIMING ---
+		// Only alert us if the print took longer than a "frame" (16ms)
+		if duration > 16*time.Millisecond {
+			// Note: Printing this might trigger another lag, but it's for science!
+			// XXX: happens when running as admin and u LMB drag the scroll bar or LMB on the text area which begins selection and auto selects 1 char already!
+			fmt.Fprintf(os.Stderr, "!!! LOG LAG DETECTED: %v !!!\n", duration)
+		}
+		return
+	}
+
+	if logFile == nil {
+		initLogFile()
+		if logFile == nil {
+			return
+		}
+	}
+
+	fmt.Fprintf(logFile, "%s", finalMsg)
+	logFile.Sync()
+}
+
 type theILockedMainThreadToken struct{}
 
 func main() {
+	// 1. Lock THIS specific thread (Thread A) to the OS for Win32/Hooks.
 	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
 	token := theILockedMainThreadToken{}
+	/*
+	   	When you call go func() { ... }(), you are telling the Go Scheduler to create a new goroutine.
+	   	Unless you explicitly call runtime.LockOSThread() inside that new goroutine,
+	   	the scheduler is free to run it on any available OS thread (Core 2, Core 3, etc.).
+
+	   By calling runtime.LockOSThread() at the top of main, you are only "locking" the Main Thread.
+	    You are essentially saying: "Hey Go, this specific thread is now reserved for Win32 GUI stuff.
+	    Don't move me, and don't let anyone else sit here." All other goroutines (like your new log worker)
+	    will see that the Main Thread is "busy" and locked, so they will automatically be spawned on different OS threads.
+	*/
+	// 2. Spawn the worker.
+	// The Go scheduler sees Thread A is locked, so it puts this on Thread B.
+	go logWorker()
+
 	defer func() {
 		currentExitCode := 0
 		/*
@@ -2222,6 +2306,9 @@ func main() {
 			}
 		}
 		logf("Execution finished.")
+		if writeProfile {
+			writeHeapProfileOnExit()
+		}
 		// 2. Use your high-quality "clrbuf" waiter
 		detectConsole() // updated global bool
 		// Only pause if we have an actual console window and an error occurred
@@ -2253,6 +2340,7 @@ func main() {
 		//fmt.Scanln(&input)
 		//fmt.Scanln()             //FIXME: pending, it should wait for key not Enter. (won't use this after copying the code for the above)
 		//logf("s4")
+		close(logChan)           // not needed but hey.
 		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
 	}()
 
@@ -2285,7 +2373,7 @@ func exitf(code int, format string, a ...interface{}) {
 }
 
 // This prevents the "click-to-pause" behavior that causes the 500ms lag.
-func disableQuickEdit() {
+func disableQuickEdit() { //TODO: remove this then
 	//without this, there's 500ms mouse movement lag for a few seconds when LMB-ing an Admin cmd.exe due to selection started (1 char is auto selected)
 	/*
 					The "Root Cause" of the Mouse Lag
@@ -2328,10 +2416,29 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	assertStructSizes()
 	logf("Started")
 
-	detectConsole() // updated global bool
-	if isAdmin && hasConsole {
-		disableQuickEdit()
+	// In main(), before the GetMessage loop:
+	f, err := os.Create("cpu.prof")
+	if err != nil {
+		logf("Failed to create CPU profile: %v", err)
+		// or exitf if critical
+	} else {
+		if err := pprof.StartCPUProfile(f); err != nil {
+			logf("StartCPUProfile failed: %v", err)
+			f.Close()
+		} else {
+			// Defer stop/write — put this in your main defer block
+			defer func() {
+				pprof.StopCPUProfile()
+				f.Close()
+				logf("CPU profile written to cpu.prof")
+			}()
+		}
 	}
+
+	// detectConsole() // updated global bool
+	// if isAdmin && hasConsole {
+	// 	disableQuickEdit()
+	// }
 
 	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
 
@@ -2513,6 +2620,8 @@ func getClassName(hwnd windows.Handle) string {
 	return windows.UTF16ToString(buf[:ret])
 }
 
+var shouldLogFocusChanges = true
+
 func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
 	//fmt.Println("DEBUG: hook called")
 
@@ -2554,26 +2663,33 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	title := getWindowText(windows.Handle(rootHwnd))
 	procName := getProcessName(pid)
 	class := getClassName(hwnd)
-	logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
-		eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
-	// logf("[%s] hwnd=0x%x (Root=0x%x) objId=%d childId=%d",
-	// 	eventName, hwnd, rootHwnd, idObject, idChild)
+
+	if shouldLogFocusChanges {
+		logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
+			eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
+	}
 
 	if event == 0x0003 { // EVENT_SYSTEM_FOREGROUND
-		logf("Foreground changed to hwnd=0x%x", hwnd)
+		if shouldLogFocusChanges {
+			logf("Foreground changed to hwnd=0x%x", hwnd)
+		}
 
 		// Optional: Check for elevated
 		var pid uint32
 		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
 		il, err := processIntegrityLevel(pid)
 		if err == nil && il >= 0x3000 {
-			logf("Elevated foreground (IL=0x%x) → reconciling state", il)
-			//hardResetIfDesynced() // your recovery function
+			if shouldLogFocusChanges {
+				logf("Elevated foreground (IL=0x%x) → reconciling state", il)
+			}
+			//hardResetIfDesynced() // your recovery function, TODO:
 			// Or force suppression if Win held, etc.
 		} else {
-			//logf("Err: %v, IL=0x%x", err, il)
-			logf("PID=%d IL=0x%x err=%v", pid, il, err)
-			//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
+			if shouldLogFocusChanges {
+				//logf("Err: %v, IL=0x%x", err, il)
+				logf("PID=%d IL=0x%x err=%v", pid, il, err)
+				//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
+			}
 		}
 		//} else {
 		//	logf("event: %v hwnd=0x%x", event, hwnd)
