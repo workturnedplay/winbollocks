@@ -57,10 +57,9 @@ var (
 	procSetWinEventHook = user32.NewProc("SetWinEventHook")
 	procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
 
-	winEventHook windows.Handle
+	winEventHook     windows.Handle
+	winEventCallback = windows.NewCallback(winEventProc)
 )
-
-var winEventCallback = windows.NewCallback(winEventProc)
 
 var (
 	moveCounter     int       // how many move events we saw since last log
@@ -1641,7 +1640,8 @@ func initLogFile() {
 
 var (
 	// buffer size here matters only in the case where you used devbuild.bat AND are running as admin eg. runasadmin.bat AND you drag scrollbar or select text because that blocks the printf which blocks the hooks since this is single threaded at the moment (message loop and hooks are on same 1 thread)
-	logChan = make(chan string, 4096) // Buffer of this many log messages
+	logChan       = make(chan string, 4096) // Buffer of this many log messages
+	logWorkerDone = make(chan struct{})     // The "I'm finished" signal
 )
 
 func logf(format string, args ...any) {
@@ -2233,6 +2233,8 @@ func logWorker() {
 	for msg := range logChan {
 		internalLogger(msg)
 	}
+	// This only executes AFTER close(logChan) is called AND the buffer is empty
+	close(logWorkerDone)
 }
 
 func internalLogger(finalMsg string) {
@@ -2280,7 +2282,7 @@ func main() {
 	    Don't move me, and don't let anyone else sit here." All other goroutines (like your new log worker)
 	    will see that the Main Thread is "busy" and locked, so they will automatically be spawned on different OS threads.
 	*/
-	// 2. Spawn the worker.
+	// 2. Spawn the worker. The "Main Thread" Lock: Since we are using runtime.LockOSThread() in main, we want to be absolutely certain that the Go scheduler has finished its "Main Thread" bookkeeping before we start spawning background workers that we expect to land on other cores.
 	// The Go scheduler sees Thread A is locked, so it puts this on Thread B.
 	go logWorker()
 
@@ -2296,12 +2298,12 @@ func main() {
 				currentExitCode = status.Code
 				// This was an intentional exit(code)
 				//if code != 0 {
-				logf("Program intentionally exited with code: '%d' and error message: '%s'\n", currentExitCode, status.Message)
+				logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
 				//}
 			} else {
 				currentExitCode = 1
 				stack := debug.Stack()
-				logf("--- CRASH: %v ---\nStack: %s\n--- END---\n", r, stack)
+				logf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
 				//debug.PrintStack()
 			}
 		}
@@ -2310,8 +2312,9 @@ func main() {
 			writeHeapProfileOnExit()
 		}
 		// 2. Use your high-quality "clrbuf" waiter
-		detectConsole() // updated global bool
+		detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already)
 		// Only pause if we have an actual console window and an error occurred
+
 		// hConsole, _, _ := procGetConsoleWindow.Call()
 		// // 2. If no handle, try to attach to the parent's console
 		// if hConsole == 0 {
@@ -2331,16 +2334,26 @@ func main() {
 		//if hasConsole || hConsole != 0 || isTerminal || true {
 		if hasConsole {
 			//logf("s2")
-			todo()
+			//todo()
 			//logf("s3")
 			//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this.
+			logf("Press Enter to exit...")
+			var dummy string
+			fmt.Scanln(&dummy)
 		}
 		//logf("\nExecution finished. Press any key to exit...")
 		//var input string
 		//fmt.Scanln(&input)
 		//fmt.Scanln()             //FIXME: pending, it should wait for key not Enter. (won't use this after copying the code for the above)
 		//logf("s4")
-		close(logChan)           // not needed but hey.
+
+		//XXX: these 3 should be last:
+		// 1. Close the channel to tell the worker "no more logs are coming"
+		close(logChan)
+		// 2. Wait for the worker to finish printing the backlog
+		// This blocks until close(logWorkerDone) happens in the worker
+		<-logWorkerDone
+		// 3. exit
 		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
 	}()
 
