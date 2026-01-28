@@ -136,6 +136,9 @@ var (
 
 	//procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 	procGetLastError = kernel32.NewProc("GetLastError")
+
+	procSendInput = user32.NewProc("SendInput")
+	procLoadIcon  = user32.NewProc("LoadIconW")
 )
 
 /* ---------------- Constants ---------------- */
@@ -200,8 +203,10 @@ const (
 	NIM_MODIFY = 0x00000001
 	NIM_DELETE = 0x00000002
 
-	NIF_TIP  = 0x00000004
-	NIF_INFO = 0x00000010
+	NIF_MESSAGE = 0x00000001
+	NIF_ICON    = 0x00000002
+	NIF_TIP     = 0x00000004
+	NIF_INFO    = 0x00000010
 )
 
 const (
@@ -221,9 +226,10 @@ const (
 
 // Win32 message constants missing from x/sys/windows
 const (
-	WM_USER      = 0x0400
-	WM_CLOSE     = 0x0010
-	WM_RBUTTONUP = 0x0205
+	WM_USER        = 0x0400
+	WM_CLOSE       = 0x0010
+	WM_RBUTTONUP   = 0x0205
+	WM_CONTEXTMENU = 0x007B
 )
 
 const (
@@ -409,15 +415,6 @@ type MSG struct {
 }
 
 /* ---------------- Globals ---------------- */
-var procSendInput = user32.NewProc("SendInput")
-
-var (
-	kbdHook windows.Handle
-
-//	winDownSeen      atomic.Bool
-//
-// swallowNextWinUp atomic.Bool
-)
 
 var (
 	// winDown   atomic.Bool
@@ -429,7 +426,9 @@ var (
 )
 
 var (
-	hHook windows.Handle
+	mouseHook windows.Handle
+	kbdHook   windows.Handle
+
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
 	capturing   bool
 	targetWnd   windows.Handle
@@ -856,33 +855,28 @@ func initTray(hwnd windows.Handle) {
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.HWnd = hwnd
 	trayIcon.UID = 1
-	trayIcon.UFlags = NIF_TIP
-
-	procLoadIcon := user32.NewProc("LoadIconW")
+	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
 
 	const IDI_APPLICATION = 32512
 
 	hIcon, _, _ := procLoadIcon.Call(0, IDI_APPLICATION)
 	trayIcon.HIcon = windows.Handle(hIcon)
-	trayIcon.UFlags |= 0x00000002 // NIF_ICON
-
 	trayIcon.UCallbackMessage = WM_TRAY
-	trayIcon.UFlags |= 0x00000001 // NIF_MESSAGE
 	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
 	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks")) //TODO: make const
 
-	//2
-	ret2, _, err2 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
-	if ret2 == 0 {
-		logf("Failed to set version of tray icon: %v (code %d)", err2, err2)
-		// You could exitf or fallback here, but for now just log
-	}
-
 	//1
 	ret1, _, err1 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 	if ret1 == 0 {
-		logf("Failed to delete tray icon (real error): %v (code %d)", err1, err1)
+		logf("Failed to add tray icon (real error): %v (code %d)", err1, err1)
+		// You could exitf or fallback here, but for now just log
+	}
+
+	//2
+	ret2, _, err2 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
+	if ret2 == 0 {
+		logf("NIM_SETVERSION for tray icon failed: %v (code %d)", err2, err2)
 		// You could exitf or fallback here, but for now just log
 	}
 
@@ -1511,7 +1505,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		injectLMBClick()
 		return 0
 	case WM_TRAY:
-		if lParam == WM_RBUTTONUP {
+		// Get mouse position (always do this manually — wParam/lParam don't carry it reliably)
+		var pt POINT
+		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+
+		// if lParam != 0x10200 {
+		// 	logf("WM_TRAY received with lParam %x, %x", lParam, lParam&0x0FFFF)
+		// }
+		if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
+			//logf("popping tray menu")
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
 			exitText := mustUTF16("Exit")
@@ -1554,8 +1556,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
-			var pt POINT
-			procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+			// var pt POINT
+			// procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 
 			procSetForegroundWindow.Call(hwnd)
 
@@ -1591,15 +1593,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				shouldLogDragRate = !shouldLogDragRate
 
 			case MENU_EXIT:
-				procUnhookWindowsHookEx.Call(uintptr(hHook))
+				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 				exit(0)
 			}
 
-		}
+		} // fi RMB context menu
 		return 0
 
 	case WM_CLOSE: //case 0x0010: // WM_CLOSE
-		procUnhookWindowsHookEx.Call(uintptr(hHook))
+		//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 		exit(0)
 	} //switch
 
@@ -1608,12 +1610,22 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	return ret
 })
 
-// type exitCode int // Custom type so recover knows it's an intentional exit
-func exit(code int) {
-
+func deinit() {
 	//TODO: add the others? or perhaps there's no point?!
 	capturing = false
 	procReleaseCapture.Call()
+	if mouseHook != 0 {
+		procUnhookWindowsHookEx.Call(uintptr(mouseHook))
+		mouseHook = 0
+	}
+	if kbdHook != 0 {
+		procUnhookWindowsHookEx.Call(uintptr(kbdHook))
+		kbdHook = 0
+	}
+}
+
+// type exitCode int // Custom type so recover knows it's an intentional exit
+func exit(code int) {
 	// if code == 0 {
 	// 	return // Just return and let main finish naturally, so bad Gemini 3 Fast!
 	// }
@@ -2478,7 +2490,8 @@ func main() {
 
 	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
 	if err := runApplication(token); err != nil {
-		logf("Error: %v\n", err)
+		//logf("Error: %v\n", err)
+		exitf(2, "Error: %v\n", err)
 	}
 }
 
@@ -2496,6 +2509,7 @@ type exitStatus struct {
 
 // exitf allows you to provide a code and a formatted message
 func exitf(code int, format string, a ...interface{}) {
+	deinit()
 	panic(exitStatus{
 		Code:    code,
 		Message: fmt.Sprintf(format, a...),
@@ -2585,10 +2599,10 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		//os.Exit(1)
 		// exit(1)
 		// exitErrorf()
-		exitf(1, "Got error: %v", err)
+		return fmt.Errorf("Got error: %v", err)
 	} else {
-		hHook = windows.Handle(h)
-		defer procUnhookWindowsHookEx.Call(uintptr(hHook))
+		mouseHook = windows.Handle(h)
+		defer procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 	}
 
 	kbdCB := windows.NewCallback(keyboardProc)
@@ -2600,7 +2614,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	)
 	if hk == 0 {
 		//logf("Got error: %v", err) // has no console!
-		exitf(2, "Got error: %v", err)
+		return fmt.Errorf("Got error: %v", err)
 	} else {
 		kbdHook = windows.Handle(hk)
 		defer procUnhookWindowsHookEx.Call(uintptr(kbdHook))
