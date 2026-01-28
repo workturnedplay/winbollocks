@@ -102,6 +102,7 @@ var (
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 
 	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
+	procDestroyWindow   = user32.NewProc("DestroyWindow")
 
 	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	procGetWindowPlacement       = user32.NewProc("GetWindowPlacement")
@@ -197,6 +198,7 @@ const (
 
 	NIM_ADD    = 0x00000000
 	NIM_MODIFY = 0x00000001
+	NIM_DELETE = 0x00000002
 
 	NIF_TIP  = 0x00000004
 	NIF_INFO = 0x00000010
@@ -868,9 +870,45 @@ func initTray(hwnd windows.Handle) {
 	trayIcon.UFlags |= 0x00000001 // NIF_MESSAGE
 	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
-	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks"))
-	procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
-	procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
+	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks")) //TODO: make const
+
+	//2
+	ret2, _, err2 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
+	if ret2 == 0 {
+		logf("Failed to set version of tray icon: %v (code %d)", err2, err2)
+		// You could exitf or fallback here, but for now just log
+	}
+
+	//1
+	ret1, _, err1 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
+	if ret1 == 0 {
+		logf("Failed to delete tray icon (real error): %v (code %d)", err1, err1)
+		// You could exitf or fallback here, but for now just log
+	}
+
+}
+
+func cleanupTray() {
+	if trayIcon.HWnd == 0 {
+		// Never initialized or window creation failed — nothing to clean
+		return
+	}
+	// Optional: Destroy the message-only window first (good hygiene)
+
+	ret, _, err := procDestroyWindow.Call(uintptr(trayIcon.HWnd))
+	if ret == 0 {
+		logf("DestroyWindow failed: %v (probably already destroyed or invalid)", err)
+	}
+
+	// Use the same trayIcon struct from initTray
+	trayIcon.UFlags = 0 // NIM_DELETE ignores most fields, but set to be safe
+	ret, _, err = procShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&trayIcon)))
+	//ret is non-zero (success), but err can still be set
+	if ret == 0 {
+		logf("Failed to delete tray icon: %v", err) // optional, for debug
+	}
+	// Optional: zero out the struct to avoid reuse confusion
+	trayIcon = NOTIFYICONDATA{}
 }
 
 func showTrayInfo(title, msg string) {
@@ -1343,20 +1381,28 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 
 /* ---------------- Main ---------------- */
 
-func createMessageWindow() windows.Handle {
-	className, _ := windows.UTF16PtrFromString("winbollocksHidden")
+func createMessageWindow() (windows.Handle, error) {
+	className, err := windows.UTF16PtrFromString("winbollocksHidden")
+	if err != nil {
+		return 0, fmt.Errorf("UTF16PtrFromString failed for class name: %v", err)
+	}
 
 	var wc WNDCLASSEX
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = wndProc
 	wc.LpszClassName = className
-	//wc.HInstance = windows.GetModuleHandle(nil)
-	hinst, _, _ := procGetModuleHandle.Call(0)
+	//nolint:errcheck
+	hinst, _, _ := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
 	wc.HInstance = windows.Handle(hinst)
 
-	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	// Register class — check return value
+	ret, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	if ret == 0 {
+		lastErr := windows.GetLastError()
+		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %d)", err, lastErr)
+	}
 
-	hwnd, _, _ := procCreateWindowEx.Call(
+	hwndRaw, _, err := procCreateWindowEx.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		0,
@@ -1367,8 +1413,12 @@ func createMessageWindow() windows.Handle {
 		uintptr(wc.HInstance),
 		0,
 	)
+	if hwndRaw == 0 {
+		lastErr := windows.GetLastError()
+		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %d)", err, lastErr)
+	}
 
-	return windows.Handle(hwnd)
+	return windows.Handle(hwndRaw), nil
 }
 
 func mustUTF16(s string) *uint16 {
@@ -1611,21 +1661,47 @@ func exit(code int) {
 // }
 
 var (
-	logFile        *os.File
-	hasConsole     bool
-	consoleChecked bool
+	logFile *os.File
+	//hasConsole bool
+	useStderr bool // true if os.Stderr is valid/writable
+	//consoleChecked bool
 )
 
-func detectConsole() {
-	if consoleChecked {
+// func detectConsole() {
+// 	if consoleChecked {
+// 		return
+// 	}
+
+//		h := windows.Handle(os.Stdout.Fd())
+//		var mode uint32
+//		err := windows.GetConsoleMode(h, &mode)
+//		hasConsole = (err == nil)
+//		consoleChecked = true
+//	}
+func init() {
+	useStderr = false
+
+	// //detectConsole()
+	// h := windows.Handle(os.Stderr.Fd())
+	// var mode uint32
+	// err := windows.GetConsoleMode(h, &mode)
+	// hasConsole = (err == nil)
+	h := windows.Handle(os.Stderr.Fd())
+	var mode uint32
+	err := windows.GetConsoleMode(h, &mode) // optional, for true console
+	if err != nil {
 		return
 	}
-	consoleChecked = true
-
-	h := windows.Handle(os.Stdout.Fd())
-	var mode uint32
-	err := windows.GetConsoleMode(h, &mode)
-	hasConsole = (err == nil)
+	n, err := windows.GetFileType(h)
+	if err != nil {
+		return
+	}
+	useStderr = (n != windows.INVALID_FILE_ATTRIBUTES) // basic validity
+	// Optional: Test writability
+	if useStderr {
+		_, writeErr := os.Stderr.WriteString("") // zero-write test
+		useStderr = writeErr == nil
+	}
 }
 
 func initLogFile() {
@@ -2160,17 +2236,46 @@ var (
 	procCreateMutex = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
 )
 
-func ensureSingleInstance(name string) {
+type MutexScope int
+
+const (
+	MutexScopeSession MutexScope = iota // 0
+	MutexScopeMachine                   // 1
+)
+
+func (s MutexScope) Prefix() string {
+	switch s {
+	case MutexScopeSession:
+		return "Local\\" // want this for winbollocks
+	case MutexScopeMachine:
+		return "Global\\" // don't want this for winbollocks, but do for dnsbollocks
+	default:
+		panic(fmt.Sprintf("Unhandled MutexScope value: %d", s))
+	}
+}
+
+func ensureSingleInstance(name string, scope MutexScope) {
 	// Create a global mutex. The "Global\" prefix works across terminal sessions.
 	/*
 		Global\: The mutex is visible to all users on the machine. If User A is logged in and User B fast-switches to their account, User B cannot run the app.
 
 		Local\: The mutex is visible only to the current session. User A and User B can both run the app simultaneously in their own sessions.
 	*/
-	namePtr, _ := windows.UTF16PtrFromString("Global\\" + name)
+	//namePtr, _ := windows.UTF16PtrFromString("Global\\" + name)
+	// Use "Local\\" for per-session isolation (allows multiple users on same machine)
+	// Omit prefix entirely for same effect, but explicit is clearer.
+	prefix := scope.Prefix() // panics if invalid/missing case
+	str := prefix + name
+	namePtr, err0 := windows.UTF16PtrFromString(str)
+	//namePtr, err0 := windows.UTF16PtrFromString("Global\\" + name)
+	if err0 != nil {
+		exitf(3, "UTF16PtrFromString (in ensureSingleInstance) for str '%s' failed: %v", str, err0)
+	}
 
 	// CreateMutex(lpMutexAttributes, bInitialOwner, lpName)
+	// CreateMutex: Security attributes NULL (0), Initial owner TRUE (1), Name
 	ret, _, callErr := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
+	//ret, _, callErr := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
 
 	// if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 	// 	// We don't want to pause here usually, just die quietly or alert user.
@@ -2190,12 +2295,20 @@ func ensureSingleInstance(name string) {
 
 	if err != nil {
 		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-			exitf(0, "Application '%s' is already running.", name)
+			exitf(5, "Application '%s' is already running.", name)
 		}
 		// other error handling if needed:
 		// exitf(1, "CreateMutex failed: %v", err)
 	}
 
+	// If handle is 0, we didn't even create it (likely Access Denied for Global\)
+	if ret == 0 {
+		var extra string = ""
+		if errors.Is(callErr, windows.Errno(5)) { // aka 'Access Denied'==5
+			extra = " this means mutex attempt was 'Global\\' and it was already acquired by an admin-running exe"
+		}
+		exitf(2, "CreateMutex failed entirely: %v (code: %d)%s", err, err, extra)
+	}
 	// Note: We don't technically need to close this handle manually.
 	// As long as the process is alive, the mutex is held.
 	// When the process dies, Windows cleans it up.
@@ -2242,8 +2355,8 @@ func logWorker() {
 }
 
 func internalLogger(finalMsg string) {
-	detectConsole()
-	if hasConsole {
+	//detectConsole()
+	if useStderr {
 		// --- START TIMING ---
 		startPrint := time.Now()
 		//fmt.Fprintf(os.Stderr, "[%s] %s\n", timestamp, s)
@@ -2253,7 +2366,7 @@ func internalLogger(finalMsg string) {
 		// Only alert us if the print took longer than a "frame" (16ms)
 		if duration > 16*time.Millisecond {
 			// Note: Printing this might trigger another lag, but it's for science!
-			// XXX: happens when running as admin and u LMB drag the scroll bar or LMB on the text area which begins selection and auto selects 1 char already!
+			// XXX: used to happen when running as admin and u LMB drag the scroll bar or LMB on the text area which begins selection and auto selects 1 char already! when logging was happening on same thread as hooks and msg.loop.
 			fmt.Fprintf(os.Stderr, "!!! LOG LAG DETECTED: %v !!!\n", duration)
 		}
 		return
@@ -2297,7 +2410,6 @@ func main() {
 			recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
 		*/
 		if r := recover(); r != nil {
-			//if code, ok := r.(exitCode); ok {
 			if status, ok := r.(exitStatus); ok {
 				currentExitCode = status.Code
 				// This was an intentional exit(code)
@@ -2311,12 +2423,13 @@ func main() {
 				//debug.PrintStack()
 			}
 		}
+		cleanupTray()
 		logf("Execution finished.")
 		if writeProfile {
 			writeHeapProfileOnExit()
 		}
 		// 2. Use your high-quality "clrbuf" waiter
-		detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already)
+		//detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already) and if we forgot to put this in an init()
 		// Only pause if we have an actual console window and an error occurred
 
 		// hConsole, _, _ := procGetConsoleWindow.Call()
@@ -2332,11 +2445,11 @@ func main() {
 		// 	}
 		// }
 		// // 2. Check if Stdin is actually a terminal (not a pipe/null)
-		// stat, _ := os.Stdin.Stat()
-		// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
+		stat, _ := os.Stdin.Stat()
+		isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
 		// logf("s1")
 		//if hasConsole || hConsole != 0 || isTerminal || true {
-		if hasConsole {
+		if isTerminal {
 			//logf("s2")
 			//todo()
 			//logf("s3")
@@ -2353,7 +2466,7 @@ func main() {
 
 		//XXX: these 3 should be last:
 		// 1. Close the channel to tell the worker "no more logs are coming"
-		close(logChan)
+		close(logChan) // Yes — the worker will drain everything that was already queued before close.
 		// 2. Wait for the worker to finish printing the backlog
 		// This blocks until close(logWorkerDone) happens in the worker
 		<-logWorkerDone
@@ -2361,7 +2474,7 @@ func main() {
 		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
 	}()
 
-	ensureSingleInstance("winbollocks_uniqueID_123lol")
+	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
 
 	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
 	if err := runApplication(token); err != nil {
@@ -2524,7 +2637,12 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		defer procUnhookWinEvent.Call(uintptr(winEventHook))
 	}
 
-	hwnd := createMessageWindow()
+	//hwnd := createMessageWindow()
+	hwnd, err := createMessageWindow()
+	if err != nil {
+		//exitf(1, "Failed to create message window: %v", err)
+		return fmt.Errorf("Failed to create message window: %v", err)
+	}
 	initTray(hwnd)
 
 	mainThreadId = windows.GetCurrentThreadId() // Set the global for the hook
