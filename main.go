@@ -2457,8 +2457,9 @@ func main() {
 		// 	}
 		// }
 		// // 2. Check if Stdin is actually a terminal (not a pipe/null)
-		stat, _ := os.Stdin.Stat()
-		isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
+		stat, err := os.Stdin.Stat()
+		isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
+		//FIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
 		// logf("s1")
 		//if hasConsole || hConsole != 0 || isTerminal || true {
 		if isTerminal {
@@ -2469,6 +2470,8 @@ func main() {
 			logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
 			var dummy string
 			_, _ = fmt.Scanln(&dummy)
+		} else {
+			logf("not waiting for keypress")
 		}
 		//logf("\nExecution finished. Press any key to exit...")
 		//var input string
