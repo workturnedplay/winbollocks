@@ -1505,15 +1505,21 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		injectLMBClick()
 		return 0
 	case WM_MYTRAY:
-		// Get mouse position (always do this manually — wParam/lParam don't carry it reliably)
-		var pt POINT
-		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 
-		// if lParam != 0x10200 {
-		// 	logf("WM_TRAY received with lParam %x, %x", lParam, lParam&0x0FFFF)
+		// Strip high word to get the low 16-bit message code
+		low := uint32(lParam & 0xFFFF)
+
+		// if lParam != 0x10200 { // any non-mouse_move events:
+		// 	logf("WM_TRAY received with lParam %x, %x", lParam, low)
 		// }
-		if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
-			//logf("popping tray menu")
+
+		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
+		if low == WM_CONTEXTMENU {
+			// Get mouse position early (always do this manually — wParam/lParam don't carry it reliably) - Grok
+			var pt POINT
+			procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+
+			logf("popping tray menu")
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
 			exitText := mustUTF16("Exit")
