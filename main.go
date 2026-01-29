@@ -43,9 +43,10 @@ var (
 	moveDataChan = make(chan WindowMoveData, 2048)
 
 	// Modern Atomic tracking
-	droppedEvents    atomic.Uint32
-	droppedLogEvents atomic.Uint32 //FIXME: detect and 'log' somehow diffs(increases) to this!
-	maxChannelFill   atomic.Int64  // To track how "full" it got
+	droppedMoveEvents           atomic.Uint32
+	droppedLogEvents            atomic.Uint32
+	maxChannelFillForMoveEvents atomic.Int64 // To track how "full" it got
+	maxChannelFillForLogEvents  atomic.Int64 // To track how "full" it got
 
 	// To tell the hook where to send the "Doorbell"
 	mainThreadId uint32
@@ -54,7 +55,7 @@ var (
 )
 
 func init() {
-	maxChannelFill.Store(1) // avoid the first message: New Channel Peak: 1 events queued (Dropped: 0)
+	maxChannelFillForMoveEvents.Store(1) // avoid the first message: New Channel Peak: 1 events queued (Dropped: 0)
 }
 
 var (
@@ -514,61 +515,6 @@ func injectLMBClick() {
 		logf("SendInput mouse click failed: %v", err)
 	}
 }
-
-// func activateWindow(hwnd windows.Handle) {
-// 	// Get target window thread
-// 	var pid uint32
-// 	targetTID, _, _ := procGetWindowThreadProcessId.Call(
-// 		uintptr(hwnd),
-// 		uintptr(unsafe.Pointer(&pid)),
-// 	)
-
-// 	// Get our thread
-// 	selfTID := windows.GetCurrentThreadId()
-
-// 	if targetTID != uintptr(selfTID) {
-// 		// Attach threads
-// 		procAttachThreadInput.Call(
-// 			uintptr(selfTID),
-// 			targetTID,
-// 			1,
-// 		)
-// 	}
-
-// 	// Activate
-// 	//procSetForegroundWindow.Call(uintptr(hwnd))
-// 	//XXX: doesn't work, well only in the first 1-2 seconds, then flashes taskbar button for that window instead!
-
-// 	//temp-start:
-// 	// 1️⃣ Bring to top WITHOUT activation
-// 	procSetWindowPos.Call(
-// 		uintptr(hwnd),
-// 		HWND_TOP,
-// 		0, 0, 0, 0,
-// 		SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-// 	)
-
-// 	// 2️⃣ Attempt activation
-// 	//procSetForegroundWindow.Call(uintptr(hwnd))
-
-// 	// 3️⃣ Reinforce Z-order (still no activate)
-// 	// procSetWindowPos.Call(
-// 	// uintptr(hwnd),
-// 	// HWND_TOP,
-// 	// 0, 0, 0, 0,
-// 	// SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-// 	// )
-// 	//temp-end
-
-// 	if targetTID != uintptr(selfTID) {
-// 		// Detach threads
-// 		procAttachThreadInput.Call(
-// 			uintptr(selfTID),
-// 			targetTID,
-// 			0,
-// 		)
-// 	}
-// }
 
 func initDPIAwareness() {
 	// Try modern API first (Win10 1607+)
@@ -1166,6 +1112,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				now = time.Now()
 				// Count every potential move (even if we skip due to debounce)
 				moveCounter++
+				//logf("%d", moveCounter) //FIXME: temp, remove
 			}
 
 			dx := info.Pt.X - currentDrag.startPt.X
@@ -1264,7 +1211,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					// This happens if the Main Thread is frozen (e.g., Admin console lag).
 					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 					// We just increment our "shame counter" and move on.
-					droppedEvents.Add(1)
+					droppedMoveEvents.Add(1)
 				}
 
 				if ratelimitOnMove {
@@ -1361,7 +1308,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					// This happens if the Main Thread is frozen (e.g., Admin console lag).
 					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 					// We just increment our "shame counter" and move on.
-					droppedEvents.Add(1)
+					droppedMoveEvents.Add(1)
 				}
 			}
 			return 1 // swallow MMB
@@ -1744,16 +1691,41 @@ func initLogFile() {
 
 var (
 	// buffer size here matters only in the case where you used devbuild.bat AND are running as admin eg. runasadmin.bat AND you drag scrollbar or select text because that blocks the printf which blocks the hooks since this is single threaded at the moment (message loop and hooks are on same 1 thread)
-	logChan       = make(chan string, 4096) // Buffer of this many log messages
-	logWorkerDone = make(chan struct{})     // The "I'm finished" signal
+	logChanSize   = 4096
+	logChan       = make(chan string, logChanSize) // Buffer of this many log messages
+	logWorkerDone = make(chan struct{})            // The "I'm finished" signal
 )
+
+const attemptAtomicSwapThisManyTimes uint = 100
 
 func logf(format string, args ...any) {
 
 	s := fmt.Sprintf(format, args...)
 	now := time.Now().Format("15:04:05.000")
-	//timestamp := now.Format("15:04:05.000")
 	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
+
+	// Check the current pressure on the pipe
+	currentDepth := int64(len(logChan))
+	// Update the high water mark if this is a new record
+	// We use a loop or a CompareAndSwap to ensure we never overwrite
+	// a higher value from another thread (though likely overkill here)
+	wentAccordingToPlan := false
+	//TODO: this logic for maxChannelFillForMoveEvents too.
+	for range attemptAtomicSwapThisManyTimes { // try this only 100 times, to prevent infinite loop in impossible cases.
+		oldMax := maxChannelFillForLogEvents.Load()
+		if currentDepth <= oldMax {
+			// Nothing to do, current is smaller
+			wentAccordingToPlan = true
+			break
+		}
+		if maxChannelFillForLogEvents.CompareAndSwap(oldMax, currentDepth) {
+			// Optional: logf it? Careful, don't cause recursion!
+			// Better to just let the exit logic report the final max.
+			wentAccordingToPlan = true
+			break
+		}
+		// If we reach here, another thread changed oldMax, so we loop again
+	}
 
 	// select with default makes this NON-BLOCKING
 	select {
@@ -1764,6 +1736,12 @@ func logf(format string, args ...any) {
 		droppedLogEvents.Add(1)
 	}
 
+	// 2. Note the problem if we exhausted the 100 tries
+	if !wentAccordingToPlan {
+		// We failed to record the peak after 100 tries.
+		// Increment a "Contention Error" counter
+		panic(fmt.Sprintf("Failed(%d times) to set an atomic to int64 value %d. Happened during this log msg: '%s'", attemptAtomicSwapThisManyTimes, currentDepth, finalMsg))
+	}
 }
 
 func injectLetterE() {
@@ -2371,8 +2349,21 @@ func logWorker() {
 	// This runs on Thread B.
 	// even If fmt.Fprint blocks for 10 seconds here, Thread A (your mouse hook)
 	// keeps spinning at 100% speed on its own CPU core.
+	//counter := 0
 	for msg := range logChan {
+		//counter++
 		internalLogger(msg)
+		// if counter%500 == 0 {
+		// 	time.Sleep(10 * time.Second) //FIXME: temp, remove this!
+		// }
+	}
+	drops := droppedLogEvents.Load()
+	if drops > 0 {
+		internalLogger(fmt.Sprintf("Dropped %d log events due to contention.\n", drops))
+	}
+	maxfill := maxChannelFillForLogEvents.Load()
+	if maxfill > 1 {
+		internalLogger(fmt.Sprintf("Most log events seen at one time ie. peak queued on log channel: %d, out of logChanSize: %d\n", maxfill, logChanSize))
 	}
 	// This only executes AFTER close(logChan) is called AND the buffer is empty
 	close(logWorkerDone)
@@ -2407,6 +2398,14 @@ func internalLogger(finalMsg string) {
 	logFile.Sync()
 }
 
+func closeAndFlushLog() {
+	// 1. Close the channel to tell the worker "no more logs are coming"
+	close(logChan) // Yes — the worker will drain everything that was already queued before close.
+	// 2. Wait for the worker to finish printing the backlog
+	// This blocks until close(logWorkerDone) happens in the worker
+	<-logWorkerDone
+}
+
 type theILockedMainThreadToken struct{}
 
 func main() {
@@ -2438,9 +2437,8 @@ func main() {
 			exitcode = 121
 		}
 		logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode, exitcode)
-		close(logChan)
-		<-logWorkerDone
-		os.Exit(exitcode)
+		closeAndFlushLog()
+		os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
 	}()
 
 	defer func() { //primary defer
@@ -2464,6 +2462,7 @@ func main() {
 			}
 		}
 		cleanupTray()
+
 		logf("Execution finished.")
 		if writeProfile {
 			writeHeapProfileOnExit()
@@ -2509,14 +2508,10 @@ func main() {
 			logf("not waiting for keypress")
 		}
 
-		//XXX: these 3 should be last:
-		// 1. Close the channel to tell the worker "no more logs are coming"
-		close(logChan) // Yes — the worker will drain everything that was already queued before close.
-		// 2. Wait for the worker to finish printing the backlog
-		// This blocks until close(logWorkerDone) happens in the worker
-		<-logWorkerDone
+		//XXX: these should be last:
+		closeAndFlushLog()
 		// 3. exit
-		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit!
+		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
 	}()
 
 	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
@@ -2734,11 +2729,11 @@ func drainMoveChannel() {
 	for {
 		// Track High-Water Mark
 		currentFill := int64(len(moveDataChan))
-		if currentFill > maxChannelFill.Load() {
+		if currentFill > maxChannelFillForMoveEvents.Load() {
 			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
-			maxChannelFill.Store(currentFill)
+			maxChannelFillForMoveEvents.Store(currentFill)
 			logf("New Channel Peak: %d events queued (Dropped: %d)",
-				currentFill, droppedEvents.Load())
+				currentFill, droppedMoveEvents.Load())
 		}
 
 		select {

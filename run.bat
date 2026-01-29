@@ -7,10 +7,17 @@ cd /d %~dp0
 echo running from: %CD%
 set GODEBUG=allocfreetrace=1
 .\winbollocks.exe
-if ERRORLEVEL 1 (
+:: CAPTURE THE EXIT CODE IMMEDIATELY
+set EXIT_CODE=%ERRORLEVEL%
+
+:: Check if the code is NOT 0 (errors or intentional exit codes like 5)
+if %EXIT_CODE% NEQ 0 (
+::if ERRORLEVEL 1 (
   echo ---- debug log file echoed below ----
   type winbollocks_debug.log
   echo ---- debug log file echoed above ----
 )
-::echo ec:%ERRORLEVEL%
+
+echo.
+echo Process exited with code: %EXIT_CODE%
 pause
