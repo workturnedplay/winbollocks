@@ -234,7 +234,7 @@ const (
 
 const (
 	WM_START_NATIVE_DRAG = WM_USER + 1
-	WM_TRAY              = WM_USER + 2
+	WM_MYTRAY            = WM_USER + 2
 	//WM_WAKE_UP           = WM_USER + 3
 	WM_INJECT_SEQUENCE  = WM_USER + 100
 	WM_INJECT_LMB_CLICK = WM_USER + 101
@@ -861,7 +861,7 @@ func initTray(hwnd windows.Handle) {
 
 	hIcon, _, _ := procLoadIcon.Call(0, IDI_APPLICATION)
 	trayIcon.HIcon = windows.Handle(hIcon)
-	trayIcon.UCallbackMessage = WM_TRAY
+	trayIcon.UCallbackMessage = WM_MYTRAY
 	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
 	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks")) //TODO: make const
@@ -1504,7 +1504,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		//avoids injecting from the hook
 		injectLMBClick()
 		return 0
-	case WM_TRAY:
+	case WM_MYTRAY:
 		// Get mouse position (always do this manually — wParam/lParam don't carry it reliably)
 		var pt POINT
 		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
