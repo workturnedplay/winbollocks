@@ -189,9 +189,12 @@ const (
 const (
 	WH_MOUSE_LL = 14
 
-	WM_LBUTTONDOWN   = 0x0201
-	WM_LBUTTONUP     = 0x0202
-	WM_MOUSEMOVE     = 0x0200
+	WM_MOUSEMOVE   = 0x0200
+	WM_LBUTTONDOWN = 0x0201
+	WM_LBUTTONUP   = 0x0202
+	WM_RBUTTONUP   = 0x0205 // even winxp would have this
+	WM_CONTEXTMENU = 0x007B // winxp won't have this tho
+
 	WM_NCLBUTTONDOWN = 0x00A1
 
 	HTCAPTION = 2
@@ -226,10 +229,8 @@ const (
 
 // Win32 message constants missing from x/sys/windows
 const (
-	WM_USER        = 0x0400
-	WM_CLOSE       = 0x0010
-	WM_RBUTTONUP   = 0x0205
-	WM_CONTEXTMENU = 0x007B
+	WM_USER  = 0x0400
+	WM_CLOSE = 0x0010
 )
 
 const (
@@ -873,10 +874,10 @@ func initTray(hwnd windows.Handle) {
 		// You could exitf or fallback here, but for now just log
 	}
 
-	//2
+	//2, this must happen after NIM_ADD ! (bad chatgpt which suggested it before NIM_ADD)
 	ret2, _, err2 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
 	if ret2 == 0 {
-		logf("NIM_SETVERSION for tray icon failed: %v (code %d)", err2, err2)
+		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): %v (code %d)", err2, err2)
 		// You could exitf or fallback here, but for now just log
 	}
 
@@ -1509,12 +1510,17 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		// Strip high word to get the low 16-bit message code
 		low := uint32(lParam & 0xFFFF)
 
-		// if lParam != 0x10200 { // any non-mouse_move events:
+		// if low != WM_MOUSEMOVE { // any non-mouse_move(0x10200 on v4) events:
 		// 	logf("WM_TRAY received with lParam %x, %x", lParam, low)
 		// }
 
 		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
-		if low == WM_CONTEXTMENU {
+		if low == WM_RBUTTONUP {
+			/*
+				Yes — handling WM_RBUTTONUP (after masking with 0xFFFF) alone would work on every Windows version, because:
+				  XP → only 0x0205
+				  Vista+ → both 0x0205 and 0x007B, but 0x0205 is still sent
+			*/
 			// Get mouse position early (always do this manually — wParam/lParam don't carry it reliably) - Grok
 			var pt POINT
 			procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
