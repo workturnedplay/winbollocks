@@ -2426,9 +2426,25 @@ func main() {
 	// 2. Spawn the worker. The "Main Thread" Lock: Since we are using runtime.LockOSThread() in main, we want to be absolutely certain that the Go scheduler has finished its "Main Thread" bookkeeping before we start spawning background workers that we expect to land on other cores.
 	// The Go scheduler sees Thread A is locked, so it puts this on Thread B.
 	go logWorker()
+	currentExitCode := 0
+	defer func() { //secondary defer, never ran unless primary defer is defective(ie. panics in itself)
+		var exitcode int
+		// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
+		if r2 := recover(); r2 != nil {
+			logf("!secondary defer here! [CRITICAL ERROR IN primary DEFER]: '%v'\n%s\n----snip----", r2, debug.Stack())
+			exitcode = 120
+		} else {
+			logf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
+			exitcode = 121
+		}
+		logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode, exitcode)
+		close(logChan)
+		<-logWorkerDone
+		os.Exit(exitcode)
+	}()
 
-	defer func() {
-		currentExitCode := 0
+	defer func() { //primary defer
+
 		/*
 			What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
 			recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
@@ -2468,11 +2484,18 @@ func main() {
 		// 		hConsole, _, _ = procGetConsoleWindow.Call()
 		// 	}
 		// }
+
 		// // 2. Check if Stdin is actually a terminal (not a pipe/null)
+
+		// these 2 lines fixes things:
 		stat, err := os.Stdin.Stat()
 		isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
-		//FIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
-		// logf("s1")
+		//these two lines instead, broke all logging by causing a panic here: (uncomment them for testing purposes)
+		// stat, _ := os.Stdin.Stat()
+		// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
+
+		//fixedFIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
+
 		//if hasConsole || hConsole != 0 || isTerminal || true {
 		if isTerminal {
 			//logf("s2")
@@ -2485,11 +2508,6 @@ func main() {
 		} else {
 			logf("not waiting for keypress")
 		}
-		//logf("\nExecution finished. Press any key to exit...")
-		//var input string
-		//fmt.Scanln(&input)
-		//fmt.Scanln()             //FIXME: pending, it should wait for key not Enter. (won't use this after copying the code for the above)
-		//logf("s4")
 
 		//XXX: these 3 should be last:
 		// 1. Close the channel to tell the worker "no more logs are coming"
