@@ -167,6 +167,11 @@ const (
 )
 
 const (
+	WM_QUERYENDSESSION = 0x0011
+	WM_ENDSESSION      = 0x0016
+)
+
+const (
 	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4
 	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ^uintptr(3)
 
@@ -1400,36 +1405,25 @@ func handleActualMove(data WindowMoveData) {
 
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case WM_QUERYENDSESSION:
+		// system is asking permission to end session
+		logf("system is asking permission to end session")
+		return 1 // allow
+	case WM_ENDSESSION:
+		if wParam != 0 {
+			logf("WM_ENDSESSION with wParam!=0 aka system shutdown or restart detected")
+			// ensure flush here if buffered
+		} else {
+			logf("WM_ENDSESSION with wParam == 0 (weird?!)")
+		}
+		exitf(20, "due to WM_ENDSESSION")
+		unreachable()
+		return 0
+
 	//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
 	//TODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
 	//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
-	case WM_DO_SETWINDOWPOS:
-		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS in wndProc!")
-	// 	// target := windows.Handle(wParam)
-	// 	// x := int32(lParam >> 16)
-	// 	// y := int32(lParam & 0xFFFF)
-	// 	dataPtr := (*WindowMoveData)(unsafe.Pointer(lParam))
-	// 	// Access fields safely
-	// 	target := dataPtr.Hwnd
-	// 	x := dataPtr.X
-	// 	y := dataPtr.Y
-	// 	ret, _, _ := procSetWindowPos.Call(
-	// 		uintptr(target),
-	// 		uintptr(dataPtr.InsertAfter),
-	// 		uintptr(x), uintptr(y),
-	// 		0, 0,
-	// 		uintptr(dataPtr.Flags),
-	// 	)
 
-	// 	if ret == 0 {
-	// 		errCode, _, _ := procGetLastError.Call()
-	// 		logf("SetWindowPos failed in message loop: hwnd=0x%x error=%d", target, errCode)
-	// 		// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
-	// 		pt := POINT{X: x, Y: y} // or current cursor
-	// 		lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
-	// 		procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
-	// 	}
-	// 	return 0
 	case WM_START_NATIVE_DRAG:
 		target := windows.Handle(wParam)
 		if target != 0 {
@@ -1562,6 +1556,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_CLOSE: //case 0x0010: // WM_CLOSE
 		//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 		exit(0)
+	case WM_DO_SETWINDOWPOS:
+		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS in wndProc!")
 	} //switch
 
 	//let the default window proc handle the rest:
@@ -2525,6 +2521,10 @@ func main() {
 
 func todo() {
 	panic("TODO: not yet implemented")
+}
+
+func unreachable() {
+	panic("unreachable code was reached, bad assumptions or programmer then ;p")
 }
 
 //	func exitErrorf(format string, a ...interface{}) {
