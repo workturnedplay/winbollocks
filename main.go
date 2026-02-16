@@ -2531,8 +2531,8 @@ func primary_defer() { //primary defer
 	// // 2. Check if Stdin is actually a terminal (not a pipe/null)
 
 	// these 2 lines fixes things:
-	stat, err := os.Stdin.Stat()
-	isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
+	// stat, err := os.Stdin.Stat()
+	// isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
 	//these two lines instead, broke all logging by causing a panic here: (uncomment them for testing purposes)
 	// stat, _ := os.Stdin.Stat()
 	// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
@@ -2540,7 +2540,7 @@ func primary_defer() { //primary defer
 	//fixedFIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
 
 	//if hasConsole || hConsole != 0 || isTerminal || true {
-	if isTerminal {
+	if stdinIsConsoleInteractive() {
 		//logf("s2")
 		//todo()
 		//logf("s3")
@@ -2556,6 +2556,14 @@ func primary_defer() { //primary defer
 	closeAndFlushLog()
 	// 3. exit
 	os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
+}
+
+func stdinIsConsoleInteractive() bool {
+	h := windows.Handle(os.Stdin.Fd())
+
+	var mode uint32
+	err := windows.GetConsoleMode(h, &mode)
+	return err == nil
 }
 
 func main() {
