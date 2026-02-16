@@ -1761,7 +1761,7 @@ const attemptAtomicSwapThisManyTimes uint = 100
 func logf(format string, args ...any) {
 
 	s := fmt.Sprintf(format, args...)
-	now := time.Now().Format("15:04:05.000")
+	now := time.Now().Format("Mon Jan 2 15:04:05 MST 2006") // these values must be used exactly, they're like specific % placeholders.
 	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
 
 	// Check the current pressure on the pipe
@@ -2295,7 +2295,9 @@ func init() {
 }
 
 var (
-	procCreateMutex = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
+	procCreateMutex  = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
+	procReleaseMutex = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReleaseMutex")
+	procCloseHandle  = windows.NewLazySystemDLL("kernel32.dll").NewProc("CloseHandle")
 )
 
 type MutexScope int
@@ -2313,6 +2315,29 @@ func (s MutexScope) Prefix() string {
 		return "Global\\" // don't want this for winbollocks, but do for dnsbollocks
 	default:
 		panic(fmt.Sprintf("Unhandled MutexScope value: %d", s))
+	}
+}
+
+var mutexHandle uintptr
+
+func releaseSingleInstance() {
+	if mutexHandle != 0 {
+		//defer is tied to the function, not to inner scopes, so it happens only when this func. exits!
+		//defers do run when a panic happens
+		defer func() { mutexHandle = 0 }()
+		// Release ownership if we own it
+		//procReleaseMutex.Call(mutexHandle)
+		r1, _, e1 := procReleaseMutex.Call(mutexHandle)
+		if r1 == 0 {
+			logf("ReleaseMutex failed: %v", e1)
+		}
+		// Close handle so other instances can acquire
+		//procCloseHandle.Call(mutexHandle)
+		r2, _, e2 := procCloseHandle.Call(mutexHandle)
+		if r2 == 0 {
+			logf("CloseHandle failed: %v", e2)
+		}
+		//mutexHandle = 0
 	}
 }
 
@@ -2337,7 +2362,6 @@ func ensureSingleInstance(name string, scope MutexScope) {
 	// CreateMutex(lpMutexAttributes, bInitialOwner, lpName)
 	// CreateMutex: Security attributes NULL (0), Initial owner TRUE (1), Name
 	ret, _, callErr := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
-	//ret, _, callErr := procCreateMutex.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
 
 	// if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 	// 	// We don't want to pause here usually, just die quietly or alert user.
@@ -2374,7 +2398,8 @@ func ensureSingleInstance(name string, scope MutexScope) {
 	// Note: We don't technically need to close this handle manually.
 	// As long as the process is alive, the mutex is held.
 	// When the process dies, Windows cleans it up.
-	_ = ret
+	//_ = ret
+	mutexHandle = ret
 }
 
 const writeProfile bool = false
@@ -2541,6 +2566,7 @@ func primary_defer() { //primary defer
 
 	//if hasConsole || hConsole != 0 || isTerminal || true {
 	if stdinIsConsoleInteractive() {
+		releaseSingleInstance() // don't hog the mutex while waiting for key
 		//logf("s2")
 		//todo()
 		//logf("s3")
