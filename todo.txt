@@ -2,3 +2,4 @@
 //they can be moved * see if child windows or dialogs like the LAN adapter config. can be moved and how.
 //* FIXME: winkey+L will make prog think winkey is held after unlock!
 //fixed printing was blocking thus our hooks weren't running //* ensure when runasadmin.bat and LMB-dragging scrollbar of that cmd.exe (admin) the mouse movements aren't 500ms delayed - probably need to use separate thread for hooks(+ their own msg.loop). This only happened in devbuild.bat not in build.bat btw.
+//* tooltip not showing on warnings for lines in vscode, this was due to keyboard spamming keys (known keyboard bug)

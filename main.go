@@ -1422,7 +1422,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 	//TODO: add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
 	//TODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
-	//TODO: Do the same for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
+	//TODO: Do the postmessage for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
 
 	case WM_START_NATIVE_DRAG:
 		target := windows.Handle(wParam)
@@ -1470,8 +1470,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
 			exitText := mustUTF16("Exit")
-			manualText := mustUTF16("Manual move (no focus)")
-			focusText := mustUTF16("Activate(focus) window on move")
+			manualText := mustUTF16("Manual move (no focus)") //TODO: make default and remove the disabled variant!
+			focusText := mustUTF16("Activate(focus) window on move(caveat: presses LMB once if not already focused)")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 
@@ -2205,7 +2205,7 @@ func init() {
 	//defaults:
 	forceManual = true
 	activateOnMove = true
-	ratelimitOnMove = true
+	ratelimitOnMove = false
 	shouldLogDragRate = false
 
 	lastPostedX = -1
@@ -2661,7 +2661,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	// 	logf("WH_SHELL hook failed: %v", err)
 	// }
 
-	// Global foreground change hook
+	// Global foreground change hook, this is the WH_SHELL hook, changed tho to accomodate needs.
 	h, _, err = procSetWinEventHook.Call(
 		0x0003, // EVENT_SYSTEM_FOREGROUND min
 		//0x0003, // max
