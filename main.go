@@ -119,7 +119,7 @@ var (
 
 	procSetCapture = user32.NewProc("SetCapture")
 
-	//procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
+	procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
 
 	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
 
@@ -245,6 +245,7 @@ const (
 	//WM_WAKE_UP           = WM_USER + 3
 	WM_INJECT_SEQUENCE  = WM_USER + 100
 	WM_INJECT_LMB_CLICK = WM_USER + 101
+	WM_EXIT_VIA_CTRL_C  = WM_USER + 150
 	WM_DO_SETWINDOWPOS  = WM_USER + 200 // arbitrary, just unique
 )
 const (
@@ -1556,6 +1557,24 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_CLOSE: //case 0x0010: // WM_CLOSE
 		//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 		exit(0)
+	case WM_EXIT_VIA_CTRL_C:
+		var ctrlType uint32 = uint32(wParam)
+		switch ctrlType {
+		//case 0, 2: // CTRL_C_EVENT, CTRL_CLOSE_EVENT
+		case CTRL_C_EVENT:
+			// procUnhookWindowsHookEx.Call(uintptr(hHook))
+			// os.Exit(0)
+			//todo()
+			exitf(128, "exit via Ctrl+C")
+
+		case CTRL_BREAK_EVENT:
+			exitf(128, "exit via Ctrl+Break")
+		case CTRL_CLOSE_EVENT:
+			exitf(127, "exit via Ctrl+Close event (wtf is this?!)") //TODO: find out what this is.
+		default:
+			exitf(129, "exit via unknown event %d", ctrlType)
+		}
+		unreachable()
 	case WM_DO_SETWINDOWPOS:
 		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS in wndProc!")
 	} //switch
@@ -1593,14 +1612,59 @@ func exit(code int) {
 	exitf(code, "express exit")
 }
 
-// var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
-// switch ctrlType {
-// case 0, 2: // CTRL_C_EVENT, CTRL_CLOSE_EVENT
-// procUnhookWindowsHookEx.Call(uintptr(hHook))
-// os.Exit(0)
-// }
-// return 1
-// })
+const CTRL_C_EVENT = 0
+const CTRL_BREAK_EVENT = 1
+const CTRL_CLOSE_EVENT = 2
+
+// done: keep this for the devbuild.bat mode?! ie. when having console!
+var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
+	/*
+			The handler registered via SetConsoleCtrlHandler (and indirectly through Go’s os/signal) is executed on a dedicated control-handler thread, not on the thread that created your window.
+
+		That matters because:
+
+		Win32 requires many window operations — especially DestroyWindow() — to be performed on the creating thread.
+
+		Calling DestroyWindow() from the Ctrl+C handler thread can fail with:
+
+		invalid handle
+
+		access denied
+
+		already destroyed semantics
+
+		or simply undefined teardown behavior.
+		-chatgpt 5.2
+		ok So u can't attempt to destroy hwnd from this thread, it will 'access denied' !
+		so we don't exit from here, we tell message window to exit for us.
+	*/
+	// defer secondary_defer()
+	// defer primary_defer()
+
+	// switch ctrlType {
+	// //case 0, 2: // CTRL_C_EVENT, CTRL_CLOSE_EVENT
+	// case CTRL_C_EVENT:
+	// 	// procUnhookWindowsHookEx.Call(uintptr(hHook))
+	// 	// os.Exit(0)
+	// 	//todo()
+	// 	exitf(128, "exit via Ctrl+C")
+
+	// case CTRL_BREAK_EVENT:
+	// 	exitf(128, "exit via Ctrl+Break")
+	// case CTRL_CLOSE_EVENT:
+	// 	exitf(127, "exit via Ctrl+Close event (wtf is this?!)") //TODO: find out what this is.
+	// default:
+	// 	exitf(129, "exit via unknown event %d", ctrlType)
+	// }
+	//unreachable()
+	procPostMessage.Call(
+		uintptr(trayIcon.HWnd),
+		WM_EXIT_VIA_CTRL_C,
+		uintptr(ctrlType),
+		0,
+	)
+	return 1 // 1=true aka i handled this event ie. don't do the default handling which would exit.
+})
 
 // var logFile *os.File
 
@@ -2404,6 +2468,96 @@ func closeAndFlushLog() {
 
 type theILockedMainThreadToken struct{}
 
+var currentExitCode int = 0
+
+func secondary_defer() { //secondary defer, never ran unless primary defer is defective(ie. panics in itself)
+	var exitcode int
+	// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
+	if r2 := recover(); r2 != nil {
+		logf("!secondary defer here! [CRITICAL ERROR IN primary DEFER]: '%v'\n%s\n----snip----", r2, debug.Stack())
+		exitcode = 120
+	} else {
+		logf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
+		exitcode = 121
+	}
+	logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode, exitcode)
+	closeAndFlushLog()
+	os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
+}
+
+func primary_defer() { //primary defer
+
+	/*
+		What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
+		recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
+	*/
+	if r := recover(); r != nil {
+		if status, ok := r.(exitStatus); ok {
+			currentExitCode = status.Code
+			// This was an intentional exit(code)
+			//if code != 0 {
+			logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
+			//}
+		} else {
+			currentExitCode = 1
+			stack := debug.Stack()
+			logf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
+			//debug.PrintStack()
+		}
+	}
+	cleanupTray()
+
+	logf("Execution finished.")
+	if writeProfile {
+		writeHeapProfileOnExit()
+	}
+	// 2. Use your high-quality "clrbuf" waiter
+	//detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already) and if we forgot to put this in an init()
+	// Only pause if we have an actual console window and an error occurred
+
+	// hConsole, _, _ := procGetConsoleWindow.Call()
+	// // 2. If no handle, try to attach to the parent's console
+	// if hConsole == 0 {
+	// 	var (
+	// 		procAttachConsole     = kernel32.NewProc("AttachConsole")
+	// 		ATTACH_PARENT_PROCESS = uintptr(^uint32(0)) // -1
+	// 	)
+	// 	ret, _, _ := procAttachConsole.Call(ATTACH_PARENT_PROCESS)
+	// 	if ret != 0 {
+	// 		hConsole, _, _ = procGetConsoleWindow.Call()
+	// 	}
+	// }
+
+	// // 2. Check if Stdin is actually a terminal (not a pipe/null)
+
+	// these 2 lines fixes things:
+	stat, err := os.Stdin.Stat()
+	isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
+	//these two lines instead, broke all logging by causing a panic here: (uncomment them for testing purposes)
+	// stat, _ := os.Stdin.Stat()
+	// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
+
+	//fixedFIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
+
+	//if hasConsole || hConsole != 0 || isTerminal || true {
+	if isTerminal {
+		//logf("s2")
+		//todo()
+		//logf("s3")
+		//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this. Or make it a common library or smth, then vendor it.
+		logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
+		var dummy string
+		_, _ = fmt.Scanln(&dummy)
+	} else {
+		logf("not waiting for keypress")
+	}
+
+	//XXX: these should be last:
+	closeAndFlushLog()
+	// 3. exit
+	os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
+}
+
 func main() {
 	// 1. Lock THIS specific thread (Thread A) to the OS for Win32/Hooks.
 	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
@@ -2421,102 +2575,55 @@ func main() {
 	// 2. Spawn the worker. The "Main Thread" Lock: Since we are using runtime.LockOSThread() in main, we want to be absolutely certain that the Go scheduler has finished its "Main Thread" bookkeeping before we start spawning background workers that we expect to land on other cores.
 	// The Go scheduler sees Thread A is locked, so it puts this on Thread B.
 	go logWorker()
-	currentExitCode := 0
-	defer func() { //secondary defer, never ran unless primary defer is defective(ie. panics in itself)
-		var exitcode int
-		// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
-		if r2 := recover(); r2 != nil {
-			logf("!secondary defer here! [CRITICAL ERROR IN primary DEFER]: '%v'\n%s\n----snip----", r2, debug.Stack())
-			exitcode = 120
-		} else {
-			logf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
-			exitcode = 121
-		}
-		logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode, exitcode)
-		closeAndFlushLog()
-		os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
-	}()
 
-	defer func() { //primary defer
+	defer secondary_defer() //this runs second but only if first doesn't os.exit ie. it fails/panics!
 
-		/*
-			What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
-			recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
-		*/
-		if r := recover(); r != nil {
-			if status, ok := r.(exitStatus); ok {
-				currentExitCode = status.Code
-				// This was an intentional exit(code)
-				//if code != 0 {
-				logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
-				//}
-			} else {
-				currentExitCode = 1
-				stack := debug.Stack()
-				logf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
-				//debug.PrintStack()
-			}
-		}
-		cleanupTray()
+	defer primary_defer() //this runs first
 
-		logf("Execution finished.")
-		if writeProfile {
-			writeHeapProfileOnExit()
-		}
-		// 2. Use your high-quality "clrbuf" waiter
-		//detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already) and if we forgot to put this in an init()
-		// Only pause if we have an actual console window and an error occurred
-
-		// hConsole, _, _ := procGetConsoleWindow.Call()
-		// // 2. If no handle, try to attach to the parent's console
-		// if hConsole == 0 {
-		// 	var (
-		// 		procAttachConsole     = kernel32.NewProc("AttachConsole")
-		// 		ATTACH_PARENT_PROCESS = uintptr(^uint32(0)) // -1
-		// 	)
-		// 	ret, _, _ := procAttachConsole.Call(ATTACH_PARENT_PROCESS)
-		// 	if ret != 0 {
-		// 		hConsole, _, _ = procGetConsoleWindow.Call()
-		// 	}
-		// }
-
-		// // 2. Check if Stdin is actually a terminal (not a pipe/null)
-
-		// these 2 lines fixes things:
-		stat, err := os.Stdin.Stat()
-		isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
-		//these two lines instead, broke all logging by causing a panic here: (uncomment them for testing purposes)
-		// stat, _ := os.Stdin.Stat()
-		// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
-
-		//fixedFIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
-
-		//if hasConsole || hConsole != 0 || isTerminal || true {
-		if isTerminal {
-			//logf("s2")
-			//todo()
-			//logf("s3")
-			//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this.
-			logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
-			var dummy string
-			_, _ = fmt.Scanln(&dummy)
-		} else {
-			logf("not waiting for keypress")
-		}
-
-		//XXX: these should be last:
-		closeAndFlushLog()
-		// 3. exit
-		os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
-	}()
+	installCtrlHandlerIfConsole()
 
 	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
 
 	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
 	if err := runApplication(token); err != nil {
-		//logf("Error: %v\n", err)
 		exitf(2, "Error: %v\n", err)
 	}
+}
+
+func getConsoleWindow() (windows.HWND, error) {
+	r1, _, err := procGetConsoleWindow.Call()
+
+	hwnd := windows.HWND(r1)
+
+	if hwnd == 0 {
+		// syscall wrappers often return err == "The operation completed successfully."
+		// when no failure occurred, so treat that as nil.
+		if err != nil && err != windows.ERROR_SUCCESS {
+			return 0, err
+		}
+
+		// No console is a normal state, not an error.
+		return 0, nil
+	}
+
+	return hwnd, nil
+}
+
+func hasRealConsole() bool {
+	hwnd, err := getConsoleWindow()
+	if err != nil {
+		return false
+	}
+	return hwnd != 0
+}
+
+func installCtrlHandlerIfConsole() {
+	if !hasRealConsole() {
+		return
+	} else {
+		logf("Installing Ctrl+C handler due to console.")
+	}
+	procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // this doesn't work(ie. has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
 }
 
 func todo() {
@@ -2542,44 +2649,6 @@ func exitf(code int, format string, a ...interface{}) {
 		Code:    code,
 		Message: fmt.Sprintf(format, a...),
 	})
-}
-
-// This prevents the "click-to-pause" behavior that causes the 500ms lag.
-func disableQuickEdit() { //TODO: remove this then
-	//without this, there's 500ms mouse movement lag for a few seconds when LMB-ing an Admin cmd.exe due to selection started (1 char is auto selected)
-	/*
-					The "Root Cause" of the Mouse Lag
-
-				It isn't actually anything you are doing wrong in your code. It is a fundamental "feature" of the Windows Console (conhost.exe).
-
-				    When you select text in a console, Windows freezes the process's execution so the buffer doesn't change while you're trying to copy.
-
-				    Since your program is the one that registered the Global Mouse Hook, and your program is now "frozen" by the console selection, the Windows Input Manager is waiting for your mouseProc to say "OK, continue."
-
-				    Windows waits for its internal timeout (around 500ms-2s) and then says "This hook is hung, bypass it."
-
-				    The "lag" you feel is the time it takes Windows to give up on your frozen process. disableQuickEdit is the industry-standard fix for this in CLI tools.
-					Gemini 3 Fast
-
-					Yes, disableQuickEdit makes it harder to copy/paste. You can still do it, but you have to right-click the title bar -> Edit -> Mark, which is annoying.
-
-		However, the "Root Cause" isn't your code—it's how Windows handles hooks. Because your program is the "hook provider,"
-		if your program's thread is paused (by a selection), the entire OS input chain for those specific events has to wait for you.
-		If you want to keep QuickEdit enabled, you have to move your hook logic into a separate thread/process that never has a visible console window,
-		so it can never be "paused" by a user click.
-	*/
-	hStdin := windows.Handle(os.Stdin.Fd())
-	var mode uint32
-	windows.GetConsoleMode(hStdin, &mode)
-
-	// ENABLE_QUICK_EDIT_MODE is 0x0040
-	// We use bitwise AND NOT to clear it
-	mode &^= 0x0040
-	// Also clear Extended Mode just to be sure
-	mode &^= 0x0080
-
-	windows.SetConsoleMode(hStdin, mode)
-	logf("disabled ENABLE_QUICK_EDIT_MODE")
 }
 
 // XXX: in here, return errors like 'return fmt.Errorf("something went wrong")' instead of using log.Fatal or os.Exit(1)
@@ -2608,13 +2677,6 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 			}
 		}
 	}
-
-	// detectConsole() // updated global bool
-	// if isAdmin && hasConsole {
-	// 	disableQuickEdit()
-	// }
-
-	//procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // doesn't work(has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
@@ -2679,8 +2741,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		defer procUnhookWinEvent.Call(uintptr(winEventHook))
 	}
 
-	//hwnd := createMessageWindow()
-	hwnd, err := createMessageWindow()
+	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
 	if err != nil {
 		//exitf(1, "Failed to create message window: %v", err)
 		return fmt.Errorf("Failed to create message window: %v", err)
