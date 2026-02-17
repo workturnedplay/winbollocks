@@ -1615,6 +1615,10 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			if ratelimitOnMove {
 				rlFlags |= MF_CHECKED
 			}
+			if !forceManual {
+				//rate limit only applies to manual move mode
+				rlFlags |= MF_DISABLED
+			}
 			procAppendMenu.Call(hMenu, rlFlags, MENU_RATELIMIT_MOVES,
 				uintptr(unsafe.Pointer(ratelimitText)))
 
