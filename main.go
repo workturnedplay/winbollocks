@@ -2315,7 +2315,7 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 */
 func init() {
 	//defaults:
-	forceManual = false // FIXME: temp! set to true after!
+	forceManual = true
 	activateOnMove = true
 	ratelimitOnMove = false
 	shouldLogDragRate = false
