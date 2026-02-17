@@ -4,4 +4,9 @@
 //fixed printing was blocking thus our hooks weren't running //* ensure when runasadmin.bat and LMB-dragging scrollbar of that cmd.exe (admin) the mouse movements aren't 500ms delayed - probably need to use separate thread for hooks(+ their own msg.loop). This only happened in devbuild.bat not in build.bat btw.
 //* tooltip not showing on warnings for lines in vscode, this was due to keyboard spamming keys (known keyboard bug)
 //* while waiting for Enter key to exit, unregister mutex right before that.
+* re: focus the drag-moved window first, "Your Current Method: Injected LMB avoids attachment(to target window's thread) but risks UI interactions (e.g., clicking a button starts an action). Attachment + SetForegroundWindow is cleaner for focus-only, no click side effects.", but this means the hooks must be in their own thread to not lock things up. Kept so far as 1 thread and seems to be working, but unclear how correct this is with respect to potential hangs due to target window hanging.
+* see if SW_RESTORE works for when window is maximized!
+* could maybe check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
+* make sure hooks are on their own thread, different from msg. loop thread, to avoid lockups; use windows.GetCurrentThreadId() to check they're diff. threads; test with GOMAXPROCS=1; "you can force more threads via runtime.GOMAXPROCS(runtime.NumCPU())" and make sure it's at least 2 even if numCPU is less;
+* native window dragging is broken currently, ie. if you uncheck "Manual move(no focus)" in systray that means native drag is used but it only works sometimes and it's pretty bad/choppy when it does work on cmd.exe due to the 1 thread of our program (for msg. loop and hooks, same thread) and cmd.exe does something (like selection started) which hangs our program thus the hooks too and Windows times out the hooks that's why it's not fully locked up.
 

@@ -98,7 +98,7 @@ var (
 	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	procWindowFromPoint     = user32.NewProc("WindowFromPoint")
 	procGetAncestor         = user32.NewProc("GetAncestor")
-	procReleaseCapture      = user32.NewProc("ReleaseCapture")
+	procReleaseCapture      = user32.NewProc("ReleaseCapture") // Releases mouse capture if any window has it
 	procSendMessage         = user32.NewProc("SendMessageW")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 
@@ -131,7 +131,7 @@ var (
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDpiAwareness        = shcore.NewProc("SetProcessDpiAwareness")
 
-	//procAttachThreadInput = user32.NewProc("AttachThreadInput")
+	procAttachThreadInput = user32.NewProc("AttachThreadInput")
 
 	procPostMessage = user32.NewProc("PostMessageW")
 
@@ -243,10 +243,10 @@ const (
 	WM_START_NATIVE_DRAG = WM_USER + 1
 	WM_MYTRAY            = WM_USER + 2
 	//WM_WAKE_UP           = WM_USER + 3
-	WM_INJECT_SEQUENCE  = WM_USER + 100
-	WM_INJECT_LMB_CLICK = WM_USER + 101
-	WM_EXIT_VIA_CTRL_C  = WM_USER + 150
-	WM_DO_SETWINDOWPOS  = WM_USER + 200 // arbitrary, just unique
+	WM_INJECT_SEQUENCE             = WM_USER + 100
+	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
+	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
+	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 )
 const (
 	MENU_EXIT              = 1
@@ -511,6 +511,8 @@ func injectLMBClick() {
 	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
 	(*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
 
+	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
+
 	ret, _, err := procSendInput.Call(
 		uintptr(len(inputs)),
 		uintptr(unsafe.Pointer(&inputs[0])),
@@ -519,6 +521,43 @@ func injectLMBClick() {
 
 	if ret == 0 {
 		logf("SendInput mouse click failed: %v", err)
+	} else {
+		//TODO: remove, temp.
+		logf("Used LMB click to focus, caveat: target window got a LMB click at the point where you started the window move so it could've clicked an UI button!")
+	}
+}
+
+func injectLMBDown() {
+	inputs := []INPUT{
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{}, // union placeholder
+		},
+		// {
+		// 	Type: INPUT_MOUSE,
+		// 	Ki:   KEYBDINPUT{}, // union placeholder
+		// },
+	}
+
+	// Fill the union as MOUSEINPUT
+	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
+	//(*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
+
+	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
+
+	//SendInput is synchronous—blocks until inputs queued/processed by system. In WH_MOUSE_LL (global, synchronous chain), this blocks all mouse input until done.
+	//SendInput is synchronous — blocks caller until inputs queued to system queue (not processed).
+	ret, _, err := procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+
+	if ret == 0 {
+		logf("SendInput mouse click failed: %v", err)
+	} else {
+		//TODO: remove, temp.
+		logf("Injected LMB down, ret=%d err=%v", ret, err)
 	}
 }
 
@@ -584,168 +623,6 @@ func isMaximized(hwnd windows.Handle) bool {
 
 /* ---------------- Integrity ---------------- */
 
-// func processIntegrityLevel(pid uint32) (uint32, error) { // chatgpt made, gpt-5.2 likely (on Free tier)
-// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	defer windows.CloseHandle(hProc)
-
-// 	var token windows.Token
-// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
-// 		return 0, err
-// 	}
-// 	defer token.Close()
-
-// 	var needed uint32
-// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
-
-// 	buf := make([]byte, needed)
-// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
-// 		return 0, err
-// 	}
-
-// 	sid := (*windows.SID)(unsafe.Pointer(&buf[8]))
-// 	subAuthCount := *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + 1))
-// 	rid := *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + uintptr(8+4*(subAuthCount-1))))
-// 	return rid, nil
-// }
-
-// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made.
-// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	defer windows.CloseHandle(hProc)
-
-// 	var token windows.Token
-// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
-// 		return 0, err
-// 	}
-// 	defer token.Close()
-
-// 	var needed uint32
-// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
-
-// 	buf := make([]byte, needed)
-// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
-// 		return 0, err
-// 	}
-
-// 	// TOKEN_MANDATORY_LABEL header: Sid pointer (uintptr) + Attributes (uint32)
-// 	// SID starts after the header (skip sizeof(uintptr) + sizeof(uint32))
-// 	sidPtrOffset := unsafe.Sizeof(uintptr(0)) + unsafe.Sizeof(uint32(0))
-// 	sid := (*windows.SID)(unsafe.Pointer(&buf[sidPtrOffset]))
-
-// 	// SubAuthorityCount (byte at offset 1 in SID)
-// 	subCount := *(*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + 1))
-
-// 	// First SubAuthority at offset 8; last (RID) at 8 + 4*(count-1)
-// 	if subCount == 0 {
-// 		return 0, fmt.Errorf("invalid SID")
-// 	}
-// 	ridOffset := uintptr(8 + 4*(subCount-1))
-// 	rid := *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + ridOffset))
-
-// 	return rid, nil
-// }
-
-// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, second try
-// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	defer windows.CloseHandle(hProc)
-
-// 	var token windows.Token
-// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
-// 		return 0, err
-// 	}
-// 	defer token.Close()
-
-// 	var needed uint32
-// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
-
-// 	buf := make([]byte, needed)
-// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
-// 		return 0, err
-// 	}
-
-// 	// Add debug log
-// 	logf("Integrity buf len=%d for PID %d", len(buf), pid)
-
-// 	// TOKEN_MANDATORY_LABEL: Sid (*SID as uintptr) + Attributes (uint32) + padding for alignment
-// 	type tokenMandatoryLabel struct {
-// 		SidPtr     uintptr // pointer to SID
-// 		Attributes uint32
-// 		Padding    uint32 // 64-bit alignment padding
-// 	}
-
-// 	if len(buf) < unsafe.Sizeof(tokenMandatoryLabel{}) {
-// 		return 0, fmt.Errorf("buffer too small: %d", len(buf))
-// 	}
-
-// 	tml := (*tokenMandatoryLabel)(unsafe.Pointer(&buf[0]))
-
-// 	if tml.SidPtr == 0 {
-// 		return 0, fmt.Errorf("nil SID pointer")
-// 	}
-
-// 	sid := (*windows.SID)(unsafe.Pointer(tml.SidPtr))
-
-// 	subCount := sid.SubAuthorityCount
-// 	if subCount == 0 {
-// 		return 0, fmt.Errorf("invalid subauthority count")
-// 	}
-
-// 	// RID is last subauthority
-// 	ridOffset := uintptr(8) + uintptr(subCount-1)*4
-// 	ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(sid)) + ridOffset))
-// 	rid := *ridPtr
-
-// 	return rid, nil
-// }
-
-// func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, 3rd try
-// 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-// 	if err != nil {
-// 		return 0, err
-// 	}
-// 	defer windows.CloseHandle(hProc)
-
-// 	var token windows.Token
-// 	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
-// 		return 0, err
-// 	}
-// 	defer token.Close()
-
-// 	var needed uint32
-// 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
-
-// 	buf := make([]byte, needed)
-// 	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
-// 		return 0, err
-// 	}
-
-// 	// Fixed offset for 64-bit (header 16 bytes aligned)
-// 	const sidOffset = 16
-// 	if len(buf) < sidOffset+12 { // min SID size
-// 		return 0, fmt.Errorf("buffer too small: %d", len(buf))
-// 	}
-
-// 	sid := (*windows.SID)(unsafe.Pointer(&buf[sidOffset]))
-
-// 	subCount := sid.SubAuthorityCount
-// 	if subCount == 0 {
-// 		return 0, fmt.Errorf("invalid SID subcount=0")
-// 	}
-
-// 	// RID is last SubAuthority (integrity levels have subCount=1)
-// 	ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&sid.SubAuthority[0])) + uintptr(subCount-1)*4))
-// 	rid := *ridPtr
-
-//		return rid, nil
-//	}
 func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, 4th try
 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
@@ -936,14 +813,97 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	// 0,
 	// )
 
-	procPostMessage.Call(
-		uintptr(trayIcon.HWnd),
-		WM_START_NATIVE_DRAG,
-		uintptr(hwnd),
-		0,
-	)
-
 	currentDrag = &dragState{manual: false}
+
+	if true {
+		logf("Doing native drag via wndProc")
+		procPostMessage.Call(
+			uintptr(trayIcon.HWnd),
+			WM_START_NATIVE_DRAG,
+			uintptr(hwnd),
+			0,
+		)
+	} else {
+		logf("Doing native drag via mouseProc aka in hook, bad as it doesn't work because the LMB down is queued after these so it never does anything.")
+		target := hwnd
+		if target != 0 {
+			logf("got target %d", target)
+			// get target thread id
+			// Fix: Capture thread ID from return value, good grok (bad chatgpt)
+			var targetProcessId uint32
+			r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
+			if r1 == 0 {
+				logf("GetWindowThreadProcessId failed: %v", err)
+				return
+			}
+			targetThreadId := uint32(r1) // This is the actual thread ID
+
+			// current thread id
+			curTid := windows.GetCurrentThreadId()
+
+			// attach input so SetForegroundWindow is allowed
+			// Attach (check success)
+			attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
+			if attachRet == 0 {
+				logf("AttachThreadInput failed: %v", attachErr)
+				return
+			}
+
+			// Get current cursor pos for lParam (screen coords, fresh)
+			var cursorPt POINT
+			getRet, _, getErr := procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursorPt)))
+			if getRet == 0 {
+				logf("GetCursorPos failed: %v", getErr)
+				// Fallback to your +5 method or bail
+			}
+			//lParamNative := uintptr(uint32(cursorPt.Y)<<16 | uint32(cursorPt.X)) // MAKEWPARAM equivalent
+			var lParamNative uintptr = makeLParam(cursorPt.X, cursorPt.Y)
+			//var lParamNative uintptr = 0
+
+			procSetForegroundWindow.Call(uintptr(target)) //XXX: focus is required for WM_NCLBUTTONDOWN to work!
+			//procReleaseCapture.Call()
+			// detach input even if SetForegroundWindow failed
+			procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE
+
+			//procSendMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative) // synchronous
+			// ret, _, err = procSendMessage.Call(
+			// 	uintptr(target),
+			// 	WM_NCLBUTTONDOWN,
+			// 	HTCAPTION,
+			// 	lParamNative,
+			// )
+			// logf("WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
+
+			injectLMBDown() // this blocks here and Windows times out the hook after 500ms or so.
+			/*
+				You confirmed correctly: AttachThreadInput is only needed for SetForegroundWindow (to bypass focus restrictions),
+				not for PostMessage / SendMessage itself. Cross-thread PostMessage works without attachment (messages are queued to the target's thread safely).
+				SendMessage requires the target thread to be pumping messages, but no attachment needed unless focus/input state is involved.
+				- grok fast
+			*/
+			// Use PostMessage (async) to avoid sync issues
+			ret, _, err := procPostMessage.Call(
+				uintptr(target),
+				WM_NCLBUTTONDOWN,
+				HTCAPTION,
+				lParamNative,
+			)
+			logf("PostMessage WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
+
+			// attempt to bring the target to the foreground and start the native move
+
+			// procSetForegroundWindow.Call(uintptr(target))
+			// procReleaseCapture.Call()
+			// ret, _, err = procSendMessage.Call(
+			// 	uintptr(target),
+			// 	WM_SYSCOMMAND,
+			// 	SC_MOVE|HTCAPTION,
+			// 	0,
+			// )
+			// logf("WM_SYSCOMMAND ret=%d err=%v", ret, err)
+		}
+	} // else
+
 	return
 }
 
@@ -1007,10 +967,50 @@ func hardReset() {
 
 func isWindowForeground(hwnd windows.Handle) bool {
 	if hwnd == 0 {
+		logf("!! attempted to check the focus of a windows with handle 0")
 		return false
 	}
 	fg, _, _ := procGetForegroundWindow.Call()
 	return windows.Handle(fg) == hwnd
+}
+
+// aka focus(activate) the window, works by attaching to target window's thread, so Windows won't do its focus stealing prevention thing!
+// also, this way I don't have to inject LMB down then LMB up aka a LMB click event to focus it, risking pressing Exit button on total commander for example.
+// however, TODO: now i do have to make sure hooks are running on a separate thread (than main msg. loop) because this is potentially blocking and can deadlock, depending on target app.
+func forceForeground(target windows.Handle) bool {
+	if target == 0 {
+		logf("!! attempted to focus a windows with handle 0")
+		return false
+	}
+	if isWindowForeground(target) {
+		return true // Already good, no-op
+	}
+
+	var targetProcessId uint32
+	r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
+	if r1 == 0 {
+		logf("GetWindowThreadProcessId failed: %v", err)
+		return false
+	}
+	targetThreadId := uint32(r1)
+
+	curTid := windows.GetCurrentThreadId()
+	attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1))
+	if attachRet == 0 {
+		logf("AttachThreadInput failed: %v", attachErr)
+		return false
+	}
+
+	fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+	if fgRet != 1 {
+		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+		logf("SetForegroundWindow ret=%d err=%v", fgRet, fgErr)
+	}
+
+	procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // Detach always
+
+	return fgRet != 0
 }
 
 /* ---------------- Mouse Hook ---------------- */
@@ -1092,21 +1092,22 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				// }
 				capturing = true
 				if activateOnMove && !isWindowForeground(targetWnd) {
-					//logf("injecting LMB click")
-					// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
-					// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow
+
 					procPostMessage.Call(
 						uintptr(trayIcon.HWnd),
-						WM_INJECT_LMB_CLICK,
+						WM_FOCUS_TARGET_WINDOW_SOMEHOW,
 						0, // no args to that function
 						0,
 					)
+					//}
 				}
 				return 1 // swallow LMB only for manual
 				//} else {
 				//	return 0 // let native move receive input
+				// } else {
+				// 	return 1 // FIXME: temp swallow LMB for non-manual too. Because i need to insert a LMB down before WM_NCLBUTTONDOWN else WM_NCLBUTTONDOWN will be first!
 			}
-			//XXX: else, let it fall thru(let native move receive input) so CallNextHookEx is called too
+			//XXX: else, let it fall thru(let native move receive input - required!) so CallNextHookEx is called too
 			//}
 		}
 
@@ -1396,12 +1397,38 @@ func handleActualMove(data WindowMoveData) {
 	if ret == 0 {
 		errCode, _, _ := procGetLastError.Call()
 		logf("SetWindowPos failed(from within main message loop): hwnd=0x%x error=%d", target, errCode)
-
-		// Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
-		pt := POINT{X: x, Y: y}
-		lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
-		procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
+		if errCode == 5 { // Access denied (UIPI likely)
+			showTrayInfo("winbollocks", "Cannot move elevated window (access denied), you'd have to run as admin.")
+		}
+		// // Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
+		// pt := POINT{X: x, Y: y}
+		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
+		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
 	}
+}
+
+// func makeLParam(x, y int32) uintptr { // chatgpt
+//
+//		return uintptr(uint32(uint16(x)) | (uint32(uint16(y)) << 16))
+//	}
+//
+// func makeLParam(x, y int32) uintptr { //grok, dumb for y needs &
+//
+//		return uintptr((int64(y) << 16) | (int64(x) & 0xFFFF))
+//	}
+//
+// func makeLParam(x, y int32) uintptr { //grok, fixed by me
+//
+//		return uintptr(((int64(y) << 16) & 0xFFFF0000) | (int64(x) & 0xFFFF))
+//	}
+func makeLParam(x, y int32) uintptr { // grok again
+	//AND ensures 16-bit truncation, prevents high bits bleed. No warnings, handles negatives.
+	// cast doesn't change bits only interpretation
+	//The cast to uint32 doesn't "change" the bits in a harmful way for your scenario (2's complement representation is preserved,
+	// and &0xFFFF truncates to the low 16 bits correctly before shifting).
+	// The following line suppresses the warning:
+	// #nosec G115 -- safe: coords are screen pixels, always fit in 16 bits
+	return uintptr((uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF))
 }
 
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -1426,16 +1453,97 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	//TODO: Do the postmessage for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
 
 	case WM_START_NATIVE_DRAG:
+		logf("doing it via WM_START_NATIVE_DRAG")
 		target := windows.Handle(wParam)
 		if target != 0 {
-			procSetForegroundWindow.Call(uintptr(target))
-			procReleaseCapture.Call()
-			procSendMessage.Call(
-				uintptr(target),
-				WM_SYSCOMMAND,
-				SC_MOVE|HTCAPTION,
-				0,
-			)
+			logf("got target %d", target)
+			// get target thread id
+			// var targetThreadId uint32
+			// procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetThreadId))) // bad chatgpt
+			// Fix: Capture thread ID from return value, good grok
+			var targetProcessId uint32
+			r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
+			if r1 == 0 {
+				logf("GetWindowThreadProcessId failed: %v", err)
+				return 0
+			}
+			targetThreadId := uint32(r1) // This is the actual thread ID
+
+			// current thread id
+			curTid := windows.GetCurrentThreadId()
+
+			// attach input so SetForegroundWindow is allowed
+			// procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
+			// Attach (check success)
+			attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
+			if attachRet == 0 {
+				logf("AttachThreadInput failed: %v", attachErr)
+				return 0 // Bail, or fallback to manual
+			}
+
+			// Get current cursor pos for lParam (screen coords, fresh)
+			var cursorPt POINT
+			getRet, _, getErr := procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursorPt)))
+			if getRet == 0 {
+				logf("GetCursorPos failed: %v", getErr)
+				// Fallback to your +5 method or bail
+			}
+			//lParamNative := uintptr(uint32(cursorPt.Y)<<16 | uint32(cursorPt.X)) // MAKEWPARAM equivalent
+			var lParamNative uintptr = makeLParam(cursorPt.X, cursorPt.Y)
+			//var lParamNative uintptr = 0
+
+			// if activateOnMove {
+			procSetForegroundWindow.Call(uintptr(target)) //XXX: focus is required for WM_NCLBUTTONDOWN to work!
+			// }
+			//procReleaseCapture.Call() //XXX: unclear if ever needed and when.
+
+			//procSendMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative) // synchronous
+			// ret, _, err = procSendMessage.Call(
+			// 	uintptr(target),
+			// 	WM_NCLBUTTONDOWN,
+			// 	HTCAPTION,
+			// 	lParamNative,
+			// )
+			// logf("WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
+
+			//now insert a LMB down (since the real one we swallowed) - required for WM_NCLBUTTONDOWN to work:
+			//			injectLMBDown()
+			//sleep to allow LMB to happen before the below WM_NCLBUTTONDOWN; trying to see if it works! no effect!
+			//time.Sleep(100 * time.Millisecond) //FIXME: temp, remove this!
+
+			/*
+				You confirmed correctly: AttachThreadInput is only needed for SetForegroundWindow (to bypass focus restrictions),
+				not for PostMessage / SendMessage itself. Cross-thread PostMessage works without attachment (messages are queued to the target's thread safely).
+				SendMessage requires the target thread to be pumping messages, but no attachment needed unless focus/input state is involved.
+				- grok fast
+			*/
+			if false {
+				// Use PostMessage (async) to avoid sync issues
+				ret, _, err := procPostMessage.Call(
+					uintptr(target),
+					WM_NCLBUTTONDOWN,
+					HTCAPTION,
+					lParamNative,
+				)
+				logf("PostMessage WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
+			} else {
+
+				// attempt to bring the target to the foreground and start the native move
+
+				// procSetForegroundWindow.Call(uintptr(target))
+				// procReleaseCapture.Call()
+				ret, _, err := procPostMessage.Call(
+					uintptr(target),
+					WM_SYSCOMMAND,
+					SC_MOVE|HTCAPTION,
+					0,
+				)
+				logf("WM_SYSCOMMAND ret=%d err=%v", ret, err)
+			}
+
+			// detach input even if SetForegroundWindow/SendMessage failed
+			procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE
+
 		}
 		return 0
 	case WM_INJECT_SEQUENCE:
@@ -1443,9 +1551,17 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		which := uint16(wParam)        // ie. uint16(vk))
 		injectShiftTapThenWinUp(which) // it's correct casting, as per AI.
 		return 0
-	case WM_INJECT_LMB_CLICK:
-		//avoids injecting from the hook
-		injectLMBClick()
+	case WM_FOCUS_TARGET_WINDOW_SOMEHOW:
+		//this is here because avoids focusing window or injecting LMB from the hook
+		if !forceForeground(targetWnd) {
+			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open; next, falling back to injected LMB click which, unfortunatelly, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!")
+			// Optionally keep your old inject as backup
+
+			//logf("injecting LMB click")
+			// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
+			// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
+			injectLMBClick()
+		}
 		return 0
 	case WM_MYTRAY:
 
@@ -1472,7 +1588,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			exitText := mustUTF16("Exit")
 			manualText := mustUTF16("Manual move (no focus)") //TODO: make default and remove the disabled variant!
-			focusText := mustUTF16("Activate(focus) window on move(caveat: presses LMB once if not already focused)")
+			focusText := mustUTF16("Activate(focus) window on manual move(caveat: presses LMB once(but only if the thread-attaching variant fails) if not already focused)")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 
@@ -1486,6 +1602,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
 			if activateOnMove {
 				actFlags |= MF_CHECKED
+			}
+			if !forceManual {
+				// grey out this if manual move is not enabled, so it's more obvious it only applies to it,
+				// because in native drag(FIXME: bugged currently(only works some of the time and on cmd.exe it lags due to our msg. loop and hooks are on same thread!)) it always focuses!
+				actFlags |= MF_DISABLED
 			}
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
 				uintptr(unsafe.Pointer(focusText)))
@@ -2002,79 +2123,6 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		- chatgpt 5.2
 	*/
 
-	// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	// var shiftDown bool = keyDown(VK_SHIFT)
-	// var ctrlDown bool = keyDown(VK_CONTROL)
-	// var altDown bool = keyDown(VK_MENU)
-
-	// switch wParam {
-	// case WM_KEYDOWN, WM_SYSKEYDOWN:
-	// if vk == VK_LWIN || vk == VK_RWIN {
-	// winDownSeen.Store(true)
-	// swallowNextWinUp.Store(false) // safety valve
-	// return 0                       // let Win DOWN through
-	// }
-
-	// case WM_KEYUP, WM_SYSKEYUP:
-	// if vk == VK_LWIN || vk == VK_RWIN {
-	// winDownSeen.Store(false)
-
-	// if swallowNextWinUp.Load() {
-	// // This is the entire trick
-	// swallowNextWinUp.Store(false)
-	// return 1 // swallow Win UP
-	// }
-
-	// return 0
-	// }
-	// }
-
-	// // ---- Win DOWN: always let through ----
-	// if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) &&
-	// (vk == VK_LWIN || vk == VK_RWIN) {
-	// //swallowNextWinUp.Store(false) // allowing this means it won't swallow next winkey up below.
-	// winDownSeen.Store(true)
-	// return 0
-	// }
-
-	// // ---- Win UP: conditionally swallow ----
-	// if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) &&
-	// (vk == VK_LWIN || vk == VK_RWIN) {
-
-	// winDownSeen.Store(false)
-
-	// //Letting Winkey UP(aka winkey released) through(ie. pass thru) → Start menu opens, Winkey clears
-	// // Swallowing Winkey UP → Start menu suppressed, Winkey remains logically active, so pressing E runs explorer because winkey+E does it!
-	// if swallowNextWinUp.Load() {
-	// swallowNextWinUp.Store(false)
-	// return 0 // 🔥 swallow BOTH KEYUP and SYSKEYUP
-	// }
-	// return 0
-	// }
-
-	// && vk == VK_F12
-	// if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && vk == VK_F {
-	// // when you press f key it presses e key, temporary test.
-	// injectLetterE()
-	// return 1 // swallow F12
-	// }
-
-	// Key DOWN
-	// if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
-	// 	switch vk {
-
-	// 	case VK_LWIN, VK_RWIN:
-	// 		winDown.Store(true)
-	// 	//case VK_SHIFT: // Low-level keyboard hooks do NOT reliably(read: at all) deliver VK_SHIFT. VK_SHIFT is a virtual aggregation key used by higher-level APIs (like GetKeyState), not by the LL hook stream.
-	// 	case VK_LSHIFT, VK_RSHIFT:
-	// 		shiftDown.Store(true)
-	// 	case VK_LCONTROL, VK_RCONTROL:
-	// 		ctrlDown.Store(true)
-	// 	case VK_LMENU, VK_RMENU: // Alt
-	// 		altDown.Store(true)
-	// 	}
-	// }
-
 	// Key UP
 	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
 		switch vk {
@@ -2267,7 +2315,7 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 */
 func init() {
 	//defaults:
-	forceManual = true
+	forceManual = false // FIXME: temp! set to true after!
 	activateOnMove = true
 	ratelimitOnMove = false
 	shouldLogDragRate = false
