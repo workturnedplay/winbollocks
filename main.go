@@ -1579,9 +1579,10 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// )
 			// logf("WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
 
-			// logf("sleeping 40 ms before SC_MOVE")
-			// time.Sleep(40 * time.Millisecond) //FIXME: temp, remove this! but make it 100ms and it misses the native drag more often! weird.
-			// logf("done slept 40 ns before SC_MOVE")
+			//XXX: this 40ms delay isn't needed when spy++ v17 is running, but when it's not it always misses the first drag attempt if target wasn't focused and winbollocks was just started.
+			logf("sleeping 40 ms before SC_MOVE")
+			time.Sleep(40 * time.Millisecond) //FIXME: temp, remove this! but make it 100ms and it misses the native drag more often! weird.
+			logf("done slept 40 ns before SC_MOVE")
 
 			/*
 				You confirmed correctly: AttachThreadInput is only needed for SetForegroundWindow (to bypass focus restrictions),
