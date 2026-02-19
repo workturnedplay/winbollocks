@@ -276,10 +276,11 @@ const (
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 )
 const (
-	MENU_EXIT              = 1
-	MENU_ACTIVATE_MOVE     = 3
-	MENU_RATELIMIT_MOVES   = 4
-	MENU_LOG_RATE_OF_MOVES = 5
+	MENU_EXIT                         = 1
+	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK = 2
+	MENU_ACTIVATE_MOVE                = 3
+	MENU_RATELIMIT_MOVES              = 4
+	MENU_LOG_RATE_OF_MOVES            = 5
 
 	MF_STRING = 0x0000
 
@@ -469,9 +470,11 @@ var (
 
 	trayIcon NOTIFYICONDATA
 )
-var activateOnManualMoveOnly bool
-var ratelimitOnMove bool
-var shouldLogDragRate bool // but only when ratelimitOnMove is true
+
+var focusOnDrag bool                // whether or not to (also)focus dragged window
+var doLMBClick2FocusAsFallback bool // if normal(thread attach) focus fails, then do the LMB click on the window to focus it(caveat: can click inside it eg. on its buttons!)
+var ratelimitOnMove bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
+var shouldLogDragRate bool          // but only when ratelimitOnMove is true
 
 /* ---------------- Utilities ---------------- */
 
@@ -994,13 +997,13 @@ func isInSameThreadID(hwnd windows.Handle) bool {
 	return uint32(tid) == windows.GetCurrentThreadId()
 }
 
-func focusThisHwnd(target windows.Handle) bool {
+func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 	fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
 	if fgRet != 1 {
 		lastErr := windows.GetLastError()
 		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
 		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-		logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+		logf("failed SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
 		return false
 	} else { // ie. 1 is TRUE
 		return true
@@ -1051,14 +1054,37 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	return ret, nil
 }
 
-func shouldSkipForeground(hwnd windows.Handle) bool {
+func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
+	ret = true
 	if hwnd == 0 {
-		return true
+		reason = "hwnd is 0"
+		return
 	}
 
 	// 1. Our own process → skip
 	if isOwnWindow(hwnd) {
-		return true
+
+		//don't try to focus self, it will fail to attach
+		//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
+		// Same process → AttachThreadInput is unnecessary and sometimes harmful
+
+		if isInSameThreadID(hwnd) {
+			logf("attempting to focus own window, sure.")
+			////procSetForegroundWindow.Call(uintptr(target))
+			// fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+			// if fgRet != 1 {
+			// 	lastErr := windows.GetLastError()
+			// 	// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+			// 	//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+			// 	logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+			// }
+			ret = false // should NOT skip focusing it.
+		} else {
+			reason = "is own window on diff. thread which might have own msg. loop"
+			logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
+			ret = true //should skip
+		}
+		return
 	}
 
 	// 2. Read styles
@@ -1067,13 +1093,15 @@ func shouldSkipForeground(hwnd windows.Handle) bool {
 	style, err := getWindowLongPtr(hwnd, GWL_STYLE)
 	if err != nil {
 		logf("GetWindowLongPtr STYLE failed: %v", err)
-		return true
+		reason = "GetWindowLongPtr STYLE failed"
+		return
 	}
 
 	exStyle, err := getWindowLongPtr(hwnd, GWL_EXSTYLE)
 	if err != nil {
 		logf("GetWindowLongPtr EXSTYLE failed: %v", err)
-		return true
+		reason = "GetWindowLongPtr EXSTYLE failed"
+		return
 	}
 
 	s := uint32(style)
@@ -1081,20 +1109,25 @@ func shouldSkipForeground(hwnd windows.Handle) bool {
 
 	// Child windows cannot be foreground windows
 	if s&WS_CHILD != 0 {
-		return true
+		reason = "is child"
+		return
 	}
 
 	// Tool windows are often menus/popups
 	if ex&WS_EX_TOOLWINDOW != 0 {
-		return true
+		reason = "is tool window"
+		return
 	}
 
 	// Explicit no-activate → DO NOT TOUCH
 	if ex&WS_EX_NOACTIVATE != 0 {
-		return true
+		reason = "is no WS_EX_NOACTIVATE"
+		return
 	}
 
-	return false
+	ret = false
+	reason = "shouldn't skip"
+	return
 }
 
 // aka focus(activate) the window, works by attaching to target window's thread, so Windows won't do its focus stealing prevention thing!
@@ -1108,31 +1141,34 @@ func forceForeground(target windows.Handle) bool {
 	if isWindowForeground(target) {
 		return true // Already good, no-op
 	}
-	if shouldSkipForeground(target) {
-		logf("shouldSkipForeground for HWND 0x%X", target)
-		return true
-	}
-	if isOwnWindow(target) {
-		//don't try to focus self, it will fail to attach
-		//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
-		// Same process → AttachThreadInput is unnecessary and sometimes harmful
-
-		if isInSameThreadID(target) {
-			logf("attempting to focus own window, sure.")
-			////procSetForegroundWindow.Call(uintptr(target))
-			// fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
-			// if fgRet != 1 {
-			// 	lastErr := windows.GetLastError()
-			// 	// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
-			// 	//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-			// 	logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
-			// }
-			focusThisHwnd(target)
-		} else {
-			logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
+	{
+		b, reason := shouldSkipFocusingIt(target)
+		if b {
+			logf("shouldSkipFocusingIt for HWND 0x%X because %s", target, reason)
+			return true //pretend it's focused
 		}
-		return true // so it doesn't try the LMB click way next.
 	}
+	// if isOwnWindow(target) {
+	// 	//don't try to focus self, it will fail to attach
+	// 	//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
+	// 	// Same process → AttachThreadInput is unnecessary and sometimes harmful
+
+	// 	if isInSameThreadID(target) {
+	// 		logf("attempting to focus own window, sure.")
+	// 		////procSetForegroundWindow.Call(uintptr(target))
+	// 		// fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+	// 		// if fgRet != 1 {
+	// 		// 	lastErr := windows.GetLastError()
+	// 		// 	// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+	// 		// 	//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+	// 		// 	logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+	// 		// }
+	// 		focusThisHwnd(target)
+	// 	} else {
+	// 		logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
+	// 	}
+	// 	return true // so it doesn't try the LMB click way next.
+	// }
 
 	var targetProcessId uint32
 	r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
@@ -1149,11 +1185,11 @@ func forceForeground(target windows.Handle) bool {
 		return false
 	}
 
-	ret := focusThisHwnd(target)
+	succeeded := focusThisHwnd(target)
 
 	procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // Detach always
 
-	return ret //fgRet != 0
+	return succeeded //fgRet != 0
 }
 
 func logLMBState(prefix string) {
@@ -1243,8 +1279,8 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// 	// procSetForegroundWindow.Call(uintptr(hwnd))
 			// 	// AttachThreadInput(self, target, FALSE)
 			// }
-			capturing = true
-			if activateOnManualMoveOnly && !isWindowForeground(targetWnd) {
+			capturing = true //FIXME: this probably needs to be atomic if multi-threaded (it's not m.t. yet)
+			if focusOnDrag && !isWindowForeground(targetWnd) {
 
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
@@ -1683,13 +1719,25 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_FOCUS_TARGET_WINDOW_SOMEHOW:
 		//this is here because avoids focusing window or injecting LMB from the hook
 		if !forceForeground(targetWnd) {
-			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open; next, falling back to injected LMB click which, unfortunatelly, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!")
-			// Optionally keep your old inject as backup
+			var extra string
+			if doLMBClick2FocusAsFallback {
+				extra = "; next, falling back to injected LMB click which, unfortunately, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!"
+			} else {
+				extra = "."
+			}
+			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open(ie. press and release winkey once)%s", extra)
 
-			//logf("injecting LMB click")
-			// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
-			// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
-			injectLMBClick()
+			if doLMBClick2FocusAsFallback {
+				//logf("injecting LMB click")
+				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
+				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
+				injectLMBClick()
+			}
+			// // Non-attachment focus: Simulate safe click to focus, doesn't work due to focus stealing prevention (win11) and thus only flashes the taskbar button of the target window. Actually the flashing is due to the above focus try(via attach thread first) failing! This may or may not do it alone, unsure.
+			// ret, _, err := procPostMessage.Call(uintptr(targetWnd), WM_LBUTTONDOWN, 1, makeLParam(10, 10)) // MK_LBUTTON = 1, safe pos
+			// logf("Post WM_LBUTTONDOWN for focus ret=%d err=%v", ret, err)
+			// ret, _, err = procPostMessage.Call(uintptr(targetWnd), WM_LBUTTONUP, 0, makeLParam(10, 10)) // Release to avoid hold
+			// logf("Post WM_LBUTTONUP for focus ret=%d err=%v", ret, err)
 		}
 		return 0
 	case WM_MYTRAY:
@@ -1715,18 +1763,30 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			logf("popping tray menu")
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
-			exitText := mustUTF16("Exit")
-			focusText := mustUTF16("Activate(focus) window on move(caveat: presses LMB once(but only if the thread-attaching variant fails) if not already focused)")
+			focusText := mustUTF16("Focus(activate) window on move(uses thread-attaching variant) if not already focused")
+			doLMBClick2FocusAsFallbackText := mustUTF16("If the above focus method fails send LMB click to focus(can click buttons if u start drag from one!)")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 
+			exitText := mustUTF16("Exit")
+
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
-			if activateOnManualMoveOnly {
+			if focusOnDrag {
 				actFlags |= MF_CHECKED
 			}
 
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
 				uintptr(unsafe.Pointer(focusText)))
+
+			var lmbFlags uintptr = MF_STRING
+			if doLMBClick2FocusAsFallback {
+				lmbFlags |= MF_CHECKED
+			}
+			if !focusOnDrag {
+				lmbFlags |= MF_DISABLED | MF_GRAYED
+			}
+			procAppendMenu.Call(hMenu, lmbFlags, MENU_USE_LMB_TO_FOCUS_AS_FALLBACK,
+				uintptr(unsafe.Pointer(doLMBClick2FocusAsFallbackText)))
 
 			var rlFlags uintptr = MF_STRING
 			if ratelimitOnMove {
@@ -1768,7 +1828,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
-				activateOnManualMoveOnly = !activateOnManualMoveOnly
+				focusOnDrag = !focusOnDrag
+			case MENU_USE_LMB_TO_FOCUS_AS_FALLBACK:
+				doLMBClick2FocusAsFallback = !doLMBClick2FocusAsFallback
 			case MENU_RATELIMIT_MOVES:
 				ratelimitOnMove = !ratelimitOnMove
 				if !ratelimitOnMove {
@@ -2432,7 +2494,8 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 */
 func init() {
 	//defaults:
-	activateOnManualMoveOnly = true
+	focusOnDrag = true
+	doLMBClick2FocusAsFallback = false
 	ratelimitOnMove = false
 	shouldLogDragRate = false
 
