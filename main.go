@@ -268,8 +268,7 @@ const (
 )
 
 const (
-	WM_START_NATIVE_DRAG = WM_USER + 1
-	WM_MYTRAY            = WM_USER + 2
+	WM_MYTRAY = WM_USER + 2
 	//WM_WAKE_UP           = WM_USER + 3
 	WM_INJECT_SEQUENCE             = WM_USER + 100
 	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
@@ -278,7 +277,6 @@ const (
 )
 const (
 	MENU_EXIT              = 1
-	MENU_FORCE_MANUAL      = 2
 	MENU_ACTIVATE_MOVE     = 3
 	MENU_RATELIMIT_MOVES   = 4
 	MENU_LOG_RATE_OF_MOVES = 5
@@ -422,7 +420,6 @@ type MSLLHOOKSTRUCT struct {
 type dragState struct {
 	startPt   POINT
 	startRect RECT
-	manual    bool
 }
 
 type NOTIFYICONDATA struct {
@@ -466,14 +463,12 @@ var (
 	kbdHook   windows.Handle
 
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
-	capturing         bool
-	inNativeCapturing bool
-	targetWnd         windows.Handle
-	currentDrag       *dragState
+	capturing   bool
+	targetWnd   windows.Handle
+	currentDrag *dragState
 
 	trayIcon NOTIFYICONDATA
 )
-var forceManual bool // Default is false, if left like this.
 var activateOnManualMoveOnly bool
 var ratelimitOnMove bool
 var shouldLogDragRate bool // but only when ratelimitOnMove is true
@@ -508,6 +503,45 @@ func waitForMoveLoop(tid uint32, timeout time.Duration) bool {
 	return false
 }
 
+func injectShiftTapOnly() {
+	/*
+		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
+	*/
+	inputs := []INPUT{
+		{
+			Type: INPUT_KEYBOARD,
+			Ki: KEYBDINPUT{
+				//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
+				//WVk: VK_E,
+				//WScan:   0x12, // scancode for 'E',
+				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+				DwFlags: KEYEVENTF_SCANCODE,
+			},
+		},
+		{ // putting this after winUP below has same effect!
+			Type: INPUT_KEYBOARD,
+			Ki: KEYBDINPUT{
+				//WVk:     VK_SHIFT,
+				//WVk: VK_E,
+				//DwFlags: KEYEVENTF_KEYUP,
+				//WScan:   0x12, // 'E' key
+				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+			},
+		},
+	}
+
+	ret, _, err := procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+	if ret == 0 {
+		logf("SendInput for injectShiftTapOnly failed: %v", err)
+	} else {
+		logf("done injectShiftTapOnly")
+	}
+}
 func injectShiftTapThenWinUp(whichWinUp uint16) {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
@@ -550,6 +584,8 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 	)
 	if ret == 0 {
 		logf("SendInput for injectShiftTapThenWinUp failed: %v", err)
+	} else {
+		logf("done injectShiftTapThenWinUp")
 	}
 }
 func injectLMBClick() {
@@ -823,10 +859,10 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 	//capture is released cleanly
 	//no weird input edge cases
 
-	currentDrag = &dragState{startPt: pt, startRect: r, manual: true}
+	currentDrag = &dragState{startPt: pt, startRect: r}
 }
 
-func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
+func startDrag(hwnd windows.Handle, pt POINT) {
 	//logf("startDrag")
 	if isMaximized(hwnd) {
 		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
@@ -851,118 +887,7 @@ func startDrag(hwnd windows.Handle, pt POINT) (usedManual bool) {
 	}
 	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
 
-	usedManual = forceManual
-	if forceManual {
-		startManualDrag(hwnd, pt)
-		return
-	}
-
-	// procSetForegroundWindow.Call(uintptr(hwnd))
-	// //procReleaseCapture.Call()
-
-	// //lParam := uintptr(uint32(pt.Y))<<16 | uintptr(uint32(pt.X)&0xFFFF)
-	// //procSendMessage.Call(uintptr(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, lParam)
-	// procReleaseCapture.Call()
-	// procSendMessage.Call(
-	// uintptr(hwnd),
-	// WM_SYSCOMMAND,
-	// SC_MOVE|HTCAPTION,
-	// 0,
-	// )
-
-	currentDrag = &dragState{manual: false}
-	inNativeCapturing = true
-
-	if true {
-		logf("Doing native drag via wndProc")
-		procPostMessage.Call(
-			uintptr(trayIcon.HWnd),
-			WM_START_NATIVE_DRAG,
-			uintptr(hwnd),
-			0,
-		)
-	} else {
-		logf("Doing native drag via mouseProc aka in hook, bad as it doesn't work because the LMB down is queued after these so it never does anything.")
-		target := hwnd
-		if target != 0 {
-			logf("got target %d", target)
-			// get target thread id
-			// Fix: Capture thread ID from return value, good grok (bad chatgpt)
-			var targetProcessId uint32
-			r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
-			if r1 == 0 {
-				logf("GetWindowThreadProcessId failed: %v", err)
-				return
-			}
-			targetThreadId := uint32(r1) // This is the actual thread ID
-
-			// current thread id
-			curTid := windows.GetCurrentThreadId()
-
-			// attach input so SetForegroundWindow is allowed
-			// Attach (check success)
-			attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
-			if attachRet == 0 {
-				logf("AttachThreadInput failed: %v", attachErr)
-				return
-			}
-
-			// Get current cursor pos for lParam (screen coords, fresh)
-			var cursorPt POINT
-			getRet, _, getErr := procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursorPt)))
-			if getRet == 0 {
-				logf("GetCursorPos failed: %v", getErr)
-				// Fallback to your +5 method or bail
-			}
-			//lParamNative := uintptr(uint32(cursorPt.Y)<<16 | uint32(cursorPt.X)) // MAKEWPARAM equivalent
-			var lParamNative uintptr = makeLParam(cursorPt.X, cursorPt.Y)
-			//var lParamNative uintptr = 0
-
-			procSetForegroundWindow.Call(uintptr(target)) //XXX: focus is required for WM_NCLBUTTONDOWN to work!
-			//procReleaseCapture.Call()
-			// detach input even if SetForegroundWindow failed
-			procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE
-
-			//procSendMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative) // synchronous
-			// ret, _, err = procSendMessage.Call(
-			// 	uintptr(target),
-			// 	WM_NCLBUTTONDOWN,
-			// 	HTCAPTION,
-			// 	lParamNative,
-			// )
-			// logf("WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
-
-			injectLMBDown() // this blocks here and Windows times out the hook after 500ms or so.
-			/*
-				You confirmed correctly: AttachThreadInput is only needed for SetForegroundWindow (to bypass focus restrictions),
-				not for PostMessage / SendMessage itself. Cross-thread PostMessage works without attachment (messages are queued to the target's thread safely).
-				SendMessage requires the target thread to be pumping messages, but no attachment needed unless focus/input state is involved.
-				- grok fast
-			*/
-			// Use PostMessage (async) to avoid sync issues
-			ret, _, err := procPostMessage.Call(
-				uintptr(target),
-				WM_NCLBUTTONDOWN,
-				HTCAPTION,
-				lParamNative,
-			)
-			logf("PostMessage WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
-
-			// attempt to bring the target to the foreground and start the native move
-
-			// procSetForegroundWindow.Call(uintptr(target))
-			// procReleaseCapture.Call()
-			// ret, _, err = procSendMessage.Call(
-			// 	uintptr(target),
-			// 	WM_SYSCOMMAND,
-			// 	SC_MOVE|HTCAPTION,
-			// 	0,
-			// )
-			// logf("WM_SYSCOMMAND ret=%d err=%v", ret, err)
-		}
-	} // else
-
-	return
+	startManualDrag(hwnd, pt)
 }
 
 func keyDown(vk uintptr) bool {
@@ -1009,18 +934,22 @@ func hardResetIfDesynced(winDownInHook bool) {
 	}
 }
 
-func hardReset() {
-	// winDown.Store(keyDown(VK_LWIN) || keyDown(VK_RWIN))
-	// shiftDown.Store(keyDown(VK_SHIFT))
-	// ctrlDown.Store(keyDown(VK_CONTROL))
-	// altDown.Store(keyDown(VK_MENU))
-
-	winGestureUsed = false
+func softReset() { //TODO: use hardReset instead because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	capturing = false
 	currentDrag = nil
 	targetWnd = 0
 
 	procReleaseCapture.Call()
+}
+
+func hardReset() {
+	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	if winGestureUsed && winDown {
+		injectShiftTapOnly() // this way when winUP happens it won't pop up start menu
+		//TODO: inject shift tap at the time gesture is detected!
+		winGestureUsed = false
+	}
+	softReset()
 }
 
 func isWindowForeground(hwnd windows.Handle) bool {
@@ -1030,6 +959,142 @@ func isWindowForeground(hwnd windows.Handle) bool {
 	}
 	fg, _, _ := procGetForegroundWindow.Call()
 	return windows.Handle(fg) == hwnd
+}
+
+// aka in window in my own process?
+func isOwnWindow(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return false
+	}
+
+	var pid uint32
+	r1, _, _ := procGetWindowThreadProcessId.Call(
+		uintptr(hwnd),
+		uintptr(unsafe.Pointer(&pid)),
+	)
+	if r1 == 0 {
+		return false
+	}
+
+	return pid == windows.GetCurrentProcessId()
+}
+
+// FIXME: make these two funcs be one and return two bools: (samePID, sameTID) and sameTID would be false if samePID is false!
+
+// is window in the same thread ID as the caller thread ID (could still be two diff. processes tho!)
+func isInSameThreadID(hwnd windows.Handle) bool {
+	var pid uint32
+	tid, _, _ := procGetWindowThreadProcessId.Call(
+		uintptr(hwnd),
+		uintptr(unsafe.Pointer(&pid)),
+	)
+	if tid == 0 {
+		return false
+	}
+	return uint32(tid) == windows.GetCurrentThreadId()
+}
+
+func focusThisHwnd(target windows.Handle) bool {
+	fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+	if fgRet != 1 {
+		lastErr := windows.GetLastError()
+		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+		logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+		return false
+	} else { // ie. 1 is TRUE
+		return true
+	}
+}
+
+const (
+	WS_CHILD         = 0x40000000
+	WS_POPUP         = 0x80000000
+	WS_EX_TOOLWINDOW = 0x00000080
+	WS_EX_NOACTIVATE = 0x08000000
+)
+const (
+	GWL_STYLE   = -16
+	GWL_EXSTYLE = -20
+)
+
+var procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
+var modkernel32 = windows.NewLazySystemDLL("kernel32.dll")
+var procSetLastError = modkernel32.NewProc("SetLastError")
+
+func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
+	if hwnd == 0 {
+		return 0, fmt.Errorf("getWindowLongPtr: hwnd is 0")
+	}
+
+	// Clear last error so we can detect real failure
+	//windows.SetLastError(0)
+	// Clear last error so we can detect real failure
+	procSetLastError.Call(0)
+
+	ret, _, _ := procGetWindowLongPtrW.Call(
+		uintptr(hwnd),
+		uintptr(index),
+	)
+
+	// Important edge case:
+	// GetWindowLongPtr can legally return 0 even on success.
+	// The only reliable failure signal is GetLastError.
+	if ret == 0 {
+		// windows.GetLastError() is safer than trusting err blindly
+		lastErr := windows.GetLastError()
+		if lastErr != windows.ERROR_SUCCESS {
+			return 0, lastErr
+		}
+	}
+
+	return ret, nil
+}
+
+func shouldSkipForeground(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return true
+	}
+
+	// 1. Our own process → skip
+	if isOwnWindow(hwnd) {
+		return true
+	}
+
+	// 2. Read styles
+	// style, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_STYLE))
+	// exStyle, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_EXSTYLE))
+	style, err := getWindowLongPtr(hwnd, GWL_STYLE)
+	if err != nil {
+		logf("GetWindowLongPtr STYLE failed: %v", err)
+		return true
+	}
+
+	exStyle, err := getWindowLongPtr(hwnd, GWL_EXSTYLE)
+	if err != nil {
+		logf("GetWindowLongPtr EXSTYLE failed: %v", err)
+		return true
+	}
+
+	s := uint32(style)
+	ex := uint32(exStyle)
+
+	// Child windows cannot be foreground windows
+	if s&WS_CHILD != 0 {
+		return true
+	}
+
+	// Tool windows are often menus/popups
+	if ex&WS_EX_TOOLWINDOW != 0 {
+		return true
+	}
+
+	// Explicit no-activate → DO NOT TOUCH
+	if ex&WS_EX_NOACTIVATE != 0 {
+		return true
+	}
+
+	return false
 }
 
 // aka focus(activate) the window, works by attaching to target window's thread, so Windows won't do its focus stealing prevention thing!
@@ -1042,6 +1107,31 @@ func forceForeground(target windows.Handle) bool {
 	}
 	if isWindowForeground(target) {
 		return true // Already good, no-op
+	}
+	if shouldSkipForeground(target) {
+		logf("shouldSkipForeground for HWND 0x%X", target)
+		return true
+	}
+	if isOwnWindow(target) {
+		//don't try to focus self, it will fail to attach
+		//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
+		// Same process → AttachThreadInput is unnecessary and sometimes harmful
+
+		if isInSameThreadID(target) {
+			logf("attempting to focus own window, sure.")
+			////procSetForegroundWindow.Call(uintptr(target))
+			// fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+			// if fgRet != 1 {
+			// 	lastErr := windows.GetLastError()
+			// 	// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+			// 	//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+			// 	logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+			// }
+			focusThisHwnd(target)
+		} else {
+			logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
+		}
+		return true // so it doesn't try the LMB click way next.
 	}
 
 	var targetProcessId uint32
@@ -1059,16 +1149,11 @@ func forceForeground(target windows.Handle) bool {
 		return false
 	}
 
-	fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
-	if fgRet != 1 {
-		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
-		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-		logf("SetForegroundWindow ret=%d err=%v", fgRet, fgErr)
-	}
+	ret := focusThisHwnd(target)
 
 	procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // Detach always
 
-	return fgRet != 0
+	return ret //fgRet != 0
 }
 
 func logLMBState(prefix string) {
@@ -1122,19 +1207,11 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
 			if !winGestureUsed { //wasn't set already
-				winGestureUsed = true      // we used at least once of our gestures
-				logf("gesture used: true") //FIXME: remove this, temporary!
+				winGestureUsed = true // we used at least once of our gestures
 			}
 			if capturing {
 				//FIXME: happens when winkey+LMB then winkey+L to lock, release both, unlock, move mouse (still drag/moves window), hold winkey and press LMB and u're here.
 				logf("already capturing")
-			}
-			if inNativeCapturing {
-				// 	logf("already in native capturing, not re-issuing it, but swallowing LMB")
-				// 	return 1
-				//logf("already in native capturing, not re-issuing it, letting LMB pass-thru")
-				//break
-				logf("already in native capturing, re-issuing it")
 			}
 
 			// we don't want to trigger our drag if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
@@ -1157,40 +1234,52 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			//capturing.Store(true)
 			targetWnd = hwnd
 
-			manual := startDrag(hwnd, info.Pt)
-			if manual {
+			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
+			startDrag(hwnd, info.Pt)
 
-				// if activateOnMove.Load() {
-				// 	activateWindow(hwnd)
-				// 	// AttachThreadInput(self, target, TRUE)
-				// 	// procSetForegroundWindow.Call(uintptr(hwnd))
-				// 	// AttachThreadInput(self, target, FALSE)
-				// }
-				capturing = true
-				if activateOnManualMoveOnly && !isWindowForeground(targetWnd) {
+			// if activateOnMove.Load() {
+			// 	activateWindow(hwnd)
+			// 	// AttachThreadInput(self, target, TRUE)
+			// 	// procSetForegroundWindow.Call(uintptr(hwnd))
+			// 	// AttachThreadInput(self, target, FALSE)
+			// }
+			capturing = true
+			if activateOnManualMoveOnly && !isWindowForeground(targetWnd) {
 
-					procPostMessage.Call(
-						uintptr(trayIcon.HWnd),
-						WM_FOCUS_TARGET_WINDOW_SOMEHOW,
-						0, // no args to that function
-						0,
-					)
-					//}
-				}
-				return 1 // swallow LMB only for manual
-				//} else {
-				//	return 0 // let native move receive input
-			} else {
-				logLMBState("native drag, before swallowing LMB in hook") //FIXME: remove this, temporary!
-				return 1                                                  // FIXME: temp swallow LMB for non-manual too. Because i need to insert a LMB down before WM_NCLBUTTONDOWN else WM_NCLBUTTONDOWN will be first!
+				procPostMessage.Call(
+					uintptr(trayIcon.HWnd),
+					WM_FOCUS_TARGET_WINDOW_SOMEHOW,
+					0, // no args to that function
+					0,
+				)
+				//}
 			}
-			//XXX: else, let it fall thru(let native move receive input - required!) so CallNextHookEx is called too
-			//}
+			return 1 // swallow LMB
 		}
 
 	case WM_MOUSEMOVE:
-		if capturing && currentDrag != nil && currentDrag.manual {
-			logf("mouse move capturing in manual mode") //FIXME: remove this, temporary!
+		if capturing && currentDrag != nil {
+			//var stopDrag bool = false
+			// //FIXME: LMB is swallowed during our gesture move, even tho it would be down physically! so can't use async state! and in case of Winkey+L the LMB UP event is never seen by us, thus we don't know if LMB is UP physically when session is unlocked!
+			// var isLMBstillDown bool = keyDown(VK_LBUTTON)
+			// if !isLMBstillDown {
+			// 	logf("LMB is no longer held down, stopping drag")
+			// 	stopDrag = true
+			// }
+			var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+			if !winDown {
+				logf("winkey is no longer down, stopping drag")
+				//TODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
+				//stopDrag = true
+				hardReset() //resets gesture used which means doesn't prevent a winUP from popping start menu
+				break
+			}
+			// if stopDrag {
+			// 	logf("stopping drag due to above, resetting state.")
+			// 	hardReset()//resets gesture used which means doesn't prevent a winUP from popping start menu
+			// 	break
+			// }
+
 			// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
 			var now time.Time
 			if ratelimitOnMove {
@@ -1309,17 +1398,21 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			}
 		} //main 'if'
 
-	case WM_LBUTTONUP: //LMB released
-		if capturing && currentDrag != nil && currentDrag.manual {
-			logf("was manual-capturing, now resetting state and releasing")
-			capturing = false
-			currentDrag = nil
-			targetWnd = 0
-			procReleaseCapture.Call()
+	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
+		if capturing && currentDrag != nil {
+			//logf("was manual-capturing, now resetting state and releasing mouse capture")
+			// capturing = false
+			// currentDrag = nil
+			// targetWnd = 0
+			// procReleaseCapture.Call()
+			softReset() // this means that when winkey goes UP it will make sure from keyboardProc that start menu doesn't pop up!
 
 			//return 0 //0 is to let it thru (1 was to swallow)
 			//XXX: let it fall thru so CallNextHookEx is also called!
-		}
+
+			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
+			return 1 //eat it
+		} // else let it pass
 
 	case WM_MBUTTONDOWN: //MMB pressed
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -1427,7 +1520,7 @@ func createMessageWindow() (windows.Handle, error) {
 	ret, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
 	if ret == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %d)", err, lastErr)
+		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %v)", err, lastErr)
 	}
 
 	hwndRaw, _, err := procCreateWindowEx.Call(
@@ -1443,7 +1536,7 @@ func createMessageWindow() (windows.Handle, error) {
 	)
 	if hwndRaw == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %d)", err, lastErr)
+		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %v)", err, lastErr)
 	}
 
 	return windows.Handle(hwndRaw), nil
@@ -1582,432 +1675,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	//TODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
 	//TODO: Do the postmessage for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
 
-	case WM_START_NATIVE_DRAG:
-		logf("doing it via WM_START_NATIVE_DRAG")
-
-		target := windows.Handle(wParam)
-		if target != 0 {
-			//logf("got target %d", target)
-			// get target thread id
-			// var targetThreadId uint32
-			// procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetThreadId))) // bad chatgpt
-			// Fix: Capture thread ID from return value, good grok
-			var targetProcessId uint32
-			r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
-			if r1 == 0 {
-				logf("GetWindowThreadProcessId for target HWND 0x%X failed: %v", target, err)
-				return 0
-			}
-			targetThreadId := uint32(r1) // This is the actual thread ID
-
-			// current thread id
-			curTid := windows.GetCurrentThreadId()
-
-			// // // Warm-up: Dummy attach/detach + SC_MOVE to prime system
-			// dummyRet, _, _ := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // attach self
-			// if dummyRet != 0 {
-			// 	//procPostMessage.Call(uintptr(target), WM_SYSCOMMAND, SC_MOVE|HTCAPTION, 0) // dummy to hidden window
-			// 	//procPostMessage.Call(uintptr(target), WM_LBUTTONDOWN, 1, 0)
-			// 	procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // detach self
-			// }
-			// logf("Warm-up complete")
-
-			// dummyRet, _, dummyErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1))
-			// errCode := windows.GetLastError() // always get, even on ret=1
-			// logf("Dummy attach ret=%d last err=%v (%v)", dummyRet, errCode, dummyErr)
-			// if dummyRet != 0 {
-			// 	detachRet, _, detachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0))
-			// 	detachCode := windows.GetLastError()
-			// 	logf("Dummy detach ret= %d last err=%v (%v)", detachRet, detachCode, detachErr)
-			// }
-			// logf("Warm-up complete")
-
-			// grok fail:
-			// // Warm-up: Attach/detach to explorer.exe main thread to prime cross-process
-			// var explorerHwnd windows.Handle = procGetDesktopWindow.Call() // desktop as fallback, or find explorer
-			// var explorerTid uint32
-			// explorerThread, _, _ := procGetWindowThreadProcessId.Call(uintptr(explorerHwnd), uintptr(unsafe.Pointer(&explorerPid)))
-			// //curTid := windows.GetCurrentThreadId()
-			// dummyRet, _, _ := procAttachThreadInput.Call(uintptr(curTid), uintptr(explorerThread), uintptr(1))
-			// if dummyRet != 0 {
-			// 	procAttachThreadInput.Call(uintptr(curTid), uintptr(explorerThread), uintptr(0)) // detach
-			// }
-			// logf("Cross-process warm-up complete")
-
-			// works but no effect on the issue:
-			// explorerHwnd, _, _ := procGetDesktopWindow.Call()
-			// var explorerPid uint32
-			// explorerThread, _, _ := procGetWindowThreadProcessId.Call(uintptr(explorerHwnd), uintptr(unsafe.Pointer(&explorerPid)))
-			// //curTid := windows.GetCurrentThreadId()
-			// dummyRet, _, _ := procAttachThreadInput.Call(uintptr(curTid), uintptr(explorerThread), uintptr(1))
-			// if dummyRet != 0 {
-			// 	procAttachThreadInput.Call(uintptr(curTid), uintptr(explorerThread), uintptr(0)) // detach
-			// }
-			// logf("Cross-process warm-up complete")
-
-			// attach input so SetForegroundWindow is allowed
-			// Attach (check success)
-			attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
-			if attachRet == 0 {
-				//if AttachThreadInput returns 0 (failure), you do not need to attempt detach, as the merge never happened (state remains unattached).
-				//Historical context: Pre-Vista, failed attach could leave partial state; Vista+ UIPI makes it atomic (fail = clean).
-				logf("AttachThreadInput for thread id '%d' failed: %v", curTid, attachErr)
-				return 0 // Bail, or fallback to manual
-			} else {
-				logf("attached pre focus")
-			}
-			// time.Sleep(1000 * time.Millisecond)
-			// logf("waited 1 sec")
-
-			//due to 'goto' must declare these here:
-			var success, focused bool
-			var start time.Time
-
-			fg, _, _ := procGetForegroundWindow.Call()
-			if fg != uintptr(target) { // only attempt to focus if it wasn't focused already!
-				//focus is needed, else it can do the drag without visually moving it, but on LMBUp(released LMB) it updates the window position! and it sometimes doesn't trigger at all (possibly due to a diff. issue that's still ongoing atm)
-				fgRet, _, lastErr := procSetForegroundWindow.Call(uintptr(target)) //XXX: focus is required for WM_NCLBUTTONDOWN to work!
-				//done: check return/err values for this ^
-
-				if fgRet == 0 {
-					// SetForegroundWindow returned FALSE → failed
-					errCode := windows.GetLastError()
-					logf("SetForegroundWindow failed (fgRet='%d')on HWND 0x%X: %v (last error %v)",
-						fgRet, target, lastErr, errCode)
-
-					// detach input even if SetForegroundWindow failed
-
-					// procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE
-					// return 0
-					goto detach
-				} else {
-					// // detach input even if SetForegroundWindow succeeded
-					// logf("detached after focus")
-					// // XXX: this really makes native drag never work because it needs to be attached for the below sends to work!
-					// procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE, detaching here makes native drag not work at all
-				}
-			}
-
-			// //this is worse, fails to natively drag most of the time now.
-			// attachRet, _, attachErr = procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1)) // TRUE
-			// if attachRet == 0 {
-			// 	//if AttachThreadInput returns 0 (failure), you do not need to attempt detach, as the merge never happened (state remains unattached).
-			// 	//Historical context: Pre-Vista, failed attach could leave partial state; Vista+ UIPI makes it atomic (fail = clean).
-			// 	logf("AttachThreadInput after focus for thread id '%d' failed: %v", curTid, attachErr)
-			// 	return 0 // Bail, or fallback to manual
-			// } else {
-			// 	logf("attached again after focus and before SC_MOVE")
-			// }
-
-			// const WM_NULL = 0x0000
-			// // //Nudge target's pump to flush activation messages faster
-			// // //XXX: no effect on kicking things into gear and not sometimes failing to start native drag!
-			// for i := 0; i < 2; i++ {
-			// 	procSendMessage.Call(uintptr(target), WM_NULL, 0, 0) // harmless dummy message
-			// }
-
-			//this is overkill, not actually needed, apparently, but leaving it in for now.
-			//FIXME: need to wait until focus settled, OR something else is preventing the native drag from starting if it wasn't already focused!
-			// 2. Wait until target is really foreground (poll, timeout 500ms)
-			const maxWaitMs = 500
-			const pollMs = 10
-			// Compile-time assertion: maxWaitMs > pollMs
-			type _ [1 + (maxWaitMs - pollMs)]int // if max <= poll, negative array size = compile error
-			// or with custom message (Go doesn't support, but error says "negative constant index")
-			//_ = [1]int{}[maxWaitMs-pollMs : maxWaitMs-pollMs+1] // alternative slice trick, fails if diff <=0
-			const pollInterval = pollMs * time.Millisecond
-			focused = false
-			start = time.Now()
-			for time.Since(start).Milliseconds() < maxWaitMs {
-
-				// From a foundational perspective, GetForegroundWindow returns the HWND with keyboard focus (the "foreground" flag),
-				// but this flag sets before the full activation process completes (e.g., animations, pump settlement, or visual effects).
-				// Exploring mechanics: Focus change is multi-step: SetForegroundWindow sets the flag, but Windows' DWM (Desktop Window Manager)
-				//  handles animations (restore/minimize/fade) + pump flush, taking 10-50ms (or longer on slow hardware).
-				//  So GetForegroundWindow "lies" in that it reports the flag, but the window isn't "settled" for modals like drag (pump busy).
-
-				//  So GetForegroundWindow is telling the truth about the flag, but the window may not yet be in a state
-				//  where the native drag modal (or other input-sensitive code) can reliably start. This is why your poll exits
-				//  quickly but drag sometimes fails on unfocused targets — the flag is set, but the app hasn't finished processing activation messages.
-
-				fg, _, err := procGetForegroundWindow.Call()
-				//procGetForegroundWindow.Call()never sets err to non-zero on failure.
-				//GetForegroundWindow is documented to return NULL (0) on failure, but it does not set last error reliably (many WinAPI functions behave this way — error code is not guaranteed to be updated).
-				//if err.Is() != windows.Errno(0) || fg == 0 {
-				if fg == 0 {
-					//So err will almost always be windows.ErrorNumber(0) (syscall.Errno(0)), even when fg == 0 (real failure).
-					logf("Focusing got err: '%v' but ret was '%d' aka HWND 0x%X", err, fg, fg)
-				} else if fg == uintptr(target) {
-					logf("Got focus now on target HWND 0x%X.", target)
-					focused = true
-					break
-				} else {
-					logf("Not focused yet, waiting more.")
-				}
-				time.Sleep(pollInterval)
-			}
-			if !focused {
-				logf("Failed to focus target window '%d' in %d ms, aborting the native drag because without focus it won't natively drag!", target, maxWaitMs)
-				return 0
-			}
-
-			//procSetCapture.Call(uintptr(target)) // XXX: this make native dragging never trigger!
-
-			// SYNC POINT: Flush the target's queue
-			// This ensures focus/activation messages are DONE before we drag
-			// see it's SendMessage aka sync not PostMessage aka async!
-			// procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procPostMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procPostMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-
-			//procReleaseCapture.Call() //FIXME: unclear if this is ever needed and when. If i do use it here, it misses to do native drag more times than when I don't use it!
-
-			// 			When/If You Need procReleaseCapture.Call()
-			// From a foundational perspective, ReleaseCapture releases the mouse capture if any window (including the target or your hidden one) has it, ensuring no prior capture interferes with new modals (e.g., native drag). Exploring mechanics: Windows capture "owns" mouse events for one window — if active, other windows ignore downs/moves. In your flow, if the target had capture (e.g., from prior selection), your SC_MOVE/injection might fail (modal won't start). Historical context: Pre-Win7, capture bugs were common; now it's robust, but explicit release is best practice.
-			// From a practical example viewpoint: In AutoHotkey drag scripts, ReleaseCapture is called before injection to "reset" — prevents "stuck" drags. In your tests, avoiding it works because Total Commander rarely captures on down (only in modals), but in apps like Notepad (text selection) or Explorer (file drag), it might fail without. Nuances: Call after attachment (shared state), before injection/post. Edge: If no capture, no-op. If your capture (from hook), releases it safely.
-			// Implications for winbollocks: Safe to add — prevents rare failures (e.g., target had capture from prior gesture). Related: Log GetCapture() before/after to debug if needed.
-			// Recommendation: Add it after focus, before injection/post — no downside.
-			// - grok
-
-			//procSendMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative) // synchronous
-			// ret, _, err = procSendMessage.Call(
-			// 	uintptr(target),
-			// 	WM_NCLBUTTONDOWN,
-			// 	HTCAPTION,
-			// 	lParamNative,
-			// )
-			// logf("WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
-
-			// //XXX: this 40ms delay isn't needed when spy++ v17 is running, but when it's not it always misses the first drag attempt if target wasn't focused and winbollocks was just started.
-			// logf("sleeping 100 ms before SC_MOVE")
-			// time.Sleep(100 * time.Millisecond) //FIXME: temp, remove this! but make it 100ms and it misses the native drag more often! weird.
-			// logf("done slept 100 ms before SC_MOVE")
-
-			/*
-				You confirmed correctly: AttachThreadInput is only needed for SetForegroundWindow (to bypass focus restrictions),
-				not for PostMessage / SendMessage itself. Cross-thread PostMessage works without attachment (messages are queued to the target's thread safely).
-				SendMessage requires the target thread to be pumping messages, but no attachment needed unless focus/input state is involved.
-				- grok fast
-			*/
-			if false {
-				// Get current cursor pos for lParam (screen coords, fresh)
-				var cursorPt POINT
-				getRet, _, getErr := procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursorPt)))
-				if getRet == 0 {
-					logf("GetCursorPos failed: %v", getErr)
-					// Fallback to your +5 method or bail
-				}
-				//lParamNative := uintptr(uint32(cursorPt.Y)<<16 | uint32(cursorPt.X)) // MAKEWPARAM equivalent
-				var lParamNative uintptr = makeLParam(cursorPt.X, cursorPt.Y)
-				//var lParamNative uintptr = 0
-				// Use PostMessage (async) to avoid sync issues
-				ret, _, err := procPostMessage.Call(
-					uintptr(target),
-					WM_NCLBUTTONDOWN,
-					HTCAPTION,
-					lParamNative,
-				)
-				logf("PostMessage WM_NCLBUTTONDOWN ret=%d err=%v", ret, err)
-			} else {
-				// attempt to bring the target to the foreground and start the native move
-
-				// procSetForegroundWindow.Call(uintptr(target))
-				//procReleaseCapture.Call()
-				//logf("called procReleaseCapture which makes it miss native drag start more times than w/o it!")
-				//XXX: don't use Send instead of Post here or it will recurse/reenter this once and stop at this until LMB UP happens, but this means a second drag is initiated afterwards.
-				ret, _, err := procPostMessage.Call(
-					uintptr(target),
-					WM_SYSCOMMAND,
-					SC_MOVE|HTCAPTION,
-					0,
-				)
-				logf("WM_SYSCOMMAND SC_MOVE|HTCAPTION ret=%d err=%v", ret, err)
-			}
-			//procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-
-			//From a validity perspective, lParam = 0 is completely valid for WM_LBUTTONDOWN — the message doesn't require non-zero coords,
-			// and Windows won't reject it. The lParam is a 32-bit value (on 64-bit too, packed as DWORD),
-			// where the low-order word is the x-coordinate (signed 16-bit) and high-order word is y (signed 16-bit).
-			// So lParam = 0 means x=0, y=0 — a click at the upper-left corner of the window's client area (not the desktop top-left).
-			// Post WM_LBUTTONDOWN to main HWND (lParam = 0 = client 0,0)
-			{ // a block to satisfy 'goto detach'
-				//this is needed so it doesn't hit the child eg. LListBox in tcmd thus causing a file drag instead of a window native move drag
-				ret, _, err := procPostMessage.Call(uintptr(target), WM_LBUTTONDOWN, 1, 0) // wParam= MK_LBUTTON = 1, lParam=0
-				logf("WM_LBUTTONDOWN ret=%d err=%v", ret, err)
-			}
-
-			//procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-
-			//FIXME: what to do when any of these postmessage fail?!
-
-			// // ===== synchronization point =====
-			// if !waitForMoveLoop(0 /*targetThreadId*/, 500*time.Millisecond) {
-			// 	logf("move loop never started")
-			// 	goto detach
-			// }
-
-			//this is required to happen even tho the first time ever (ie. after running the program) the native dragging will always fail! unless spy++ is running and watching msgs of target window eg. tcmd!
-			logLMBState("before injecting LMBDown") // it's UP because hook swallowed it!
-			injectLMBDown()                         //XXX: LMB is UP(due to swallowed in hook) before the inject and DOWN instantly after inject!
-			logLMBState("after injecting LMBDown")  // it's DOWN now.
-
-			// procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procSendMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procPostMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-			// procPostMessage.Call(uintptr(target), 0, 0, 0) // 0 is WM_NULL
-
-			// // USER32 is now definitely in modal move loop
-			// logf("GUI_INMOVESIZE detected")
-
-			// logLMBState("before injecting it") //it's UP (due to swallowed in hook)
-
-			// Wait up to 50ms for the window to actually start the drag
-			success = false
-			for i := 0; i < 200; i++ {
-				// // pump messages, avoids stuttered mouse and allows my hooks to run.
-				// for {
-				// 	var msg MSG
-				// 	ret, _, _ := procPeekMessage.Call(
-				// 		uintptr(unsafe.Pointer(&msg)),
-				// 		0,
-				// 		0,
-				// 		0,
-				// 		PM_REMOVE,
-				// 	)
-				// 	if ret == 0 {
-				// 		break
-				// 	}
-				// 	procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-				// 	procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
-				// }
-
-				capHwnd, _, _ := procGetCapture.Call()
-				if capHwnd == uintptr(target) {
-
-					//logf("capturing detected, sleeping 20ms now...")
-					success = true
-					// WE FOUND IT, but don't leave yet!
-					// Give it 20ms of "Attached" time to finish entering the loop
-					//time.Sleep(20 * time.Millisecond)
-					break // It started!
-				}
-				//logf("capturing not yet... %d, err: %v", capHwnd, err) // hwnd is 0 and err is success
-				time.Sleep(5 * time.Millisecond)
-			}
-
-			if !success {
-				logf("capturing failed...")
-				// if err := cancelMoveMode(target); err != nil { //no error but no effect either, LMBDown is still needed to properly "close" the "capturing failed..." state for future tries.
-				// 	logf("cancelMoveMode returned error: %v", err)
-				// }
-				// now detach safely
-				goto detach
-			} else {
-				logf("capturing detected")
-			}
-
-			// {
-			// 	ret, _, err := procSendMessage.Call(
-			// 		uintptr(target),
-			// 		WM_SYSCOMMAND,
-			// 		SC_MOVE|HTCAPTION,
-			// 		0,
-			// 	)
-			// 	logf("2 WM_SYSCOMMAND SC_MOVE|HTCAPTION ret=%d err=%v", ret, err)
-			// }
-
-			//time.Sleep(500 * time.Millisecond) //FIXME: temp, remove this!
-			// //time.Sleep(40 * time.Millisecond) //FIXME: temp, remove this!
-
-			// logLMBState("before injecting LMBDown") // it's UP because hook swallowed it!
-			// // //now insert a LMB down (since the real one we swallowed) - required for WM_NCLBUTTONDOWN to work.
-			// // //required for WM_SYSCOMMAND SC_MOVE|HTCAPTION to work, but must injected be AFTER it(not before)!
-			// injectLMBDown() //XXX: LMB is UP(due to swallowed in hook) before the inject and DOWN instantly after inject!
-			// // //nvmthisbecauseitsnonsensicalnowFIXME: only inject LMB down if the physical state is still down? else we'd have to ensure the LMB up is also injected later? but when if LMB was up already physically, can't know when drag ended then!
-			// logLMBState("after injecting LMBDown") //it's DOWN even tho we're single threaded so my hook didn't run!
-			// // //XXX: so "Child interception is the killer in failures." ie. this LMBDown hits the LListBox a child of target's main hwnd but the SC_MOVE hits the main hwnd which also needs the WM_LBUTTONDOWN to hit it (not child) for native drag to start!
-
-			//time.Sleep(100 * time.Millisecond)//no effect on sometimes missing the native drag start, probably because my msg.loop and my hooks are on same thread.
-
-			// logf("sleeping 100 ms before detach")
-			// time.Sleep(100 * time.Millisecond) //FIXME: temp, remove this!
-			// logf("done slept 100 ms before detach")
-
-			// {
-			// 	success2 := false
-			// 	// Poll for the actual move loop state
-			// 	for i := 0; i < 200; i++ {
-			// 		if isWindowInMoveLoop(0) { //targetThreadId) {
-			// 			success2 = true
-			// 			logf("Confirmed: Window is in native MoveSize loop!")
-			// 			// Still give it that 20ms marriage buffer to be safe
-			// 			time.Sleep(20 * time.Millisecond)
-			// 			break
-			// 		}
-			// 		time.Sleep(5 * time.Millisecond)
-			// 	}
-
-			// 	//but it doesn't map to native drag, it's wtw else!
-			// 	if !success2 {
-			// 		// 	logf("Native drag LATCHED successfully")
-			// 		// } else {
-			// 		logf("isWindowInMoveLoop is still false")
-			// 	}
-			// }
-
-		detach:
-			//must detach here(late), else it won't do the drag.
-			//procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // FALSE
-			// After all injection and SC_MOVE are done
-			detachRet, _, detachErr := procAttachThreadInput.Call(
-				uintptr(curTid),
-				uintptr(targetThreadId),
-				uintptr(0), // FALSE = detach
-			)
-
-			if detachRet == 0 {
-				errCode := windows.GetLastError()
-				logf("DetachThreadInput failed on target 0x%X: %v (error code %d)", target, detachErr, errCode)
-
-				// What to do if detach fails (rare, but serious)
-				// Option 1: Log and continue (usually safe)
-				// Option 2: Force a hard reset of your state
-				hardReset()
-				// Option 3: Retry once after short delay
-				// time.Sleep(10 * time.Millisecond)
-				// procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), 0)
-			} else {
-				logf("detached, DetachThreadInput succeeded for target 0x%X", target)
-			}
-			//logf("detached")
-			logLMBState("after injecting it and after detached")
-			inNativeCapturing = false
-			logf("set bool to as not in native capturing anymore")
-
-			// logf("doing 1 sec of pumping msgs in wndProc")
-			// for i := 0; i < 200; i++ {
-			// 	// pump messages, avoids stuttered mouse and allows my hooks to run.
-			// 	for {
-			// 		var msg MSG
-			// 		ret, _, _ := procPeekMessage.Call(
-			// 			uintptr(unsafe.Pointer(&msg)),
-			// 			0,
-			// 			0,
-			// 			0,
-			// 			PM_REMOVE,
-			// 		)
-			// 		if ret == 0 {
-			// 			break
-			// 		}
-			// 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-			// 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
-			// 	}
-			// 	time.Sleep(5 * time.Millisecond)
-			// } //for
-			// logf("DONE doing 1 sec of pumping msgs in wndProc")
-		}
-		return 0
 	case WM_INJECT_SEQUENCE:
 		//avoids injecting from the hook
 		which := uint16(wParam)        // ie. uint16(vk))
@@ -2049,27 +1716,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
 			exitText := mustUTF16("Exit")
-			manualText := mustUTF16("Manual move (no focus)") //TODO: make default and remove the disabled variant!
-			focusText := mustUTF16("Activate(focus) window on manual move(caveat: presses LMB once(but only if the thread-attaching variant fails) if not already focused)")
+			focusText := mustUTF16("Activate(focus) window on move(caveat: presses LMB once(but only if the thread-attaching variant fails) if not already focused)")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
-
-			flags := MF_STRING
-			if forceManual {
-				flags |= MF_CHECKED
-			}
-
-			procAppendMenu.Call(hMenu, uintptr(flags), MENU_FORCE_MANUAL, uintptr(unsafe.Pointer(manualText)))
 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
 			if activateOnManualMoveOnly {
 				actFlags |= MF_CHECKED
 			}
-			if !forceManual {
-				// grey out this if manual move is not enabled, so it's more obvious it only applies to it,
-				// because in native drag(FIXME: bugged currently(only works some of the time and on cmd.exe it lags due to our msg. loop and hooks are on same thread!)) it always focuses!
-				actFlags |= MF_DISABLED
-			}
+
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
 				uintptr(unsafe.Pointer(focusText)))
 
@@ -2077,10 +1732,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			if ratelimitOnMove {
 				rlFlags |= MF_CHECKED
 			}
-			if !forceManual {
-				//rate limit only applies to manual move mode
-				rlFlags |= MF_DISABLED
-			}
+
 			procAppendMenu.Call(hMenu, rlFlags, MENU_RATELIMIT_MOVES,
 				uintptr(unsafe.Pointer(ratelimitText)))
 
@@ -2115,8 +1767,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			procSendMessage.Call(hwnd, 0, 0, 0) // Send WM_NULL
 
 			switch cmd {
-			case MENU_FORCE_MANUAL:
-				forceManual = !forceManual
 			case MENU_ACTIVATE_MOVE:
 				activateOnManualMoveOnly = !activateOnManualMoveOnly
 			case MENU_RATELIMIT_MOVES:
@@ -2173,8 +1823,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 func deinit() {
 	//TODO: add the others? or perhaps there's no point?!
-	capturing = false
-	procReleaseCapture.Call()
+	// capturing = false
+	// procReleaseCapture.Call()
+	hardReset()
 	if mouseHook != 0 {
 		procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 		mouseHook = 0
@@ -2710,7 +2361,6 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				“Ah, Win wasn’t alone — suppress Start.”
 				*/
 			} // XXX: else, don't suppress winkey_UP if we didn't use it for our gestures, so this allows say winkeyDown then winkeyUp to open Start menu, so let it fall thru(aka pass thru the winkeyUP), so that procCallNextHookEx is called!
-
 		}
 	}
 
@@ -2782,7 +2432,6 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 */
 func init() {
 	//defaults:
-	forceManual = false // FIXME: temp! set to true after done trying to get native drag to work.
 	activateOnManualMoveOnly = true
 	ratelimitOnMove = false
 	shouldLogDragRate = false
