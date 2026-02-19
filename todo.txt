@@ -9,4 +9,6 @@
 * could maybe check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 * make sure hooks are on their own thread, different from msg. loop thread, to avoid lockups; use windows.GetCurrentThreadId() to check they're diff. threads; test with GOMAXPROCS=1; "you can force more threads via runtime.GOMAXPROCS(runtime.NumCPU())" and make sure it's at least 2 even if numCPU is less;
 * native window dragging is broken currently, ie. if you uncheck "Manual move(no focus)" in systray that means native drag is used but it only works sometimes and it's pretty bad/choppy when it does work on cmd.exe due to the 1 thread of our program (for msg. loop and hooks, same thread) and cmd.exe does something (like selection started) which hangs our program thus the hooks too and Windows times out the hooks that's why it's not fully locked up.
-
+* currently native drag attempt on tcmd fails the first time then works 90% of the time but if tcmd then quits (not mid-drag, just normally when idle) then native drag on the newly started tcmd will fail 99.99% of the time!
+* native drag seems to need: attach thread, focus target window, send the SC_MOVE, send the WM_LBUTTONDOWN to prevent LListBox aka child from receiving it from the LMBDown that's next, then inject LMBDown because it needs the get async state for LMB to be DOWN! This works but not if you restart tcmd without also restarting winbollocks, which is positively odd.
+* give up on native drag due to so flakey, jesus; keep only manual drag.
