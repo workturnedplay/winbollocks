@@ -34,6 +34,77 @@ import (
 	"unsafe"
 )
 
+// this init() must be first, order of it in source code matters as they're executed in order of seen.
+func init() {
+	// Force the runtime to provide exactly 2 execution contexts
+	// regardless of what the user set in their Environment Variables.
+	runtime.GOMAXPROCS(2)
+	/*
+			While you can technically call it in main(), putting it in init() ensures the scheduler is reconfigured before any other code
+			(including third-party library init functions) has a chance to start spawning background goroutines.
+
+			Why init() is the "Correct" Place
+
+		    Env Var Override: It guarantees that even if a user starts your program with GOMAXPROCS=64, your code immediately scales it back to 2 before the "real" work begins.
+
+		    Predictability: The Go runtime's garbage collector and scheduler are sensitive to the number of available processors (P).
+			Setting this early prevents the runtime from briefly trying to use more threads than you intend during the startup phase.
+			- gemini 3 fast
+	*/
+	/*
+							The Verdict for your Win32 App
+
+						Setting GOMAXPROCS(2) is the "sweet spot" because:
+
+						    Safety: It ensures your Win32 Hook thread always has a "seat" at the table.
+
+						    Efficiency: It prevents the GC from spawning 8 or 16 workers (on a high-core machine) that would compete for cache and context switches,
+							which can actually cause "stuttering" in UI applications.
+							To understand how the Garbage Collector (GC) behaves when you set GOMAXPROCS(2), we have to look at the difference between Application Parallelism
+							and Runtime Background Tasks.
+
+				1. Does it affect the GC?
+
+				Yes, but in a way that protects your performance. The GC in Go is "concurrent." This means it tries to do most of its work while your program is still running.
+				It uses the number of Ps (Processors) defined by GOMAXPROCS to decide how many workers it can spawn to scan memory.
+
+				    With GOMAXPROCS(2): The GC will generally try to use a fraction of those 2 slots (usually 25%) for background marking.
+
+				    The "Worker Stealing": If your logWorker is idle, the GC will "steal" that CPU time to clean up memory. If both your Main Thread and logWorker are 100% busy,
+					the GC might briefly "assist" by taking a tiny bit of time from one of them to ensure it doesn't run out of memory.
+
+				2. Does it "Pause Everything" (Stop the World)?
+
+				Go's GC is not a traditional "Stop the World" (STW) collector like older versions of Java. It is a Low-Latency Collector.
+
+				    It does have two extremely short STW phases (measured in microseconds, not milliseconds).
+
+				    During these tiny windows, yes, it pauses both your Win32 thread and your logWorker.
+
+				    However, because these pauses are so short (often < 100µs), they are usually invisible to Win32 message loops and won't cause your UI or hooks to "lag" or drop messages.
+
+				3. Can the GC run on its own threads?
+
+				This is the "trick" of the Go runtime: The GC can spawn as many OS threads (Ms) as it needs, but it can only execute on as many Processors (Ps) as you allowed.
+
+				    If you set GOMAXPROCS(2), the Go scheduler says: "At any given instant, only 2 threads are allowed to be actively crunching numbers."
+
+				    If the GC needs to do a background task, it will wait for one of your 2 slots to become "available" (e.g., when your logWorker is waiting for a file write
+					or your Win32 loop is waiting for GetMessage).
+
+					Summary of the "Thread Landscape"
+
+		When you run your program with GOMAXPROCS(2) and LockOSThread(), your OS Thread list will look roughly like this:
+		Thread Type	Count	Behavior
+		Main Thread (Locked)	1	Runs your Win32 Loop. Uses 1 "slot" (P).
+		Worker Thread	1	Runs your logWorker. Uses the 2nd "slot" (P).
+		GC / Runtime Threads	1-3	Mostly "sleeping" or waiting to "steal" a slot when the Worker is idle.
+		Sysmon Thread	1	A tiny background thread that monitors the network and deadlocks (doesn't use a P slot).
+
+					- gemini 3 fast
+	*/
+}
+
 /* ---------------- DLLs & Procs ---------------- */
 var procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
 
@@ -401,7 +472,7 @@ type dragState struct {
 
 type NOTIFYICONDATA struct {
 	CbSize            uint32
-	HWnd              windows.Handle
+	HWnd              windows.Handle // hold handle to my hidden message window aka self.
 	UID               uint32
 	UFlags            uint32
 	UCallbackMessage  uint32
@@ -440,7 +511,8 @@ var (
 	kbdHook   windows.Handle
 
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
-	capturing   bool
+	capturing bool
+	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
 	targetWnd   windows.Handle
 	currentDrag *dragState
 
@@ -847,10 +919,13 @@ func keyDown(vk uintptr) bool {
 	return state&0x8000 != 0
 }
 
-func softReset() { //TODO: use hardReset instead because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
+func softReset() { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
+	//do this first
 	capturing = false
-	currentDrag = nil
+	//do this second
 	targetWnd = 0
+
+	currentDrag = nil
 
 	procReleaseCapture.Call()
 }
@@ -1153,52 +1228,99 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 	}
 
 	switch wParam {
-	case WM_LBUTTONDOWN: //LMB pressed.
+	case WM_LBUTTONDOWN: //LMB pressed aka LMBDown or LMB DOWN
+		// we don't want to trigger our drag gesture if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 		var shiftDown bool = keyDown(VK_SHIFT)
 		var ctrlDown bool = keyDown(VK_CONTROL)
 		var altDown bool = keyDown(VK_MENU)
-		//if winKeyDown() {
-		//if winDownSeen.Load() { //&& !swallowNextWinUp.Load() { {
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
 			if !winGestureUsed { //wasn't set already
 				winGestureUsed = true // we used at least once of our gestures
-			}
-			if capturing {
-				//FIXME: happens when winkey+LMB then winkey+L to lock, release both, unlock, move mouse (still drag/moves window), hold winkey and press LMB and u're here.
-				logf("already capturing")
+				injectShiftTapOnly()  // prevent releasing of winkey later from popping up Start menu!
 			}
 
-			// we don't want to trigger our drag if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
-			// if !swallowNextWinUp.Load() {
-			// swallowNextWinUp.Store(true)
-			// }
+			//var start bool = true // do we start the drag on the window under mouse?
 
-			//if winKeyDown() && !capturing.Load() {
-			//hwnd := windowFromPoint(info.Pt)
-			//hwnd, _, _ := user32.NewProc("GetForegroundWindow").Call()
-
-			//hwndRaw, _, _ := procGetForegroundWindow.Call()
-			//hwnd := windows.Handle(hwndRaw)
-			hwnd := windowFromPoint(info.Pt)
-			if hwnd == 0 {
-				logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(unless you LMB on a higher integrity eg. admin window before you release winkey)")
+			wantTargetWnd := windowFromPoint(info.Pt)
+			if wantTargetWnd == 0 {
+				logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)")
 				return 1 // swallow LMB
 			}
-			//if hwnd != 0 {
-			//capturing.Store(true)
-			targetWnd = hwnd
 
-			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
-			startDrag(hwnd, info.Pt)
+			if capturing {
+				//XXX: happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
+				// if you now start to hold winkey(it will drag if you move mouse) and then press(or hold) LMB (you're here) and
+				// move mouse while LMB is held it continues to drag/move that same window.
+				logf("already capturing, means you were moving a window pressed winkey+L released all then unlocked session then held winkey(again) " +
+					"and pressed(or held) LMB (on same or new window target!) thus you're now here.")
+				//In Go, when you use the + operator with string literals (text wrapped in double quotes), the compiler performs constant folding.
+				// This means it joins them together while building your binary, so there is zero performance penalty at runtime.
 
-			// if activateOnMove.Load() {
-			// 	activateWindow(hwnd)
-			// 	// AttachThreadInput(self, target, TRUE)
-			// 	// procSetForegroundWindow.Call(uintptr(hwnd))
-			// 	// AttachThreadInput(self, target, FALSE)
+				if targetWnd == 0 {
+					//start = false
+					panic("impossible state(while single-threaded win32 app in 20feb2026), logic error: you were 'capturing' but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window! even softReset does capturing=0 then targetWnd=0 first!")
+				} else { // non zero targetWnd
+					//capturing means you already were dragging a prev. window, reflected by targetWnd not being 0!
+
+					//now, is it a new window you're trying to drag or the same old one?
+					// if it's same old one, the dragging is still thought to happen (if winkey is held down anew before moving mouse, else you'd not be here), so don't start a new drag?
+					// if it's new, have to softReset() first because otherwise it will still drag the old one! and let it start drag again?
+
+					if targetWnd == wantTargetWnd {
+						//same old window
+						logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", targetWnd)
+						//FIXME: should probably use the new mouse coords for this drag, meaning softReset() this variant too and let it start anew(like the below new window one)
+						//start = false
+						return 1 //swallow LMB
+					} else {
+						//a new window
+						// it's a drag of a new window but we were moving the old window before that and didn't stop (for winkey+L reason for example!)
+						logf("Avoided moving the old window HWND=0x%X ie. you were moving a window while winkey+L happened, now you unlocked session and you're newly holding winkey "+
+							"but you LMB-ed on ANOTHER window(ie. trying to move another window), so we're not gonna move the old window anymore but the new one!", targetWnd)
+
+						logf("drag-moving new window HWND=0x%X instead of the old one HWND=0x%X", wantTargetWnd, targetWnd)
+						softReset()
+						//start = true
+					}
+				}
+				//start = true
+				// } else {
+				// 	start = true
+			}
+
+			targetWnd = wantTargetWnd // never 0 if we're here!
+
+			// //check prev. dragged window, is it same as current?
+			// if targetWnd != wantTargetWnd {
+			// 	//we're here because either this is first drag ever or it's a drag of a different/new window!
+			// 	if capturing && targetWnd != 0 {
+			// 		// it's a drag of a new window but we were moving the old window before that and didn't stop (for winkey+L reason for example!)
+			// 		logf("Avoided moving the old window HWND=0x%X ie. you were moving a window while winkey+L happened, now you unlocked session and you're newly holding winkey "+
+			// 			"but you LMB-ed on ANOTHER window(ie. trying to move another window), so we're not gonna move the old window anymore but the new one!", targetWnd)
+			// 		softReset()
+			// 		start = true
+			// 	} else {
+			// 		// you were not capturing already and
+			// 		if targetWnd == 0 {
+			// 			//start = false
+			// 			panic("impossible state, logic error: you were 'capturing' but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window! even softReset does capturing=0 then targetWnd=0 first!")
+			// 		}
+			// 		// so you're here because you're not capturing already and you had a target before but now's a new one! so need to start dragging!
+			// 		start = true
+			// 	}
+			// 	targetWnd = wantTargetWnd
+			// 	logf("drag-moving new window HWND=0x%X", targetWnd)
+			// } else {
+			// 	logf("continuing to drag-move same old window HWND=0x%X", targetWnd)
 			// }
-			capturing = true //FIXME: this probably needs to be atomic if multi-threaded (it's not m.t. yet)
+
+			//if start {
+			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
+			startDrag(targetWnd, info.Pt)
+
+			//FIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
+			capturing = true //FIXME: this probably needs to be atomic if we go multi-threaded later(it's not m.t. yet) like if we make hooks go on their own thread!
 			if focusOnDrag && !isWindowForeground(targetWnd) {
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
@@ -1207,6 +1329,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					0,
 				)
 			}
+			//}
 			return 1 // swallow LMB
 		}
 
@@ -1222,10 +1345,11 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 			if !winDown {
 				logf("winkey is no longer down, stopping drag")
-				//TODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
+				//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
 				//stopDrag = true
-				hardReset() //resets gesture used which means doesn't prevent a winUP from popping start menu
-				break
+				hardReset() //resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
+
+				break //exit case/switch!
 			}
 			// if stopDrag {
 			// 	logf("stopping drag due to above, resetting state.")
@@ -2691,6 +2815,10 @@ func stdinIsConsoleInteractive() bool {
 func main() {
 	// 1. Lock THIS specific thread (Thread A) to the OS for Win32/Hooks.
 	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
+
+	//(Passing 0 to GOMAXPROCS just returns the current setting without changing it.)
+	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %d or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), runtime.NumCPU())
+
 	token := theILockedMainThreadToken{}
 	/*
 	   	When you call go func() { ... }(), you are telling the Go Scheduler to create a new goroutine.
@@ -2705,6 +2833,18 @@ func main() {
 	// 2. Spawn the worker. The "Main Thread" Lock: Since we are using runtime.LockOSThread() in main, we want to be absolutely certain that the Go scheduler has finished its "Main Thread" bookkeeping before we start spawning background workers that we expect to land on other cores.
 	// The Go scheduler sees Thread A is locked, so it puts this on Thread B.
 	go logWorker()
+	/*
+			How the Scheduler Sees Your Code
+
+		The Go scheduler uses three entities: G (Goroutine), M (Machine/OS Thread), and P (Processor/Context). GOMAXPROCS controls the number of Ps.
+
+		    Main Goroutine (Thread A): By calling LockOSThread(), you tie your Main Goroutine to a specific OS Thread. Because it’s locked, it "clogs" one P (Processor context) while it's running your Win32 loop.
+
+		    logWorker (Thread B): If GOMAXPROCS is set to 1, there is only one "seat" available for Go code to run. Since the Main Thread is sitting in that seat (locked), the logWorker will be starved and won't run until the Main Thread yields or sleeps.
+
+		    Setting to 2: This creates two "seats." The Main Thread takes one, and the logWorker can take the second one on a different OS thread/core.
+			- Gemini 3 Fast
+	*/
 
 	defer secondary_defer() //this runs second but only if first doesn't os.exit ie. it fails/panics!
 
