@@ -268,7 +268,7 @@ const (
 )
 
 const (
-	WM_MYTRAY = WM_USER + 2
+	WM_MYSYSTRAY = WM_USER + 2
 	//WM_WAKE_UP           = WM_USER + 3
 	WM_INJECT_SEQUENCE             = WM_USER + 100
 	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
@@ -787,7 +787,7 @@ func initTray(hwnd windows.Handle) {
 
 	hIcon, _, _ := procLoadIcon.Call(0, IDI_APPLICATION)
 	trayIcon.HIcon = windows.Handle(hIcon)
-	trayIcon.UCallbackMessage = WM_MYTRAY
+	trayIcon.UCallbackMessage = WM_MYSYSTRAY
 	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
 	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks")) //TODO: make const
@@ -1414,7 +1414,11 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					// SUCCESS: The data was copied into the buffered channel.
 					// Now we ring the "Doorbell" to wake up the Main Thread.
 					// PostThreadMessage is an asynchronous "fire and forget" call.
-					procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					r, _, err := procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+					if r == 0 {
+						logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", err)
+					}
 
 				default:
 					// FAIL: The channel (2048 slots) is completely full.
@@ -1516,7 +1520,11 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					// SUCCESS: The data was copied into the buffered channel.
 					// Now we ring the "Doorbell" to wake up the Main Thread.
 					// PostThreadMessage is an asynchronous "fire and forget" call.
-					procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					r, _, err := procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+					if r == 0 {
+						logf("PostMessage of WM_DO_SETWINDOWPOS for MMB failed: %v", err)
+					}
 
 				default:
 					// FAIL: The channel (2048 slots) is completely full.
@@ -1692,6 +1700,10 @@ func cancelMoveMode(hwnd windows.Handle) error {
 
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case WM_DO_SETWINDOWPOS:
+		drainMoveChannel() // Pull everything from the channel
+		return 0           // Handled
+
 	case WM_QUERYENDSESSION:
 		// system is asking permission to end session
 		logf("system is asking permission to end session")
@@ -1740,7 +1752,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// logf("Post WM_LBUTTONUP for focus ret=%d err=%v", ret, err)
 		}
 		return 0
-	case WM_MYTRAY:
+	case WM_MYSYSTRAY:
 
 		// Strip high word to get the low 16-bit message code
 		low := uint32(lParam & 0xFFFF)
@@ -1874,8 +1886,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			exitf(129, "exit via unknown event %d", ctrlType)
 		}
 		unreachable()
-	case WM_DO_SETWINDOWPOS:
-		panic("!!! shouldn't have gotten WM_DO_SETWINDOWPOS in wndProc!")
 	} //switch
 
 	//let the default window proc handle the rest:
@@ -3022,22 +3032,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		if int32(r) <= 0 {
 			break
 		}
-		/*
-					Why not handle WM_WAKE_UP in wndProc?
 
-			This is a technical nuance of Win32: When we use PostThreadMessage, the message is sent to the thread, but it doesn't have a window handle (hwnd is 0).
-
-			    DispatchMessage only sends messages to a wndProc if they have a valid hwnd.
-
-			    If hwnd is 0, DispatchMessage does nothing.
-
-			    Therefore, you must catch WM_WAKE_UP directly in the GetMessage loop before it hits the dispatcher.
-		*/
-		// Catch the Doorbell before DispatchMessage sees it
-		if msg.Message == WM_DO_SETWINDOWPOS {
-			drainMoveChannel() // Pull everything from the channel
-			continue           // Skip Dispatching this custom message
-		}
 		// Handle System Tray / Window Messages
 		// This ensures your wndProc gets called!
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
