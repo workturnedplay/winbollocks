@@ -978,23 +978,6 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 		return
 	}
 
-	// 1. Our own process → skip
-	if isOwnWindow(hwnd) {
-		//don't try to focus self, it will fail to attach
-		//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
-		// Same process → AttachThreadInput is unnecessary and sometimes harmful
-
-		if isInSameThreadID(hwnd) {
-			logf("attempting to focus own window, sure.")
-			ret = false // should NOT skip focusing it.
-		} else {
-			reason = "is own window on diff. thread which might have own msg. loop"
-			logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
-			ret = true //should skip
-		}
-		return
-	}
-
 	// 2. Read styles
 	// style, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_STYLE))
 	// exStyle, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_EXSTYLE))
@@ -1055,7 +1038,37 @@ func forceForeground(target windows.Handle) bool {
 			logf("shouldSkipFocusingIt for HWND 0x%X because %s", target, reason)
 			return true //pretend it's focused
 		}
-	}
+
+		// 1. Our own process → skip
+		if isOwnWindow(target) {
+			//don't try to focus self, it will fail to attach
+			//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
+			// Same process → AttachThreadInput is unnecessary and sometimes harmful
+
+			if isInSameThreadID(target) {
+				logf("attempting to focus own window in same thread, sure.")
+				//this will make the systray popup menu disappear and spam these: SetWindowPos failed(from within main message loop): hwnd=0x802d6 error=0
+				// unless we skip tool windows above!
+				fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
+				if fgRet != 1 {
+					lastErr := windows.GetLastError()
+					// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
+					//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+					return false
+				} else {
+					return true
+				}
+				//focusThisHwnd(target)
+			} else {
+				//reason = "is own window on diff. thread which might have own msg. loop"
+				logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
+				return true
+			}
+			//unreachable()
+		}
+	} // a block
+
 	// if isOwnWindow(target) {
 	// 	//don't try to focus self, it will fail to attach
 	// 	//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
