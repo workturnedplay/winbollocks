@@ -48,30 +48,11 @@ var (
 	maxChannelFillForMoveEvents atomic.Int64 // To track how "full" it got
 	maxChannelFillForLogEvents  atomic.Int64 // To track how "full" it got
 
-	// To tell the hook where to send the "Doorbell"
-	mainThreadId uint32
-
-	procPostThreadMessage = user32.NewProc("PostThreadMessageW")
 )
 
 func init() {
 	maxChannelFillForMoveEvents.Store(1) // avoid the first message: New Channel Peak: 1 events queued (Dropped: 0)
 }
-
-// Define the struct for GetGUIThreadInfo
-type GUITHREADINFO struct {
-	CbSize        uint32
-	Flags         uint32
-	HwndActive    windows.Handle
-	HwndFocus     windows.Handle
-	HwndCapture   windows.Handle
-	HwndMenuOwner windows.Handle
-	HwndMoveSize  windows.Handle
-	HwndCaret     windows.Handle
-	RcCaret       windows.Rect
-}
-
-var procGetGUIThreadInfo = user32.NewProc("GetGUIThreadInfo")
 
 var (
 	procSetWinEventHook = user32.NewProc("SetWinEventHook")
@@ -113,17 +94,12 @@ var (
 	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	procWindowFromPoint     = user32.NewProc("WindowFromPoint")
 	procGetAncestor         = user32.NewProc("GetAncestor")
-	procGetCapture          = user32.NewProc("GetCapture")
 	procReleaseCapture      = user32.NewProc("ReleaseCapture") // Releases mouse capture if any window has it
 	procSendMessage         = user32.NewProc("SendMessageW")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 
-	procPeekMessage = user32.NewProc("PeekMessageW")
-
 	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
 	procDestroyWindow   = user32.NewProc("DestroyWindow")
-
-	procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 
 	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
 	procGetWindowPlacement       = user32.NewProc("GetWindowPlacement")
@@ -478,34 +454,7 @@ var shouldLogDragRate bool          // but only when ratelimitOnMove is true
 
 /* ---------------- Utilities ---------------- */
 
-func guiThreadInMoveSize(tid uint32) (bool, error) {
-	var info GUITHREADINFO
-	info.CbSize = uint32(unsafe.Sizeof(info))
-
-	r1, _, err := procGetGUIThreadInfo.Call(
-		uintptr(tid),
-		uintptr(unsafe.Pointer(&info)),
-	)
-	if r1 == 0 {
-		return false, err
-	}
-
-	return (info.Flags & GUI_INMOVESIZE) != 0, nil
-}
-
-func waitForMoveLoop(tid uint32, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		inMove, err := guiThreadInMoveSize(tid)
-		if err == nil && inMove {
-			return true
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	return false
-}
-
+// this way when winUP happens it won't pop up start menu
 func injectShiftTapOnly() {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
@@ -693,7 +642,6 @@ func windowFromPoint(pt POINT) windows.Handle {
 
 func getWindowPID(hwnd windows.Handle) uint32 {
 	var pid uint32
-	//windows.GetWindowThreadProcessId(hwnd, &pid)
 	procGetWindowThreadProcessId.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&pid)),
@@ -722,13 +670,14 @@ func isMaximized(hwnd windows.Handle) bool {
 func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinking, made, 4th try
 	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("OpenProcess failed: %w", err)
 	}
 	defer windows.CloseHandle(hProc)
 
 	var token windows.Token
-	if err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token); err != nil {
-		return 0, err
+	err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token)
+	if err != nil {
+		return 0, fmt.Errorf("OpenProcessToken failed: %w", err)
 	}
 	defer token.Close()
 
@@ -736,8 +685,9 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
 
 	buf := make([]byte, needed)
-	if err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed); err != nil {
-		return 0, err
+	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed)
+	if err != nil {
+		return 0, fmt.Errorf("GetTokenInformation failed: %w", err)
 	}
 
 	// Debug: log buffer size (should be ~28-40 bytes)
@@ -758,7 +708,7 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	subCountPtr := (*uint8)(unsafe.Add(unsafe.Pointer(&buf[headerSize]), 1))
 	subCount := *subCountPtr
 	if subCount == 0 {
-		return 0, fmt.Errorf("invalid subauthority count")
+		return 0, fmt.Errorf("invalid subauthority count: 0")
 	}
 
 	// SubAuthority array starts at offset 8 from SID base
@@ -805,7 +755,6 @@ func initTray(hwnd windows.Handle) {
 		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): %v (code %d)", err2, err2)
 		// You could exitf or fallback here, but for now just log
 	}
-
 }
 
 func cleanupTray() {
@@ -849,7 +798,6 @@ func showTrayInfo(title, msg string) {
 
 func startManualDrag(hwnd windows.Handle, pt POINT) {
 	var r RECT
-	//windows.GetWindowRect(hwnd, (*windows.RECT)(unsafe.Pointer(&r)))
 	procGetWindowRect.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&r)),
@@ -876,6 +824,7 @@ func startDrag(hwnd windows.Handle, pt POINT) {
 	pid := getWindowPID(hwnd)
 	targetIL, e1 := processIntegrityLevel(pid)
 	//selfIL, e2 := processIntegrityLevel(uint32(windows.GetCurrentProcessId())) //bugged it said, it noticed.
+	// #nosec G115 --- it's actually uint32 wrapped in an int
 	selfPID := uint32(os.Getpid())
 	selfIL, e2 := processIntegrityLevel(selfPID)
 	if e1 == nil && e2 == nil && targetIL > selfIL {
@@ -896,45 +845,6 @@ func startDrag(hwnd windows.Handle, pt POINT) {
 func keyDown(vk uintptr) bool {
 	state, _, _ := procGetAsyncKeyState.Call(vk)
 	return state&0x8000 != 0
-}
-
-// the state of mod keys that my keyboard hook sees, now works.
-// func winOnlyIsDown() bool {
-// 	return winDown.Load() &&
-// 		!shiftDown.Load() &&
-// 		!ctrlDown.Load() &&
-// 		!altDown.Load()
-// }
-
-// func winAndShiftOnlyAreDown() bool {
-// 	return winDown.Load() &&
-// 		shiftDown.Load() &&
-// 		!ctrlDown.Load() &&
-// 		!altDown.Load()
-// }
-
-// the current state of mod keys, works.
-// func winOnlyIsDown() bool {
-// 	return (keyDown(VK_LWIN) || keyDown(VK_RWIN)) &&
-// 		!keyDown(VK_SHIFT) &&
-// 		!keyDown(VK_CONTROL) &&
-// 		!keyDown(VK_MENU)
-// }
-
-func hardResetIfDesynced(winDownInHook bool) {
-	// if winDown.Load() {
-	// 	if !keyDown(VK_LWIN) && !keyDown(VK_RWIN) {
-	// 		hardReset()
-	// 	}
-	// }
-
-	if capturing {
-		// LMB not physically down anymore
-		if !keyDown(VK_LBUTTON) && !winDownInHook {
-			logf("Desync detected: Capture/LMB state reset")
-			hardReset()
-		}
-	}
 }
 
 func softReset() { //TODO: use hardReset instead because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
@@ -1034,11 +944,15 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	//windows.SetLastError(0)
 	// Clear last error so we can detect real failure
 	procSetLastError.Call(0)
+	//windows.SetLastError(0)
 
-	ret, _, _ := procGetWindowLongPtrW.Call(
+	ret, _, err := procGetWindowLongPtrW.Call(
 		uintptr(hwnd),
 		uintptr(index),
 	)
+	_ = err // silence linter
+	//Do NOT trust the third return from .Call
+	//You did the right thing ignoring it. For many Win32 APIs it is unreliable.
 
 	// Important edge case:
 	// GetWindowLongPtr can legally return 0 even on success.
@@ -1046,7 +960,10 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	if ret == 0 {
 		// windows.GetLastError() is safer than trusting err blindly
 		lastErr := windows.GetLastError()
-		if lastErr != windows.ERROR_SUCCESS {
+		//if lastErr != windows.ERROR_SUCCESS {
+		if !errors.Is(lastErr, windows.ERROR_SUCCESS) {
+			//return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", lastErr)
+			//nolint:wrapcheck
 			return 0, lastErr
 		}
 	}
@@ -1063,21 +980,12 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 
 	// 1. Our own process → skip
 	if isOwnWindow(hwnd) {
-
 		//don't try to focus self, it will fail to attach
 		//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
 		// Same process → AttachThreadInput is unnecessary and sometimes harmful
 
 		if isInSameThreadID(hwnd) {
 			logf("attempting to focus own window, sure.")
-			////procSetForegroundWindow.Call(uintptr(target))
-			// fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
-			// if fgRet != 1 {
-			// 	lastErr := windows.GetLastError()
-			// 	// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
-			// 	//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-			// 	logf("SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
-			// }
 			ret = false // should NOT skip focusing it.
 		} else {
 			reason = "is own window on diff. thread which might have own msg. loop"
@@ -1208,7 +1116,7 @@ func logLMBState(prefix string) {
 
 "When a qualifying input event occurs (e.g., a mouse move or key press), the system detects installed low-level hooks and posts a special internal message (not a standard WM_ message) to the message queue of the thread that installed the hook. Your message loop then retrieves and dispatches this message, and during dispatch, Windows invokes your hook callback (mouseProc or keyboardProc)." - Grok
 */
-func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
+func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 	// Standard Win32 Hook practice: If nCode < 0, we must pass it
 	// to the next hook immediately and stay out of the way.
 	if nCode < 0 {
@@ -1216,6 +1124,7 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		return ret
 	}
 
+	// nolint:govet //for unsafeptr
 	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam)) // XXX: warns without the .\.vscode\settings.json the unsafeptr false part.
 	// Trick the linter: convert to pointer via an interface or a helper
 	// that doesn't trigger the "unsafeptr" heuristic.
@@ -1229,9 +1138,6 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
 		return ret
 	}
-
-	//logf("in mouseProc")//spammy on mouse movements!
-	//hardResetIfDesynced()
 
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed.
@@ -1281,14 +1187,12 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			// }
 			capturing = true //FIXME: this probably needs to be atomic if multi-threaded (it's not m.t. yet)
 			if focusOnDrag && !isWindowForeground(targetWnd) {
-
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
 					WM_FOCUS_TARGET_WINDOW_SOMEHOW,
 					0, // no args to that function
 					0,
 				)
-				//}
 			}
 			return 1 // swallow LMB
 		}
@@ -1479,7 +1383,6 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				data.InsertAfter = HWND_BOTTOM
 				data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
 				hwnd = windowFromPoint(info.Pt) // window under cursor
-
 			} else {
 				// winkey + shift + MMB → bring focused window to top
 
@@ -1536,7 +1439,6 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			}
 			return 1 // swallow MMB
 		} // the 'if' in MMB
-
 	} //switch
 
 	// Always pass the event down the chain so other apps don't break
@@ -1549,22 +1451,22 @@ func mouseProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 func createMessageWindow() (windows.Handle, error) {
 	className, err := windows.UTF16PtrFromString("winbollocksHidden")
 	if err != nil {
-		return 0, fmt.Errorf("UTF16PtrFromString failed for class name: %v", err)
+		return 0, fmt.Errorf("UTF16PtrFromString failed for class name: %w", err)
 	}
 
 	var wc WNDCLASSEX
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = wndProc
 	wc.LpszClassName = className
-	//nolint:errcheck
 	hinst, _, _ := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
 	wc.HInstance = windows.Handle(hinst)
 
+	procSetLastError.Call(0)
 	// Register class — check return value
 	ret, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
 	if ret == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %v)", err, lastErr)
+		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %w)", err, lastErr) //XXX: multiple %w is illegal and will panic.
 	}
 
 	hwndRaw, _, err := procCreateWindowEx.Call(
@@ -1580,7 +1482,7 @@ func createMessageWindow() (windows.Handle, error) {
 	)
 	if hwndRaw == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %v)", err, lastErr)
+		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %w)", err, lastErr)
 	}
 
 	return windows.Handle(hwndRaw), nil
@@ -1646,57 +1548,6 @@ func makeLParam(x, y int32) uintptr { // grok again
 	// #nosec G115 -- safe: coords are screen pixels, always fit in 16 bits
 	return uintptr((uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF))
 }
-
-func isWindowInMoveLoop(targetThreadID uint32) bool {
-	var info GUITHREADINFO
-	info.CbSize = uint32(unsafe.Sizeof(info))
-
-	// We pass the target thread ID. If 0, it gets the foreground thread.
-	ret, _, _ := procGetGUIThreadInfo.Call(uintptr(targetThreadID), uintptr(unsafe.Pointer(&info)))
-	if ret == 0 {
-		return false
-	}
-
-	// Flags bit 0x00000002 is GUI_INMOVESIZE
-	// Or we can just check if HwndMoveSize is non-zero
-	return info.HwndMoveSize != 0
-}
-
-const WM_CANCELMODE = 0x001F
-
-func cancelMoveMode(hwnd windows.Handle) error {
-	ret, _, err := procSendMessage.Call(uintptr(hwnd), WM_CANCELMODE, 0, 0)
-	if ret == 0 {
-		// WM_CANCELMODE doesn't really return anything useful; just log the syscall error
-		if err != nil && err.(windows.Errno) != 0 {
-			return fmt.Errorf("WM_CANCELMODE failed: %v", err)
-		}
-	}
-	return nil
-}
-
-// func PeekMessage(msg *MSG, hwnd windows.Handle, msgMin, msgMax, removeMsg uint32) (bool, error) {
-// 	ret, _, err := procPeekMessageW.Call(
-// 		uintptr(unsafe.Pointer(msg)),
-// 		uintptr(hwnd),
-// 		uintptr(msgMin),
-// 		uintptr(msgMax),
-// 		uintptr(removeMsg),
-// 	)
-
-// 	if ret == 0 {
-// 		// ret == 0 means either:
-// 		//   - no message available
-// 		//   - error
-// 		// To distinguish, check err against ERROR_SUCCESS.
-// 		if err != windows.ERROR_SUCCESS {
-// 			return false, err
-// 		}
-// 		return false, nil
-// 	}
-
-// 	return true, nil
-// }
 
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
@@ -1861,7 +1712,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
 				exit(0)
 			}
-
 		} // fi RMB context menu
 		return 0
 
@@ -2069,7 +1919,6 @@ var (
 const attemptAtomicSwapThisManyTimes uint = 100
 
 func logf(format string, args ...any) {
-
 	s := fmt.Sprintf(format, args...)
 	now := time.Now().Format("Mon Jan 2 15:04:05.000000000 MST 2006") // these values must be used exactly, they're like specific % placeholders.
 	//now := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
@@ -2161,7 +2010,6 @@ func injectKeyTap(vk uint16) {
 	logf("SendInput ret=%d err=%v", r, err)
 	//logf("sizeof(INPUT)=%d", unsafe.Sizeof(INPUT{}))
 	//logf("sizeof(KEYBDINPUT)=%d", unsafe.Sizeof(KEYBDINPUT{}))
-
 }
 
 /*
@@ -2515,7 +2363,6 @@ func init() {
 	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
 	lastRateLogTime = now
 	lastMovePostedTime = now
-
 }
 
 var isAdmin bool // Package level
@@ -2574,7 +2421,6 @@ func releaseSingleInstance() {
 		if r2 == 0 {
 			logf("CloseHandle failed: %v", e2)
 		}
-		//mutexHandle = 0
 	}
 }
 
@@ -3015,11 +2861,10 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
 	if err != nil {
 		//exitf(1, "Failed to create message window: %v", err)
-		return fmt.Errorf("Failed to create message window: %v", err)
+		return fmt.Errorf("Failed to create message window: %w", err)
 	}
 	initTray(hwnd)
 
-	mainThreadId = windows.GetCurrentThreadId() // Set the global for the hook
 	var msg MSG
 	for {
 		/* GetMessage is the "Event-Driven" king.
