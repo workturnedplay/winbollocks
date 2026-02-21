@@ -3775,6 +3775,19 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		if int32(r) <= 0 {
 			break
 		}
+		/*
+					Why Hooks don't need Dispatch
+
+			In a normal window setup, you need DispatchMessage to send a message to a WndProc. But Low-Level Hooks (WH_MOUSE_LL) are not window messages.
+
+			When you install a Low-Level Hook, the OS injects a requirement into your thread: "Whenever the mouse moves, pause the system and run this
+			specific callback function on this thread."
+
+			The OS's Hook Manager doesn't wait for DispatchMessage. Instead, it intercepts your thread while it is inside the GetMessage (or PeekMessage) call.
+
+			    The flow: GetMessage is called → The OS sees there's a mouse event → The OS executes your mouseProc callback directly while the thread is
+				still "inside" the GetMessage syscall → Your callback returns → GetMessage finally returns to your loop with a (potentially unrelated) message.
+		*/
 
 		// Handle System Tray / Window Messages
 		// This ensures your wndProc gets called!

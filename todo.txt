@@ -5,7 +5,7 @@ todo:
 * could maybe check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 * make sure hooks are on their own thread, different from msg. loop thread, to avoid lockups; use windows.GetCurrentThreadId() to check they're diff. threads; test with GOMAXPROCS=1; "you can force more threads via runtime.GOMAXPROCS(runtime.NumCPU())" and make sure it's at least 2 even if numCPU is less;
 * LMB on systray enabled/disables the hooks! because i notice mouse stuttering when gemini 3 Fast replies in firefox and it seems to happen only while my prog. is running which is unexpected!
-* improve performance by doing something like this: "Inside mouseProc, do nothing but check the wParam and lParam. If it’s a move you care about, instantly send the coordinates into moveDataChan and return CallNextHookEx. Do the "heavy" logic (figuring out which window is under the mouse, calculating resize zones) in a different thread that reads from that channel." - gemini 3 fast.
+* when gemini replies there's mouse stuttering constantly but only when winbollocks is running, so maybe improve performance by doing something like this: "Inside mouseProc, do nothing but check the wParam and lParam. If it’s a move you care about, instantly send the coordinates into moveDataChan and return CallNextHookEx. Do the "heavy" logic (figuring out which window is under the mouse, calculating resize zones) in a different thread that reads from that channel." - gemini 3 fast.
 
 done:
 //they can be moved * see if child windows or dialogs like the LAN adapter config. can be moved and how.
