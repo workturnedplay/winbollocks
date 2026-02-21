@@ -217,6 +217,9 @@ var (
 	procGetCurrentThread  = kernel32.NewProc("GetCurrentThread")
 	procSetThreadPriority = kernel32.NewProc("SetThreadPriority")
 	procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
+
+	procSetProcessInformation    = kernel32.NewProc("SetProcessInformation")
+	procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
 )
 
 /* ---------------- Constants ---------------- */
@@ -1527,7 +1530,7 @@ func updateOverlay(x, y, w, h int32, startW, startH int32) {
 
 	diffW := w - startW
 	diffH := h - startH
-	overlayText = fmt.Sprintf("Size: %dx%d (Δ: %d, %d)", w, h, diffW, diffH)
+	overlayText = fmt.Sprintf("Size: %dx%d (delta: %d, %d)", w, h, diffW, diffH)
 
 	// Center the overlay over the window being resized
 	ox := x + (w / 2) - 150
@@ -3407,12 +3410,21 @@ func logWorker() {
 	// This runs on Thread B.
 	// even If fmt.Fprint blocks for 10 seconds here, Thread A (your mouse hook)
 	// keeps spinning at 100% speed on its own CPU core.
-	//counter := 0
+	var counter uint32 = 0
+	const MaxBeforeReset uint32 = 4_294_967_295 - 10_000_000
+	const modVal = 50
 	for msg := range logChan {
-		//counter++
+		counter++
 		internalLogger(msg)
-		// if counter%500 == 0 {
-		// 	time.Sleep(10 * time.Second) //FIXME: temp, remove this!
+		if counter%modVal == 0 {
+			verifyMemoryIsLocked() // can logf itself! so modVal must be > than how many msgs it can log worst case(currently 1) else i will infinite loop here.
+			//time.Sleep(10 * time.Second) //FIXME: temp, remove this!
+			if counter > MaxBeforeReset {
+				counter = 0
+			}
+		}
+		// if counter%5 == 0 {
+		// 	runtime.GC() // garbage collect, no apparent effect!
 		// }
 	}
 	drops := droppedLogEvents.Load()
@@ -3669,6 +3681,9 @@ type exitStatus struct {
 }
 
 // exitf allows you to provide a code and a formatted message
+// the hind below has no apparent effect or i didn't use it in proper context and something else was in effect which made it seems as having no effect!
+//
+//go:panicnhint
 func exitf(code int, format string, a ...interface{}) {
 	//deinit()
 	//this panic will run the primary and potentially secondary(if primary fails) deferrers! ie. primary_defer
@@ -3771,6 +3786,9 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	initTray()
 	initOverlay()
 
+	//You should call lockRAM() at the very end of your initialization sequence, but before you enter the main message loop (GetMessage).
+	lockRAM()
+
 	var msg MSG
 	for {
 		/* GetMessage is the "Event-Driven" king.
@@ -3805,10 +3823,150 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	return nil // no error
 }
 
+var (
+	psapi                 = windows.NewLazyDLL("psapi.dll")
+	procQueryWorkingSetEx = psapi.NewProc("QueryWorkingSetEx")
+)
+
+type PSAPI_WORKING_SET_EX_BLOCK struct {
+	Flags uintptr
+}
+
+func (b *PSAPI_WORKING_SET_EX_BLOCK) IsValid() bool {
+	// Bit 0 of VirtualAttributes (the 'Valid' bit) indicates if the page
+	// is currently resident in physical RAM.
+	return b.Flags&1 == 1 // Bit 0 is the 'Valid' (resident) bit
+}
+
+type PSAPI_WORKING_SET_EX_INFORMATION struct {
+	VirtualAddress    uintptr
+	VirtualAttributes PSAPI_WORKING_SET_EX_BLOCK
+}
+
+// Define this at the top level (global)
+var (
+	// Ensure it's not optimized away by making it a package-level variable
+	integrityCheckVar int64 = 0xDEADC0DE
+)
+
+func verifyMemoryIsLocked() {
+	//var testVar int = 42 // Variable we want to check, bad, on stack always hot.
+	hProc := getCurrentProcess()
+
+	// PSAPI_WORKING_SET_EX_INFORMATION
+	// This tells Windows: "Tell me about the physical state of this specific address"
+	info := PSAPI_WORKING_SET_EX_INFORMATION{
+		VirtualAddress: uintptr(unsafe.Pointer(&integrityCheckVar)),
+	}
+
+	ret, _, err := procQueryWorkingSetEx.Call(
+		hProc,
+		uintptr(unsafe.Pointer(&info)),
+		unsafe.Sizeof(info),
+	)
+
+	if ret == 0 {
+		logf("Failed QueryWorkingSetEx: %v", err)
+		return
+	}
+
+	if !info.VirtualAttributes.IsValid() {
+		//		logf("Verification: Memory at 0x%X is currently resident in RAM.", info.VirtualAddress)
+		//} else {
+		logf("Verification: Memory at 0x%X is currently PAGED OUT. This is unexpected!", info.VirtualAddress)
+	}
+}
+
+var (
+	advapi32                  = windows.NewLazySystemDLL("advapi32.dll") // Add this!
+	procOpenProcessToken      = advapi32.NewProc("OpenProcessToken")
+	procLookupPrivilegeValue  = advapi32.NewProc("LookupPrivilegeValueW")
+	procAdjustTokenPrivileges = advapi32.NewProc("AdjustTokenPrivileges")
+)
+
 const (
-	NORMAL_PRIORITY_CLASS         uintptr = 0x20
-	HIGH_PRIORITY_CLASS           uintptr = 0x00000080
-	THREAD_PRIORITY_TIME_CRITICAL uintptr = 15
+	TOKEN_ADJUST_PRIVILEGES = 0x0020
+	TOKEN_QUERY             = 0x0008
+	SE_PRIVILEGE_ENABLED    = 0x00000002
+	SE_INC_WORKING_SET_NAME = "SeIncrementWorkingSetPrivilege"
+)
+
+type LUID struct {
+	LowPart  uint32
+	HighPart int32
+}
+
+type LUID_AND_ATTRIBUTES struct {
+	Luid       LUID
+	Attributes uint32
+}
+
+type TOKEN_PRIVILEGES struct {
+	PrivilegeCount uint32
+	Privileges     [1]LUID_AND_ATTRIBUTES
+}
+
+func lockRAM() {
+	//Warning for Defensive Coding: SetProcessWorkingSetSize can fail if the values you provide are too high or if the user doesn't have the
+	// SE_INC_WORKING_SET_NAME privilege (though for small amounts like 10–50MB, Windows usually grants it to "High" priority processes without drama).
+	//hProc, _, _ := procGetCurrentProcess.Call()
+	hProc := getCurrentProcess()
+
+	//To successfully increase your working set, you often need the SE_INC_WORKING_SET_NAME privilege. Simply calling the API might fail silently or return "Access Denied."
+	// 1. Enable the Privilege
+	var token uintptr
+	ret, _, err := procOpenProcessToken.Call(hProc, TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, uintptr(unsafe.Pointer(&token)))
+	if ret != 0 {
+		var luid LUID
+		lpName, _ := windows.UTF16PtrFromString(SE_INC_WORKING_SET_NAME)
+		ret, _, err = procLookupPrivilegeValue.Call(0, uintptr(unsafe.Pointer(lpName)), uintptr(unsafe.Pointer(&luid)))
+
+		if ret != 0 {
+			tp := TOKEN_PRIVILEGES{
+				PrivilegeCount: 1,
+				Privileges: [1]LUID_AND_ATTRIBUTES{
+					{Luid: luid, Attributes: SE_PRIVILEGE_ENABLED},
+				},
+			}
+			// AdjustTokenPrivileges returns success even if it partially fails,
+			// so we must check GetLastError (err) specifically.
+			ret, _, err = procAdjustTokenPrivileges.Call(token, 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
+			if ret == 0 || err != windows.Errno(0) {
+				logf("Warning: Could not enable SeIncrementWorkingSetPrivilege, err: '%v', continuing tho.", err)
+			}
+		}
+		windows.CloseHandle(windows.Handle(token))
+	}
+
+	// 2. Set the Working Set Size
+	// We'll request 20MB min and 50MB max.
+
+	// We request that 20MB to 50MB stay in RAM at all times.
+	// This effectively "VirtualLocks" the core of your app.
+	min2 := uintptr(20 * 1024 * 1024)
+	max2 := uintptr(50 * 1024 * 1024)
+
+	ret, _, err = procSetProcessWorkingSetSize.Call(hProc, min2, max2)
+	if ret == 0 {
+		logf("Failed SetProcessWorkingSetSize to min:%d and max:%d, err: %v", min2, max2, err)
+	} else {
+		logf("Working Set locked between %d and %d", min2, max2)
+	}
+
+	verifyMemoryIsLocked() //kinda useless to do now
+
+	// 2. Schedule the "Heisenberg-proof" check
+	// We wait 30 seconds to let Windows try to 'trim' our RAM.
+	time.AfterFunc(30*time.Second, func() {
+		verifyMemoryIsLocked()
+	})
+}
+
+const (
+	NORMAL_PRIORITY_CLASS uintptr = 0x20
+	HIGH_PRIORITY_CLASS   uintptr = 0x00000080
+
+	THREAD_PRIORITY_TIME_CRITICAL int32 = 15
 )
 
 // GetCurrentProcess returns a valid pseudo-handle which happens to be -1.
@@ -3818,37 +3976,81 @@ const CURRENT_PROCESS_PSEUDO_HANDLE = ^uintptr(0) // All bits set to 1
 // In uintptr fashion (64-bit), -2 is: 0xFFFFFFFFFFFFFFFE aka ^uintptr(1)
 const CURRENT_THREAD_PSEUDO_HANDLE uintptr = ^uintptr(1)
 
+var (
+	ntdll                       = windows.NewLazyDLL("ntdll.dll")
+	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
+)
+
+const (
+	//PROCESS_IO_PRIORITY uint32 = 7
+	// NTDLL ProcessInfoClass Enum
+	PROCESS_IO_PRIORITY uint32 = 33 // 0x21
+
+	//In the undocumented internal ntdll.dll API, Memory Priority is 39.
+	//But we are calling the public kernel32.dll API (SetProcessInformation). In kernel32, the constant for ProcessMemoryPriority is 0.
+	//PROCESS_MEMORY_PRIORITY uint32 = 9  // The info class for Memory Priority
+	//PROCESS_PAGE_PRIORITY   uint32 = 39 // Alternative for some Win10/11 builds
+	// Kernel32 ProcessInformationClass Enum
+	PROCESS_MEMORY_PRIORITY uint32 = 0 // Fixed: It is 0, not 9 or 39!
+
+	// I/O Priority Values
+	// 0 = Very Low, 1 = Low, 2 = Normal. (Standard apps cannot exceed 2).
+	IO_PRIORITY_NORMAL uint32 = 2
+	// I/O Priority Hints
+	IO_PRIORITY_HIGH uint32 = 4
+)
+
+// MEMORY_PRIORITY_INFORMATION struct for SetProcessInformation
+type MEMORY_PRIORITY_INFORMATION struct {
+	MemoryPriority uint32
+}
+
+func getCurrentProcess() (hProc uintptr) {
+	//Unlike most functions that return a real handle you have to track and close, GetCurrentProcess just returns (HANDLE)-1 (or 0xFFFFFFFF).
+	// It’s a constant that points to "the process that is calling this function."
+	//Technically, according to Microsoft's documentation, this function cannot fail.
+	//a rename to Local isn't needed here but i wanna be sure visibly too.
+	hProcLocal, _, err := procGetCurrentProcess.Call()
+	if hProcLocal == 0 || hProcLocal != CURRENT_PROCESS_PSEUDO_HANDLE {
+		// This virtually never happens, but if it did,
+		// the system is in a very weird state.
+		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", hProcLocal, err)
+	}
+	return hProcLocal
+}
+
 // required high prio(normal is stuttering) to avoid mouse stuttering during the whole Gemini AI website version reply in Firefox.
 // "By being "High Priority," you tell the Windows Scheduler that your thread should have a longer quantum (more time before being interrupted)
 // and a shorter wait time to be re-scheduled. It ensures that when the "Mouse Interrupt" fires, your Go code is ready to answer the door immediately."
 func setAndVerifyPriority() {
-	//Unlike most functions that return a real handle you have to track and close, GetCurrentProcess just returns (HANDLE)-1 (or 0xFFFFFFFF).
-	// It’s a constant that points to "the process that is calling this function."
-	//Technically, according to Microsoft's documentation, this function cannot fail.
-	h, _, err := procGetCurrentProcess.Call()
-	if h == 0 || h != CURRENT_PROCESS_PSEUDO_HANDLE {
-		// This virtually never happens, but if it did,
-		// the system is in a very weird state.
-		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", h, err)
-	}
+	// //Unlike most functions that return a real handle you have to track and close, GetCurrentProcess just returns (HANDLE)-1 (or 0xFFFFFFFF).
+	// // It’s a constant that points to "the process that is calling this function."
+	// //Technically, according to Microsoft's documentation, this function cannot fail.
+	// hProc, _, err := procGetCurrentProcess.Call()
+	// if hProc == 0 || hProc != CURRENT_PROCESS_PSEUDO_HANDLE {
+	// 	// This virtually never happens, but if it did,
+	// 	// the system is in a very weird state.
+	// 	exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", hProc, err)
+	// }
+	hProc := getCurrentProcess()
 
 	// Set to HIGH_PRIORITY_CLASS (0x80)
-	wantedPrio := HIGH_PRIORITY_CLASS
-	ret, _, err := procSetPriorityClass.Call(h, wantedPrio)
-	if ret == 0 {
-		logf("Failed to set priority class to 0x%x, err:%v", wantedPrio, err)
-		return
+	const wantedProcessPrio uintptr = HIGH_PRIORITY_CLASS
+	ntStatus, _, err := procSetPriorityClass.Call(hProc, wantedProcessPrio)
+	if ntStatus == 0 {
+		logf("Failed to set process priority class to 0x%x, err:%v", wantedProcessPrio, err)
+		//return
 	}
 
 	// Verify it actually changed
-	prio, _, err := procGetPriorityClass.Call(h)
+	prio, _, err := procGetPriorityClass.Call(hProc)
 	if prio == 0x00000080 {
-		logf("Priority confirmed: 0x%x", wantedPrio)
+		logf("Process priority confirmed: 0x%x where 0x%x is Normal.", wantedProcessPrio, NORMAL_PRIORITY_CLASS)
 	} else {
-		logf("Priority mismatch! OS returned prio: 0x%x instead of 0x%x and err was: %v", prio, wantedPrio, err)
+		logf("Priority mismatch! OS returned prio: 0x%x instead of 0x%x and err was: %v", prio, wantedProcessPrio, err)
 	}
 
-	wantedThreadPrio := THREAD_PRIORITY_TIME_CRITICAL
+	const wantedThreadPrio int32 = THREAD_PRIORITY_TIME_CRITICAL
 	//By setting the thread to 15, you are at the absolute ceiling of the "Dynamic" priority range.
 	// Only "Realtime" processes can go higher (16–31). This ensures that even if your Go app's other threads
 	// (like the one doing logging or tray icon management) get bogged down, the thread handling the mouse hook has a "VIP pass" at the CPU's door.
@@ -3863,23 +4065,75 @@ func setAndVerifyPriority() {
 	// the Hook Thread will actually preempt the Go Garbage Collector if they both want the CPU at the same time.
 	//This is the secret sauce for low-latency Go on Windows: you've made the hook more important than the language's own housekeeping.
 	// - gemini 3 fast
-	tRet, _, tErr := procSetThreadPriority.Call(currThread, wantedThreadPrio)
+	//The Process is High, but the Hook Thread (current thread) is "Time Critical." This ensures that even if your Go app starts doing a heavy Garbage Collection on another thread,
+	// the Hook Thread gets the absolute maximum "right of way."
+	tRet, _, tErr := procSetThreadPriority.Call(currThread, uintptr(wantedThreadPrio))
 	if tRet == 0 {
 		logf("Failed to set thread priority, err: %v", tErr)
 	} else {
 		// Verify Thread Priority
 		// procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
-		tprio, _, err := procGetThreadPriority.Call(currThread)
+		tprio, _, err2 := procGetThreadPriority.Call(currThread)
 
 		// GetThreadPriority returns an int. 15 is TIME_CRITICAL.
-		if int32(tprio) == int32(wantedThreadPrio) {
+		if int32(tprio) == wantedThreadPrio {
 			logf("Thread Priority confirmed: %d", tprio)
 		} else {
-			logf("Thread Priority mismatch! OS returned prio: %d instead of %d and err was: %v", int32(tprio), wantedThreadPrio, err)
+			logf("Thread Priority mismatch! OS returned prio: %d instead of %d and err was: %v", int32(tprio), wantedThreadPrio, err2)
 		}
 	}
-	//The Process is High, but the Hook Thread (current thread) is "Time Critical." This ensures that even if your Go app starts doing a heavy Garbage Collection on another thread,
-	// the Hook Thread gets the absolute maximum "right of way."
+
+	// --- Memory Priority (Using Kernel32) ---
+	// this is so we don't get paged out to swap/pagefile
+	var wantedMemPrio uint32 = 5 // 6 is Very High(doesn't work, it fails w/ invalid param!), 5 is the value i saw in process explorer if nothing's setting it at all.
+	// Try these classes in order of preference
+	// 9: ProcessMemoryPriority (Standard Win10+)
+	// 39: ProcessPagePriority (Alternative for certain builds/environments)
+	memClasses := []uint32{PROCESS_MEMORY_PRIORITY}
+
+	//wantedType := PROCESS_MEMORY_PRIORITY
+	memPrio := MEMORY_PRIORITY_INFORMATION{MemoryPriority: wantedMemPrio}
+
+	var success bool
+	for _, class := range memClasses { //FIXME: loop not needed anymore IF this works!
+		ntStatus, _, err = procSetProcessInformation.Call(
+			hProc,
+			uintptr(class), // 0
+			uintptr(unsafe.Pointer(&memPrio)),
+			unsafe.Sizeof(memPrio),
+		)
+
+		if ntStatus != 0 {
+			logf("Memory Priority set to %d where 5 is Normal, (Using Class: %d)", memPrio.MemoryPriority, class)
+			success = true
+			break
+		} else {
+			logf("Failed SetProcessInformation (Memory) to %d (Using Class: %d), err: %v", wantedMemPrio, class, err)
+		}
+	}
+	if !success {
+		logf("Warning: Could not set Memory Priority. All %d classes failed!", len(memClasses))
+	}
+
+	// --- I/O Priority (Using NTDLL) ---
+	// 4. Set I/O Priority (to 4 - High)
+	// This affects disk access (logs), not mouse input. So I don't think i need this unless maybe there's constant heavy disk thrashing or gigs being written, then i need my logs(new log lines) saved not 2 minutes later.
+	// IMPORTANT: We MUST use uint32 here so Sizeof returns 4, not 8.
+	//IO_PRIORITY_HIGH(aka 4) will fail with NTSTATUS: 0xC000000D err: The operation completed successfully. and 3 will fail with NTSTATUS: 0xC0000061
+	//You received 0xC000000D (STATUS_INVALID_PARAMETER) because Windows strictly limits I/O priority for user-mode applications. (even if running as admin btw)
+	var ioHint uint32 = IO_PRIORITY_NORMAL //aka 2 works as it's the default anyway.
+	// Note: NtSetInformationProcess returns an NTSTATUS, where 0 is STATUS_SUCCESS
+	ntStatus, _, err = procNtSetInformationProcess.Call(
+		hProc,
+		uintptr(PROCESS_IO_PRIORITY), //33
+		uintptr(unsafe.Pointer(&ioHint)),
+		unsafe.Sizeof(ioHint),
+	)
+	if ntStatus != 0 {
+		logf("Failed NtSetInformationProcess (I/O), NTSTATUS: 0x%X err: %v", ntStatus, err)
+	} else {
+		logf("I/O Priority set to %d where default is 2", ioHint)
+	}
 }
 
 // Separate function to keep the loop readable
