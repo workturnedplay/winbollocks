@@ -214,6 +214,7 @@ var (
 	procSetPriorityClass  = kernel32.NewProc("SetPriorityClass")
 	procGetPriorityClass  = kernel32.NewProc("GetPriorityClass")
 	procGetCurrentProcess = kernel32.NewProc("GetCurrentProcess")
+	procSetThreadPriority = kernel32.NewProc("SetThreadPriority")
 )
 
 /* ---------------- Constants ---------------- */
@@ -3803,8 +3804,9 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 }
 
 const (
-	NORMAL_PRIORITY_CLASS uintptr = 0x20
-	HIGH_PRIORITY_CLASS   uintptr = 0x00000080
+	NORMAL_PRIORITY_CLASS         uintptr = 0x20
+	HIGH_PRIORITY_CLASS           uintptr = 0x00000080
+	THREAD_PRIORITY_TIME_CRITICAL uintptr = 15
 )
 
 // required high prio(normal is stuttering) to avoid mouse stuttering during the whole Gemini AI website version reply in Firefox.
@@ -3817,17 +3819,23 @@ func setAndVerifyPriority() {
 	wantedPrio := HIGH_PRIORITY_CLASS
 	ret, _, err := procSetPriorityClass.Call(h, wantedPrio)
 	if ret == 0 {
-		logf("Failed to set priority class, err:%v", err)
+		logf("Failed to set priority class to 0x%x, err:%v", wantedPrio, err)
 		return
 	}
 
 	// Verify it actually changed
 	prio, _, err := procGetPriorityClass.Call(h)
 	if prio == 0x00000080 {
-		logf("Priority confirmed: HIGH_PRIORITY_CLASS")
+		logf("Priority confirmed: HIGH_PRIORITY_CLASS aka 0x%x", wantedPrio)
 	} else {
 		logf("Priority mismatch! OS returned prio: 0x%x instead of 0x%x and err was: %v", prio, wantedPrio, err)
 	}
+
+	wantedThreadPrio := THREAD_PRIORITY_TIME_CRITICAL
+	currThread, _, _ := kernel32.NewProc("GetCurrentThread").Call()
+	procSetThreadPriority.Call(currThread, wantedThreadPrio)
+	//The Process is High, but the Hook Thread (current thread) is "Time Critical." This ensures that even if your Go app starts doing a heavy Garbage Collection on another thread,
+	// the Hook Thread gets the absolute maximum "right of way."
 }
 
 // Separate function to keep the loop readable
