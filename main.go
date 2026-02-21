@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
+	"strconv"
 
 	"golang.org/x/sys/windows"
 
@@ -114,10 +115,10 @@ var (
 	moveDataChan = make(chan WindowMoveData, 2048)
 
 	// Modern Atomic tracking
-	droppedMoveEvents           atomic.Uint32
-	droppedLogEvents            atomic.Uint32
-	maxChannelFillForMoveEvents atomic.Int64 // To track how "full" it got
-	maxChannelFillForLogEvents  atomic.Int64 // To track how "full" it got
+	droppedMoveEvents           atomic.Uint64
+	droppedLogEvents            atomic.Uint64
+	maxChannelFillForMoveEvents atomic.Uint64 // To track how "full" it got
+	maxChannelFillForLogEvents  atomic.Uint64 // To track how "full" it got
 
 )
 
@@ -134,11 +135,11 @@ var (
 )
 
 var (
-	moveCounter     int       // how many move events we saw since last log
+	moveCounter     uint64    // how many move events we saw since last log
 	lastRateLogTime time.Time // when we last printed the rate
 	rateLogInterval = 1 * time.Second
 )
-var actualPostCounter int
+var actualPostCounter uint64
 
 // Globals
 var (
@@ -738,13 +739,6 @@ func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int
 	return x, y, w, h
 }
 
-func abs(v int32) int32 {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
 // this way when winUP happens it won't pop up start menu
 func injectShiftTapOnly() {
 	/*
@@ -986,8 +980,9 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 
 	// TOKEN_MANDATORY_LABEL header is 16 bytes on 64-bit (pointer + attributes + padding)
 	const headerSize = 16
-	if len(buf) < headerSize+8 { // + min SID header
-		return 0, fmt.Errorf("buffer too small: %d", len(buf))
+	lenb := len(buf)
+	if lenb < headerSize+8 { // + min SID header
+		return 0, fmt.Errorf("buffer too small: %s", humanBytes(uint64(lenb)))
 	}
 
 	// SID starts after header
@@ -1042,14 +1037,14 @@ func initTray() error {
 	//1
 	ret1, _, err1 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 	if ret1 == 0 {
-		logf("Failed to add tray icon (real error): %v (code %d)", err1, err1)
+		logf("Failed to add tray icon (real error): '%v' (code %d)", err1, err1)
 		// You could exitf or fallback here, but for now just log
 	}
 
 	//2, this must happen after NIM_ADD ! (bad chatgpt which suggested it before NIM_ADD)
 	ret2, _, err2 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
 	if ret2 == 0 {
-		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): %v (code %d)", err2, err2)
+		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): '%v' (code %d)", err2, err2)
 		// You could exitf or fallback here, but for now just log
 	}
 
@@ -1348,7 +1343,7 @@ func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 		lastErr := windows.GetLastError()
 		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
 		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-		logf("failed SetForegroundWindow ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+		logf("failed SetForegroundWindow ret=%d err='%v' lastErr:'%v'", fgRet, fgErr, lastErr)
 		return false
 	} else { // ie. 1 is TRUE
 		return true
@@ -1490,7 +1485,7 @@ func forceForeground(target windows.Handle) bool {
 					lastErr := windows.GetLastError()
 					// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
 					//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err=%v lastErr:%v", fgRet, fgErr, lastErr)
+					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err='%v' lastErr:'%v'", fgRet, fgErr, lastErr)
 					return false
 				} else {
 					return true
@@ -1764,8 +1759,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// logf("Drag move rate: %d events in %.2fs → %.1f moves/sec",
 					// 	moveCounter, secondsElapsed, rate)
 					// In the periodic log block:
-					logf("Drag move rate: %d potential / %d actual moves in %.2fs → %.1f / %.1f per sec",
-						moveCounter, actualPostCounter, secondsElapsed,
+					logf("Drag move rate: %s potential / %s actual moves in %.2fs → %.1f / %.1f per sec",
+						withCommas(moveCounter), withCommas(actualPostCounter), secondsElapsed,
 						rate, //float64(moveCounter)/secondsElapsed,
 						float64(actualPostCounter)/secondsElapsed)
 				}
@@ -1882,7 +1877,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
 		if resizing && currentDrag != nil {
-			//resizing = false
 			softReset()
 			return 1 // Swallow
 		}
@@ -2437,25 +2431,6 @@ var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
 		ok So u can't attempt to destroy hwnd from this thread, it will 'access denied' !
 		so we don't exit from here, we tell message window to exit for us.
 	*/
-	// defer secondary_defer()
-	// defer primary_defer()
-
-	// switch ctrlType {
-	// //case 0, 2: // CTRL_C_EVENT, CTRL_CLOSE_EVENT
-	// case CTRL_C_EVENT:
-	// 	// procUnhookWindowsHookEx.Call(uintptr(hHook))
-	// 	// os.Exit(0)
-	// 	//todo()
-	// 	exitf(128, "exit via Ctrl+C")
-
-	// case CTRL_BREAK_EVENT:
-	// 	exitf(128, "exit via Ctrl+Break")
-	// case CTRL_CLOSE_EVENT:
-	// 	exitf(127, "exit via Ctrl+Close event (wtf is this?!)") //TODO: find out what this is.
-	// default:
-	// 	exitf(129, "exit via unknown event %d", ctrlType)
-	// }
-	//unreachable()
 	procPostMessage.Call(
 		uintptr(trayIcon.HWnd),
 		WM_EXIT_VIA_CTRL_C,
@@ -2464,31 +2439,6 @@ var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
 	)
 	return 1 // 1=true aka i handled this event ie. don't do the default handling which would exit.
 })
-
-// var logFile *os.File
-
-// func initLog() {
-// var err error
-// logFile, err = os.OpenFile(
-// "debug.log",
-// os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-// 0644,
-// )
-// if err != nil {
-// return
-// }
-// }
-
-// func logf(format string, args ...any) {
-// if logFile == nil {
-// initLog()
-// if logFile == nil {
-// return
-// }
-// }
-// fmt.Fprintf(logFile, format+"\n", args...)
-// logFile.Sync()
-// }
 
 var (
 	logFile *os.File
@@ -2550,9 +2500,9 @@ func initLogFile() {
 
 var (
 	// buffer size here matters only in the case where you used devbuild.bat AND are running as admin eg. runasadmin.bat AND you drag scrollbar or select text because that blocks the printf which blocks the hooks since this is single threaded at the moment (message loop and hooks are on same 1 thread)
-	logChanSize   = 4096
-	logChan       = make(chan string, logChanSize) // Buffer of this many log messages
-	logWorkerDone = make(chan struct{})            // The "I'm finished" signal
+	logChanSize   uint64 = 4096
+	logChan              = make(chan string, logChanSize) // Buffer of this many log messages
+	logWorkerDone        = make(chan struct{})            // The "I'm finished" signal
 )
 
 const attemptAtomicSwapThisManyTimes uint = 100
@@ -2564,7 +2514,8 @@ func logf(format string, args ...any) {
 	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
 
 	// Check the current pressure on the pipe
-	currentDepth := int64(len(logChan))
+	//len() - It never returns a negative value — for all supported kinds (arrays, slices, maps, strings, channels) the result is >= 0 (and for nil slices/maps/channels it’s 0).
+	currentDepth := uint64(len(logChan))
 	// Update the high water mark if this is a new record
 	// We use a loop or a CompareAndSwap to ensure we never overwrite
 	// a higher value from another thread (though likely overkill here)
@@ -3115,7 +3066,7 @@ func ensureSingleInstance(name string, scope MutexScope) {
 		if errors.Is(callErr, windows.Errno(5)) { // aka 'Access Denied'==5
 			extra = " this means mutex attempt was 'Global\\' and it was already acquired by an admin-running exe"
 		}
-		exitf(2, "CreateMutex failed entirely: %v (code: %d)%s", err, err, extra)
+		exitf(2, "CreateMutex failed entirely: '%v' (code: %d)%s", err, err, extra)
 	}
 	// Note: We don't technically need to close this handle manually.
 	// As long as the process is alive, the mutex is held.
@@ -3175,11 +3126,11 @@ func logWorker() {
 	}
 	drops := droppedLogEvents.Load()
 	if drops > 0 {
-		internalLogger(fmt.Sprintf("Dropped %d log events due to contention.\n", drops))
+		internalLogger(fmt.Sprintf("Dropped %s log events due to contention.\n", withCommas(drops)))
 	}
 	maxfill := maxChannelFillForLogEvents.Load()
 	if maxfill > 1 {
-		internalLogger(fmt.Sprintf("Most log events seen at one time ie. peak queued on log channel: %d, out of logChanSize: %d\n", maxfill, logChanSize))
+		internalLogger(fmt.Sprintf("Most log events seen at one time ie. peak queued on log channel: %s, out of logChanSize: %s\n", withCommas(maxfill), withCommas(logChanSize)))
 	}
 	// This only executes AFTER close(logChan) is called AND the buffer is empty
 	close(logWorkerDone)
@@ -3363,7 +3314,11 @@ func main() {
 	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
 
 	//(Passing 0 to GOMAXPROCS just returns the current setting without changing it.)
-	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %d or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	cpus := int64(runtime.NumCPU())
+	if cpus < 0 {
+		exitf(1, "negative number of CPUs returned %s", withCommasSigned(cpus))
+	}
+	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %s or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), withCommas(uint64(cpus)))
 
 	setAndVerifyPriority()
 
@@ -3689,14 +3644,14 @@ func lockRAM() {
 
 	// We request that 20MB to 50MB stay in RAM at all times.
 	// This effectively "VirtualLocks" the core of your app.
-	min2 := uintptr(20 * 1024 * 1024)
-	max2 := uintptr(50 * 1024 * 1024)
+	var min2 uint64 = 20 * 1024 * 1024
+	var max2 uint64 = 50 * 1024 * 1024
 
-	ret, _, err = procSetProcessWorkingSetSize.Call(hProc, min2, max2)
+	ret, _, err = procSetProcessWorkingSetSize.Call(hProc, uintptr(min2), uintptr(max2))
 	if ret == 0 {
-		logf("Failed SetProcessWorkingSetSize to min:%d and max:%d, err: %v", min2, max2, err)
+		logf("Failed SetProcessWorkingSetSize to min:%s and max:%s, err: %v", humanBytes(min2), humanBytes(max2), err)
 	} else {
-		logf("Working Set locked between %d and %d", min2, max2)
+		logf("Working Set locked between %s and %s", humanBytes(min2), humanBytes(max2))
 	}
 
 	verifyMemoryIsLocked() //kinda useless to do now
@@ -3706,6 +3661,39 @@ func lockRAM() {
 	time.AfterFunc(30*time.Second, func() {
 		verifyMemoryIsLocked()
 	})
+}
+
+func humanBytes(bytes uint64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	const unit uint64 = 1024
+	div, exp := unit, 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	suffix := []string{"KiB", "MiB", "GiB", "TiB"}[exp]
+	return fmt.Sprintf("%.2f %s", float64(bytes)/float64(div), suffix)
+}
+
+func withCommas(n uint64) string {
+	s := strconv.FormatUint(n, 10)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
+
+func withCommasSigned(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	if n < 0 {
+		return "-" + withCommasSigned(-n)
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 
 const (
@@ -3886,12 +3874,12 @@ func setAndVerifyPriority() {
 func drainMoveChannel() {
 	for {
 		// Track High-Water Mark
-		currentFill := int64(len(moveDataChan))
+		currentFill := uint64(len(moveDataChan))
 		if currentFill > maxChannelFillForMoveEvents.Load() {
 			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
 			maxChannelFillForMoveEvents.Store(currentFill)
-			logf("New Channel Peak: %d events queued (Dropped: %d)",
-				currentFill, droppedMoveEvents.Load())
+			logf("New Channel Peak: %s events queued (Dropped: %s)",
+				withCommas(currentFill), withCommas(droppedMoveEvents.Load()))
 		}
 
 		select {
