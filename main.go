@@ -210,6 +210,10 @@ var (
 	procLoadIcon  = user32.NewProc("LoadIconW")
 
 	procUnregisterClassW = user32.NewProc("UnregisterClassW")
+
+	procSetPriorityClass  = kernel32.NewProc("SetPriorityClass")
+	procGetPriorityClass  = kernel32.NewProc("GetPriorityClass")
+	procGetCurrentProcess = kernel32.NewProc("GetCurrentProcess")
 )
 
 /* ---------------- Constants ---------------- */
@@ -3562,10 +3566,6 @@ func stdinIsConsoleInteractive() bool {
 func main() {
 	// 1. Lock THIS specific thread (Thread A) to the OS for Win32/Hooks.
 	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
-
-	//(Passing 0 to GOMAXPROCS just returns the current setting without changing it.)
-	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %d or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), runtime.NumCPU())
-
 	token := theILockedMainThreadToken{}
 	/*
 	   	When you call go func() { ... }(), you are telling the Go Scheduler to create a new goroutine.
@@ -3600,6 +3600,11 @@ func main() {
 	installCtrlHandlerIfConsole()
 
 	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
+
+	//(Passing 0 to GOMAXPROCS just returns the current setting without changing it.)
+	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %d or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), runtime.NumCPU())
+
+	setAndVerifyPriority()
 
 	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
 	if err := runApplication(token); err != nil {
@@ -3795,6 +3800,34 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 	return nil // no error
+}
+
+const (
+	NORMAL_PRIORITY_CLASS uintptr = 0x20
+	HIGH_PRIORITY_CLASS   uintptr = 0x00000080
+)
+
+// required high prio(normal is stuttering) to avoid mouse stuttering during the whole Gemini AI website version reply in Firefox.
+// "By being "High Priority," you tell the Windows Scheduler that your thread should have a longer quantum (more time before being interrupted)
+// and a shorter wait time to be re-scheduled. It ensures that when the "Mouse Interrupt" fires, your Go code is ready to answer the door immediately."
+func setAndVerifyPriority() {
+	h, _, _ := procGetCurrentProcess.Call()
+
+	// Set to HIGH_PRIORITY_CLASS (0x80)
+	wantedPrio := HIGH_PRIORITY_CLASS
+	ret, _, err := procSetPriorityClass.Call(h, wantedPrio)
+	if ret == 0 {
+		logf("Failed to set priority class, err:%v", err)
+		return
+	}
+
+	// Verify it actually changed
+	prio, _, err := procGetPriorityClass.Call(h)
+	if prio == 0x00000080 {
+		logf("Priority confirmed: HIGH_PRIORITY_CLASS")
+	} else {
+		logf("Priority mismatch! OS returned prio: 0x%x instead of 0x%x and err was: %v", prio, wantedPrio, err)
+	}
 }
 
 // Separate function to keep the loop readable
