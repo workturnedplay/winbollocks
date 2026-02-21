@@ -781,8 +781,8 @@ func injectShiftTapOnly() {
 	)
 	if ret == 0 {
 		logf("SendInput for injectShiftTapOnly failed: %v", err)
-	} else {
-		logf("done injectShiftTapOnly")
+		//} else {
+		//	logf("done injectShiftTapOnly")
 	}
 }
 func injectShiftTapThenWinUp(whichWinUp uint16) {
@@ -827,8 +827,8 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 	)
 	if ret == 0 {
 		logf("SendInput for injectShiftTapThenWinUp failed: %v", err)
-	} else {
-		logf("done injectShiftTapThenWinUp")
+		//} else {
+		//	logf("done injectShiftTapThenWinUp")
 	}
 }
 func injectLMBClick() {

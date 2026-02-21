@@ -5,6 +5,7 @@ todo:
 * make sure hooks are on their own thread, different from msg. loop thread, to avoid lockups; use windows.GetCurrentThreadId() to check they're diff. threads; test with GOMAXPROCS=1; "you can force more threads via runtime.GOMAXPROCS(runtime.NumCPU())" and make sure it's at least 2 even if numCPU is less;
 * check if it's bad to deinit() in the recovered panic, i remember some AI saying it's bad in the past, but not why.
 * rate limit the resizing updates too! the move already has its systray limit option.
+* shall we allow winkey+LMB+RMB to both work, currently panicking on MB UP, see if currentDrag should be different var for each, not same.
 
 done:
 //they can be moved * see if child windows or dialogs like the LAN adapter config. can be moved and how.
