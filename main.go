@@ -236,10 +236,7 @@ var (
 	procBeginPaint                 = user32.NewProc("BeginPaint")
 	procEndPaint                   = user32.NewProc("EndPaint")
 	procDrawText                   = user32.NewProc("DrawTextW")
-	procCreateSolidBrush           = kernel32.NewProc("CreateSolidBrush") // Or Gdi32 if mapped there
 	procFillRect                   = user32.NewProc("FillRect")
-	procSetTextColor               = kernel32.NewProc("SetTextColor") // Actually in Gdi32
-	procSetBkMode                  = kernel32.NewProc("SetBkMode")    // Actually in Gdi32
 
 	gdi32                   = windows.NewLazySystemDLL("gdi32.dll")
 	procGdiSetTextColor     = gdi32.NewProc("SetTextColor")
@@ -741,257 +738,6 @@ func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int
 	return x, y, w, h
 }
 
-/*
-func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
-	dx := currentPt.X - drag.startPt.X
-	dy := currentPt.Y - drag.startPt.Y
-
-	origL := drag.startRect.Left
-	origT := drag.startRect.Top
-	origR := drag.startRect.Right
-	origB := drag.startRect.Bottom
-	origW := origR - origL
-	origH := origB - origT
-
-	// Use the dynamically discovered minimums!
-	minW := drag.knownMinW
-	minH := drag.knownMinH
-
-	if zone == ZONE_CENTER {
-		// this one jumps when axis change or so:
-		// // UNIFORM CENTER RESIZE
-		// dw := dx * 2
-		// dh := dy * 2
-
-		// if respectAspectRatio {
-		// 	// Scale based on the larger of the two mouse movements
-		// 	if abs(dx) > abs(dy) {
-		// 		dh = int32(float64(dw) / initialAspectRatio)
-		// 	} else {
-		// 		dw = int32(float64(dh) * initialAspectRatio)
-		// 	}
-		// }
-
-		// w = origW + dw
-		// h = origH + dh
-
-		// // Apply minimums while respecting aspect ratio
-		// if w < minimumW {
-		// 	w = minimumW
-		// 	if respectAspectRatio {
-		// 		h = int32(float64(w) / initialAspectRatio)
-		// 	}
-		// }
-		// if h < minimumH {
-		// 	h = minimumH
-		// 	if respectAspectRatio {
-		// 		w = int32(float64(h) * initialAspectRatio)
-		// 	}
-		// }
-
-		// // Second pass to guarantee absolute minimums (Safety > Aspect Ratio)
-		// if w < minimumW {
-		// 	w = minimumW
-		// }
-		// if h < minimumH {
-		// 	h = minimumH
-		// }
-
-		// x = origL + (origW-w)/2
-		// y = origT + (origH-h)/2
-
-		// UNIFORM CENTER RESIZE
-		var dw, dh int32
-
-		if respectAspectRatio {
-			// Prevent jumpiness: use the X axis as the absolute driver for scale,
-			// but allow Y to drive if the aspect ratio is extremely tall.
-			if initialAspectRatio >= 1.0 {
-				dw = dx * 2
-				dh = int32(float64(dw) / initialAspectRatio)
-			} else {
-				dh = dy * 2
-				dw = int32(float64(dh) * initialAspectRatio)
-			}
-		} else {
-			dw = dx * 2
-			dh = dy * 2
-		}
-
-		w = origW + dw
-		h = origH + dh
-
-		// Apply safety minimums
-		if w < minW {
-			w = minW
-		}
-		if h < minH {
-			h = minH
-		}
-
-		x = origL + (origW-w)/2
-		y = origT + (origH-h)/2
-	} else {
-		// 8-GRID EDGE/CORNER RESIZE
-		newL, newT, newR, newB := origL, origT, origR, origB
-
-		// 1. Apply free movement to the active edges
-		switch zone {
-		case ZONE_TOP_LEFT:
-			newL += dx
-			newT += dy
-		case ZONE_TOP_CENTER:
-			newT += dy
-		case ZONE_TOP_RIGHT:
-			newT += dy
-			newR += dx
-		case ZONE_MID_LEFT:
-			newL += dx
-		case ZONE_MID_RIGHT:
-			newR += dx
-		case ZONE_BOT_LEFT:
-			newL += dx
-			newB += dy
-		case ZONE_BOT_CENTER:
-			newB += dy
-		case ZONE_BOT_RIGHT:
-			newR += dx
-			newB += dy
-		}
-
-		// 2. Strictly enforce minimum width/height constraints by locking moving edges
-
-		// If moving Left edge, it cannot push past (Right - minimum)
-		if zone == ZONE_TOP_LEFT || zone == ZONE_MID_LEFT || zone == ZONE_BOT_LEFT {
-			if newR-newL < minimumW {
-				newL = newR - minimumW
-			}
-		}
-		// If moving Right edge, it cannot push past (Left + minimum)
-		if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
-			if newR-newL < minimumW {
-				newR = newL + minimumW
-			}
-		}
-		// If moving Top edge, it cannot push past (Bottom - minimum)
-		if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
-			if newB-newT < minimumH {
-				newT = newB - minimumH
-			}
-		}
-		// If moving Bottom edge, it cannot push past (Top + minimum)
-		if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
-			if newB-newT < minimumH {
-				newB = newT + minimumH
-			}
-		}
-
-		// 3. Derive the final parameters for SetWindowPos
-		x, y = newL, newT
-		w, h = newR-newL, newB-newT
-	}
-
-	return x, y, w, h
-}
-*/
-/*
-	func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
-		dx := currentPt.X - drag.startPt.X
-		dy := currentPt.Y - drag.startPt.Y
-
-		origX, origY := drag.startRect.Left, drag.startRect.Top
-		origW := drag.startRect.Right - drag.startRect.Left
-		origH := drag.startRect.Bottom - drag.startRect.Top
-
-		// Maximum we can shrink before hitting 100px
-		maxShrinkW := origW - minimumW
-		maxShrinkH := origH - minimumH
-
-		if zone == ZONE_CENTER {
-			// UNIFORM CENTER RESIZE
-			dw := dx * 2
-			dh := dy * 2
-
-			if respectAspectRatio {
-				// Scale based on the larger of the two mouse movements
-				if abs(dx) > abs(dy) {
-					dh = int32(float64(dw) / initialAspectRatio)
-				} else {
-					dw = int32(float64(dh) * initialAspectRatio)
-				}
-			}
-
-			// Clamp shrinking (negative dw/dh) to the 100px limit
-			if dw < -maxShrinkW {
-				dw = -maxShrinkW
-			}
-			if dh < -maxShrinkH {
-				dh = -maxShrinkH
-			}
-
-			x = origX - (dw / 2)
-			y = origY - (dh / 2)
-			w = origW + dw
-			h = origH + dh
-		} else {
-			// 8-GRID EDGE/CORNER RESIZE
-			// Clamp deltas to prevent "sliding" past the 100px limit
-			switch zone {
-			case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
-				if dx > maxShrinkW {
-					dx = maxShrinkW
-				} // Moving left edge right
-			case ZONE_TOP_RIGHT, ZONE_MID_RIGHT, ZONE_BOT_RIGHT:
-				if dx < -maxShrinkW {
-					dx = -maxShrinkW
-				} // Moving right edge left
-			}
-
-			switch zone {
-			case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
-				if dy > maxShrinkH {
-					dy = maxShrinkH
-				} // Moving top edge down
-			case ZONE_BOT_LEFT, ZONE_BOT_CENTER, ZONE_BOT_RIGHT:
-				if dy < -maxShrinkH {
-					dy = -maxShrinkH
-				} // Moving bottom edge up
-			}
-
-			// Apply clamped deltas to original values
-			x, y, w, h = origX, origY, origW, origH
-			switch zone {
-			case ZONE_TOP_LEFT:
-				x += dx
-				y += dy
-				w -= dx
-				h -= dy
-			case ZONE_TOP_CENTER:
-				y += dy
-				h -= dy
-			case ZONE_TOP_RIGHT:
-				y += dy
-				w += dx
-				h -= dy
-			case ZONE_MID_LEFT:
-				x += dx
-				w -= dx
-			case ZONE_MID_RIGHT:
-				w += dx
-			case ZONE_BOT_LEFT:
-				x += dx
-				w -= dx
-				h += dy
-			case ZONE_BOT_CENTER:
-				h += dy
-			case ZONE_BOT_RIGHT:
-				w += dx
-				h += dy
-			}
-		}
-		return
-	}
-*/
 func abs(v int32) int32 {
 	if v < 0 {
 		return -v
@@ -1276,7 +1022,7 @@ func initTray() error {
 	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
 	if err != nil {
 		//exitf(1, "Failed to create message window: %v", err)
-		return fmt.Errorf("Failed to create message window: %w", err)
+		return fmt.Errorf("failed to create message window: %w", err)
 	}
 
 	trayIcon.HWnd = hwnd
@@ -2484,7 +2230,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		// }
 
 		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
-		if low == WM_RBUTTONUP { // RMB on systray aka RMBUp on systray aka RMB button released
+		if low == WM_RBUTTONUP { // RMB on systray aka RMBUp or RMBUP on systray aka RMB button released
 			/*
 				Yes — handling WM_RBUTTONUP (after masking with 0xFFFF) alone would work on every Windows version, because:
 				  XP → only 0x0205
