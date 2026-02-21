@@ -214,7 +214,9 @@ var (
 	procSetPriorityClass  = kernel32.NewProc("SetPriorityClass")
 	procGetPriorityClass  = kernel32.NewProc("GetPriorityClass")
 	procGetCurrentProcess = kernel32.NewProc("GetCurrentProcess")
+	procGetCurrentThread  = kernel32.NewProc("GetCurrentThread")
 	procSetThreadPriority = kernel32.NewProc("SetThreadPriority")
+	procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
 )
 
 /* ---------------- Constants ---------------- */
@@ -3809,11 +3811,26 @@ const (
 	THREAD_PRIORITY_TIME_CRITICAL uintptr = 15
 )
 
+// GetCurrentProcess returns a valid pseudo-handle which happens to be -1.
+// In Go, ^uintptr(0) (all bits set) is the numeric representation of -1
+const CURRENT_PROCESS_PSEUDO_HANDLE = ^uintptr(0) // All bits set to 1
+
+// In uintptr fashion (64-bit), -2 is: 0xFFFFFFFFFFFFFFFE aka ^uintptr(1)
+const CURRENT_THREAD_PSEUDO_HANDLE uintptr = ^uintptr(1)
+
 // required high prio(normal is stuttering) to avoid mouse stuttering during the whole Gemini AI website version reply in Firefox.
 // "By being "High Priority," you tell the Windows Scheduler that your thread should have a longer quantum (more time before being interrupted)
 // and a shorter wait time to be re-scheduled. It ensures that when the "Mouse Interrupt" fires, your Go code is ready to answer the door immediately."
 func setAndVerifyPriority() {
-	h, _, _ := procGetCurrentProcess.Call()
+	//Unlike most functions that return a real handle you have to track and close, GetCurrentProcess just returns (HANDLE)-1 (or 0xFFFFFFFF).
+	// It’s a constant that points to "the process that is calling this function."
+	//Technically, according to Microsoft's documentation, this function cannot fail.
+	h, _, err := procGetCurrentProcess.Call()
+	if h == 0 || h != CURRENT_PROCESS_PSEUDO_HANDLE {
+		// This virtually never happens, but if it did,
+		// the system is in a very weird state.
+		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", h, err)
+	}
 
 	// Set to HIGH_PRIORITY_CLASS (0x80)
 	wantedPrio := HIGH_PRIORITY_CLASS
@@ -3826,14 +3843,41 @@ func setAndVerifyPriority() {
 	// Verify it actually changed
 	prio, _, err := procGetPriorityClass.Call(h)
 	if prio == 0x00000080 {
-		logf("Priority confirmed: HIGH_PRIORITY_CLASS aka 0x%x", wantedPrio)
+		logf("Priority confirmed: 0x%x", wantedPrio)
 	} else {
 		logf("Priority mismatch! OS returned prio: 0x%x instead of 0x%x and err was: %v", prio, wantedPrio, err)
 	}
 
 	wantedThreadPrio := THREAD_PRIORITY_TIME_CRITICAL
-	currThread, _, _ := kernel32.NewProc("GetCurrentThread").Call()
-	procSetThreadPriority.Call(currThread, wantedThreadPrio)
+	//By setting the thread to 15, you are at the absolute ceiling of the "Dynamic" priority range.
+	// Only "Realtime" processes can go higher (16–31). This ensures that even if your Go app's other threads
+	// (like the one doing logging or tray icon management) get bogged down, the thread handling the mouse hook has a "VIP pass" at the CPU's door.
+
+	//Note that GetCurrentThread also returns a pseudo-handle (usually -2), so it doesn't need to be closed either.
+	currThread, _, err := procGetCurrentThread.Call()
+	if currThread == 0 || currThread != CURRENT_THREAD_PSEUDO_HANDLE {
+		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", currThread, err)
+	}
+
+	//In Go, the Garbage Collector runs on background threads. If your Process Priority is High (13) but your Hook Thread is Time Critical (15),
+	// the Hook Thread will actually preempt the Go Garbage Collector if they both want the CPU at the same time.
+	//This is the secret sauce for low-latency Go on Windows: you've made the hook more important than the language's own housekeeping.
+	// - gemini 3 fast
+	tRet, _, tErr := procSetThreadPriority.Call(currThread, wantedThreadPrio)
+	if tRet == 0 {
+		logf("Failed to set thread priority, err: %v", tErr)
+	} else {
+		// Verify Thread Priority
+		// procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
+		tprio, _, err := procGetThreadPriority.Call(currThread)
+
+		// GetThreadPriority returns an int. 15 is TIME_CRITICAL.
+		if int32(tprio) == int32(wantedThreadPrio) {
+			logf("Thread Priority confirmed: %d", tprio)
+		} else {
+			logf("Thread Priority mismatch! OS returned prio: %d instead of %d and err was: %v", int32(tprio), wantedThreadPrio, err)
+		}
+	}
 	//The Process is High, but the Hook Thread (current thread) is "Time Critical." This ensures that even if your Go app starts doing a heavy Garbage Collection on another thread,
 	// the Hook Thread gets the absolute maximum "right of way."
 }
