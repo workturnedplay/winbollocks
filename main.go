@@ -155,6 +155,7 @@ var (
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
 	shcore   = windows.NewLazySystemDLL("shcore.dll")
 
+	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procSetWindowsHookEx    = user32.NewProc("SetWindowsHookExW")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
@@ -207,9 +208,51 @@ var (
 
 	procSendInput = user32.NewProc("SendInput")
 	procLoadIcon  = user32.NewProc("LoadIconW")
+
+	procUnregisterClassW = user32.NewProc("UnregisterClassW")
 )
 
 /* ---------------- Constants ---------------- */
+
+const (
+	WS_EX_LAYERED     = 0x00080000
+	WS_EX_TRANSPARENT = 0x00000020
+	LWA_COLORKEY      = 0x00000001
+	LWA_ALPHA         = 0x00000002
+)
+
+var (
+	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
+	procBeginPaint                 = user32.NewProc("BeginPaint")
+	procEndPaint                   = user32.NewProc("EndPaint")
+	procDrawText                   = user32.NewProc("DrawTextW")
+	procCreateSolidBrush           = kernel32.NewProc("CreateSolidBrush") // Or Gdi32 if mapped there
+	procFillRect                   = user32.NewProc("FillRect")
+	procSetTextColor               = kernel32.NewProc("SetTextColor") // Actually in Gdi32
+	procSetBkMode                  = kernel32.NewProc("SetBkMode")    // Actually in Gdi32
+
+	gdi32                   = windows.NewLazySystemDLL("gdi32.dll")
+	procGdiSetTextColor     = gdi32.NewProc("SetTextColor")
+	procGdiSetBkMode        = gdi32.NewProc("SetBkMode")
+	procGdiCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
+	procGdiDeleteObject     = gdi32.NewProc("DeleteObject")
+
+	overlayHwnd windows.Handle
+	overlayText string
+
+	// Reusable GDI brushes
+	magentaBrush windows.Handle
+	blackBrush   windows.Handle
+)
+
+type PAINTSTRUCT struct {
+	Hdc         windows.Handle
+	FErase      int32
+	RcPaint     RECT
+	FRestore    int32
+	FIncUpdate  int32
+	RgbReserved [32]byte
+}
 
 const (
 	PM_NOREMOVE = 0x0000
@@ -273,6 +316,7 @@ const (
 	WM_MOUSEMOVE   = 0x0200
 	WM_LBUTTONDOWN = 0x0201
 	WM_LBUTTONUP   = 0x0202
+	WM_RBUTTONDOWN = 0x0204 //guessed
 	WM_RBUTTONUP   = 0x0205 // even winxp would have this
 	WM_CONTEXTMENU = 0x007B // winxp won't have this tho
 
@@ -382,15 +426,35 @@ const (
 
 )
 
+const (
+	ZONE_TOP_LEFT = iota
+	ZONE_TOP_CENTER
+	ZONE_TOP_RIGHT
+	ZONE_MID_LEFT
+	ZONE_CENTER
+	ZONE_MID_RIGHT
+	ZONE_BOT_LEFT
+	ZONE_BOT_CENTER
+	ZONE_BOT_RIGHT
+)
+
 /* ---------------- Types ---------------- */
+var (
+	resizing           bool
+	resizeZone         int
+	initialAspectRatio float64
+	respectAspectRatio bool = true // Default value for your toggle
+)
+
+//TODO: reorder these (I've 'var' and 'type' in this block)
 
 type WindowMoveData struct {
 	Hwnd        windows.Handle // Target window
 	X           int32          // New X (full 32-bit)
 	Y           int32          // New Y
+	W, H        int32          //width, height for resize via winkey+RMBdrag
 	InsertAfter windows.Handle // ← this one: HWND_TOP, HWND_BOTTOM, etc.
 	Flags       uint32         // Optional: extra SWP_ flags
-	// Add more if needed (e.g., Width, Height for resize)
 }
 
 type KEYBDINPUT struct {
@@ -468,6 +532,8 @@ type MSLLHOOKSTRUCT struct {
 type dragState struct {
 	startPt   POINT
 	startRect RECT
+	knownMinW int32
+	knownMinH int32
 }
 
 type NOTIFYICONDATA struct {
@@ -503,6 +569,7 @@ var (
 	// ctrlDown  atomic.Bool
 	// altDown   atomic.Bool
 
+	// used exclusively to know when to inject shift key tap (shiftdown+shiftUP) at the point when physical winkeyUP aka winUP is detected //TODO: maybe remove because we do it(shifttap) now at gesture start
 	winGestureUsed bool = false //false initially
 )
 
@@ -525,6 +592,402 @@ var ratelimitOnMove bool            // use less CPU (see CPU time in task manage
 var shouldLogDragRate bool          // but only when ratelimitOnMove is true
 
 /* ---------------- Utilities ---------------- */
+
+func getResizeZone(pt POINT, r RECT) int {
+	w := r.Right - r.Left
+	h := r.Bottom - r.Top
+
+	col := 0
+	if pt.X > r.Left+(2*w/3) {
+		col = 2
+	} else if pt.X > r.Left+(w/3) {
+		col = 1
+	}
+
+	row := 0
+	if pt.Y > r.Top+(2*h/3) {
+		row = 2
+	} else if pt.Y > r.Top+(h/3) {
+		row = 1
+	}
+
+	return row*3 + col
+}
+
+const minimumW = 300
+const minimumH = 300
+
+func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
+	dx := currentPt.X - drag.startPt.X
+	dy := currentPt.Y - drag.startPt.Y
+
+	origL := drag.startRect.Left
+	origT := drag.startRect.Top
+	origR := drag.startRect.Right
+	origB := drag.startRect.Bottom
+	origW := origR - origL
+	origH := origB - origT
+
+	// Use the dynamically discovered minimums!
+	minW := drag.knownMinW
+	minH := drag.knownMinH
+
+	if zone == ZONE_CENTER {
+		// UNIFORM CENTER RESIZE
+		var dw, dh int32
+
+		if respectAspectRatio {
+			if initialAspectRatio >= 1.0 {
+				dw = dx * 2
+				dh = int32(float64(dw) / initialAspectRatio)
+			} else {
+				dh = dy * 2
+				dw = int32(float64(dh) * initialAspectRatio)
+			}
+		} else {
+			dw = dx * 2
+			dh = dy * 2
+		}
+
+		w = origW + dw
+		h = origH + dh
+
+		// Apply safety minimums, maintaining aspect ratio if we hit the floor
+		if w < minW {
+			w = minW
+			if respectAspectRatio && initialAspectRatio > 0 {
+				h = int32(float64(w) / initialAspectRatio)
+			}
+		}
+		if h < minH {
+			h = minH
+			if respectAspectRatio && initialAspectRatio > 0 {
+				w = int32(float64(h) * initialAspectRatio)
+			}
+		}
+		// Second pass for absolute safety
+		if w < minW {
+			w = minW
+		}
+		if h < minH {
+			h = minH
+		}
+
+		x = origL + (origW-w)/2
+		y = origT + (origH-h)/2
+	} else {
+		// 8-GRID EDGE/CORNER RESIZE
+		newL, newT, newR, newB := origL, origT, origR, origB
+
+		switch zone {
+		case ZONE_TOP_LEFT:
+			newL += dx
+			newT += dy
+		case ZONE_TOP_CENTER:
+			newT += dy
+		case ZONE_TOP_RIGHT:
+			newT += dy
+			newR += dx
+		case ZONE_MID_LEFT:
+			newL += dx
+		case ZONE_MID_RIGHT:
+			newR += dx
+		case ZONE_BOT_LEFT:
+			newL += dx
+			newB += dy
+		case ZONE_BOT_CENTER:
+			newB += dy
+		case ZONE_BOT_RIGHT:
+			newR += dx
+			newB += dy
+		}
+
+		// Strictly enforce dynamic minimums
+		if zone == ZONE_TOP_LEFT || zone == ZONE_MID_LEFT || zone == ZONE_BOT_LEFT {
+			if newR-newL < minW {
+				newL = newR - minW
+			}
+		}
+		if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
+			if newR-newL < minW {
+				newR = newL + minW
+			}
+		}
+		if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
+			if newB-newT < minH {
+				newT = newB - minH
+			}
+		}
+		if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
+			if newB-newT < minH {
+				newB = newT + minH
+			}
+		}
+
+		x, y = newL, newT
+		w, h = newR-newL, newB-newT
+	}
+
+	return x, y, w, h
+}
+
+/*
+func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
+	dx := currentPt.X - drag.startPt.X
+	dy := currentPt.Y - drag.startPt.Y
+
+	origL := drag.startRect.Left
+	origT := drag.startRect.Top
+	origR := drag.startRect.Right
+	origB := drag.startRect.Bottom
+	origW := origR - origL
+	origH := origB - origT
+
+	// Use the dynamically discovered minimums!
+	minW := drag.knownMinW
+	minH := drag.knownMinH
+
+	if zone == ZONE_CENTER {
+		// this one jumps when axis change or so:
+		// // UNIFORM CENTER RESIZE
+		// dw := dx * 2
+		// dh := dy * 2
+
+		// if respectAspectRatio {
+		// 	// Scale based on the larger of the two mouse movements
+		// 	if abs(dx) > abs(dy) {
+		// 		dh = int32(float64(dw) / initialAspectRatio)
+		// 	} else {
+		// 		dw = int32(float64(dh) * initialAspectRatio)
+		// 	}
+		// }
+
+		// w = origW + dw
+		// h = origH + dh
+
+		// // Apply minimums while respecting aspect ratio
+		// if w < minimumW {
+		// 	w = minimumW
+		// 	if respectAspectRatio {
+		// 		h = int32(float64(w) / initialAspectRatio)
+		// 	}
+		// }
+		// if h < minimumH {
+		// 	h = minimumH
+		// 	if respectAspectRatio {
+		// 		w = int32(float64(h) * initialAspectRatio)
+		// 	}
+		// }
+
+		// // Second pass to guarantee absolute minimums (Safety > Aspect Ratio)
+		// if w < minimumW {
+		// 	w = minimumW
+		// }
+		// if h < minimumH {
+		// 	h = minimumH
+		// }
+
+		// x = origL + (origW-w)/2
+		// y = origT + (origH-h)/2
+
+		// UNIFORM CENTER RESIZE
+		var dw, dh int32
+
+		if respectAspectRatio {
+			// Prevent jumpiness: use the X axis as the absolute driver for scale,
+			// but allow Y to drive if the aspect ratio is extremely tall.
+			if initialAspectRatio >= 1.0 {
+				dw = dx * 2
+				dh = int32(float64(dw) / initialAspectRatio)
+			} else {
+				dh = dy * 2
+				dw = int32(float64(dh) * initialAspectRatio)
+			}
+		} else {
+			dw = dx * 2
+			dh = dy * 2
+		}
+
+		w = origW + dw
+		h = origH + dh
+
+		// Apply safety minimums
+		if w < minW {
+			w = minW
+		}
+		if h < minH {
+			h = minH
+		}
+
+		x = origL + (origW-w)/2
+		y = origT + (origH-h)/2
+	} else {
+		// 8-GRID EDGE/CORNER RESIZE
+		newL, newT, newR, newB := origL, origT, origR, origB
+
+		// 1. Apply free movement to the active edges
+		switch zone {
+		case ZONE_TOP_LEFT:
+			newL += dx
+			newT += dy
+		case ZONE_TOP_CENTER:
+			newT += dy
+		case ZONE_TOP_RIGHT:
+			newT += dy
+			newR += dx
+		case ZONE_MID_LEFT:
+			newL += dx
+		case ZONE_MID_RIGHT:
+			newR += dx
+		case ZONE_BOT_LEFT:
+			newL += dx
+			newB += dy
+		case ZONE_BOT_CENTER:
+			newB += dy
+		case ZONE_BOT_RIGHT:
+			newR += dx
+			newB += dy
+		}
+
+		// 2. Strictly enforce minimum width/height constraints by locking moving edges
+
+		// If moving Left edge, it cannot push past (Right - minimum)
+		if zone == ZONE_TOP_LEFT || zone == ZONE_MID_LEFT || zone == ZONE_BOT_LEFT {
+			if newR-newL < minimumW {
+				newL = newR - minimumW
+			}
+		}
+		// If moving Right edge, it cannot push past (Left + minimum)
+		if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
+			if newR-newL < minimumW {
+				newR = newL + minimumW
+			}
+		}
+		// If moving Top edge, it cannot push past (Bottom - minimum)
+		if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
+			if newB-newT < minimumH {
+				newT = newB - minimumH
+			}
+		}
+		// If moving Bottom edge, it cannot push past (Top + minimum)
+		if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
+			if newB-newT < minimumH {
+				newB = newT + minimumH
+			}
+		}
+
+		// 3. Derive the final parameters for SetWindowPos
+		x, y = newL, newT
+		w, h = newR-newL, newB-newT
+	}
+
+	return x, y, w, h
+}
+*/
+/*
+	func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
+		dx := currentPt.X - drag.startPt.X
+		dy := currentPt.Y - drag.startPt.Y
+
+		origX, origY := drag.startRect.Left, drag.startRect.Top
+		origW := drag.startRect.Right - drag.startRect.Left
+		origH := drag.startRect.Bottom - drag.startRect.Top
+
+		// Maximum we can shrink before hitting 100px
+		maxShrinkW := origW - minimumW
+		maxShrinkH := origH - minimumH
+
+		if zone == ZONE_CENTER {
+			// UNIFORM CENTER RESIZE
+			dw := dx * 2
+			dh := dy * 2
+
+			if respectAspectRatio {
+				// Scale based on the larger of the two mouse movements
+				if abs(dx) > abs(dy) {
+					dh = int32(float64(dw) / initialAspectRatio)
+				} else {
+					dw = int32(float64(dh) * initialAspectRatio)
+				}
+			}
+
+			// Clamp shrinking (negative dw/dh) to the 100px limit
+			if dw < -maxShrinkW {
+				dw = -maxShrinkW
+			}
+			if dh < -maxShrinkH {
+				dh = -maxShrinkH
+			}
+
+			x = origX - (dw / 2)
+			y = origY - (dh / 2)
+			w = origW + dw
+			h = origH + dh
+		} else {
+			// 8-GRID EDGE/CORNER RESIZE
+			// Clamp deltas to prevent "sliding" past the 100px limit
+			switch zone {
+			case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
+				if dx > maxShrinkW {
+					dx = maxShrinkW
+				} // Moving left edge right
+			case ZONE_TOP_RIGHT, ZONE_MID_RIGHT, ZONE_BOT_RIGHT:
+				if dx < -maxShrinkW {
+					dx = -maxShrinkW
+				} // Moving right edge left
+			}
+
+			switch zone {
+			case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
+				if dy > maxShrinkH {
+					dy = maxShrinkH
+				} // Moving top edge down
+			case ZONE_BOT_LEFT, ZONE_BOT_CENTER, ZONE_BOT_RIGHT:
+				if dy < -maxShrinkH {
+					dy = -maxShrinkH
+				} // Moving bottom edge up
+			}
+
+			// Apply clamped deltas to original values
+			x, y, w, h = origX, origY, origW, origH
+			switch zone {
+			case ZONE_TOP_LEFT:
+				x += dx
+				y += dy
+				w -= dx
+				h -= dy
+			case ZONE_TOP_CENTER:
+				y += dy
+				h -= dy
+			case ZONE_TOP_RIGHT:
+				y += dy
+				w += dx
+				h -= dy
+			case ZONE_MID_LEFT:
+				x += dx
+				w -= dx
+			case ZONE_MID_RIGHT:
+				w += dx
+			case ZONE_BOT_LEFT:
+				x += dx
+				w -= dx
+				h += dy
+			case ZONE_BOT_CENTER:
+				h += dy
+			case ZONE_BOT_RIGHT:
+				w += dx
+				h += dy
+			}
+		}
+		return
+	}
+*/
+func abs(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
 
 // this way when winUP happens it won't pop up start menu
 func injectShiftTapOnly() {
@@ -799,9 +1262,15 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 
 /* ---------------- Tray ---------------- */
 
-func initTray(hwnd windows.Handle) {
-	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
+func initTray() error {
+	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
+	if err != nil {
+		//exitf(1, "Failed to create message window: %v", err)
+		return fmt.Errorf("Failed to create message window: %w", err)
+	}
+
 	trayIcon.HWnd = hwnd
+	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
 	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
 
@@ -827,6 +1296,8 @@ func initTray(hwnd windows.Handle) {
 		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): %v (code %d)", err2, err2)
 		// You could exitf or fallback here, but for now just log
 	}
+
+	return nil
 }
 
 func cleanupTray() {
@@ -922,12 +1393,14 @@ func keyDown(vk uintptr) bool {
 func softReset() { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	//do this first
 	capturing = false
+	resizing = false
 	//do this second
 	targetWnd = 0
 
 	currentDrag = nil
 
 	procReleaseCapture.Call()
+	hideOverlay()
 }
 
 func hardReset() {
@@ -938,6 +1411,137 @@ func hardReset() {
 		winGestureUsed = false
 	}
 	softReset()
+}
+
+func initOverlay() {
+	className := mustUTF16("winbollocksOverlay")
+
+	var wc WNDCLASSEX
+	wc.CbSize = uint32(unsafe.Sizeof(wc))
+	wc.LpfnWndProc = windows.NewCallback(overlayWndProc)
+	wc.LpszClassName = className
+	hinst, _, _ := procGetModuleHandle.Call(0)
+	wc.HInstance = windows.Handle(hinst)
+	// Add shadow/background if desired, but we'll paint it
+
+	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+
+	hwndRaw, _, _ := procCreateWindowEx.Call(
+		WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,
+		uintptr(unsafe.Pointer(className)),
+		0,
+		WS_POPUP,
+		0, 0, 400, 100, // Size will be updated dynamically
+		0, 0,
+		uintptr(wc.HInstance),
+		0,
+	)
+
+	overlayHwnd = windows.Handle(hwndRaw)
+
+	// Set Magenta (0x00FF00FF) as the transparent color key, and 200/255 opacity for the rest
+	procSetLayeredWindowAttributes.Call(uintptr(overlayHwnd), 0x00FF00FF, 220, LWA_COLORKEY|LWA_ALPHA)
+
+	// Create our reusable GDI brushes once
+	hMag, _, _ := procGdiCreateSolidBrush.Call(0x00FF00FF)
+	magentaBrush = windows.Handle(hMag)
+
+	hBlk, _, _ := procGdiCreateSolidBrush.Call(0x00000000)
+	blackBrush = windows.Handle(hBlk)
+}
+
+const WM_PAINT = 0x000F
+
+func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case WM_PAINT:
+		// var ps PAINTSTRUCT
+		// hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+
+		// // 1. Fill background with Magenta (Transparent Key)
+		// hBrush, _, _ := procGdiCreateSolidBrush.Call(0x00FF00FF)
+		// var rect RECT
+		// procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+		// rect.Right -= rect.Left
+		// rect.Left = 0
+		// rect.Bottom -= rect.Top
+		// rect.Top = 0
+		// procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), hBrush)
+		// procGdiDeleteObject.Call(hBrush)
+
+		// // 2. Draw black text box background for visibility
+		// bgBrush, _, _ := procGdiCreateSolidBrush.Call(0x00000000) // Black
+		// procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), bgBrush)
+		// procGdiDeleteObject.Call(bgBrush)
+
+		// // 3. Draw Text
+		// procGdiSetTextColor.Call(hdc, 0x0000FF00) // Green text
+		// procGdiSetBkMode.Call(hdc, 1)             // TRANSPARENT background for text
+
+		// textPtr := mustUTF16(overlayText)
+		// procDrawText.Call(hdc, uintptr(unsafe.Pointer(textPtr)), ^uintptr(0), uintptr(unsafe.Pointer(&rect)), 0x24) // DT_CENTER | DT_VCENTER | DT_SINGLELINE
+
+		// procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		// return 0
+		var ps PAINTSTRUCT
+		hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+
+		var rect RECT
+		procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+		rect.Right -= rect.Left
+		rect.Left = 0
+		rect.Bottom -= rect.Top
+		rect.Top = 0
+
+		// 1. Fill background with our global Magenta brush (Transparent Key)
+		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), uintptr(magentaBrush))
+
+		// 2. Draw black text box background for visibility with our global Black brush
+		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), uintptr(blackBrush))
+
+		// 3. Draw Text
+		procGdiSetTextColor.Call(hdc, 0x0000FF00) // Green text
+		procGdiSetBkMode.Call(hdc, 1)             // TRANSPARENT background for text
+
+		textPtr := mustUTF16(overlayText)
+		procDrawText.Call(hdc, uintptr(unsafe.Pointer(textPtr)), ^uintptr(0), uintptr(unsafe.Pointer(&rect)), 0x24) // DT_CENTER | DT_VCENTER | DT_SINGLELINE
+
+		procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		return 0
+	}
+	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
+	return ret
+}
+
+func updateOverlay(x, y, w, h int32, startW, startH int32) {
+	if overlayHwnd == 0 {
+		return
+	}
+
+	diffW := w - startW
+	diffH := h - startH
+	overlayText = fmt.Sprintf("Size: %dx%d (Δ: %d, %d)", w, h, diffW, diffH)
+
+	// Center the overlay over the window being resized
+	ox := x + (w / 2) - 150
+	oy := y + (h / 2) - 25
+
+	procSetWindowPos.Call(
+		uintptr(overlayHwnd),
+		HWND_TOPMOST,
+		uintptr(ox), uintptr(oy),
+		300, 50,
+		SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
+	)
+
+	// Force redraw
+	user32.NewProc("InvalidateRect").Call(uintptr(overlayHwnd), 0, 1)
+}
+
+func hideOverlay() {
+	if overlayHwnd != 0 {
+		procShowWindow.Call(uintptr(overlayHwnd), 0) // SW_HIDE
+	}
 }
 
 func isWindowForeground(hwnd windows.Handle) bool {
@@ -1001,6 +1605,7 @@ const (
 	WS_EX_TOOLWINDOW = 0x00000080
 	WS_EX_NOACTIVATE = 0x08000000
 )
+const WS_EX_TOPMOST = 0x00000008
 const (
 	GWL_STYLE   = -16
 	GWL_EXSTYLE = -20
@@ -1477,7 +2082,28 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				//return 0 //0 = let it thru
 				//XXX: let it fall thru so CallNextHookEx is also called!
 			}
-		} //main 'if'
+		} //main 'if', for capturing aka moving/dragging window
+
+		if resizing && currentDrag != nil {
+			nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt)
+			// ---- OVERLAY UPDATE ----
+			startW := currentDrag.startRect.Right - currentDrag.startRect.Left
+			startH := currentDrag.startRect.Bottom - currentDrag.startRect.Top
+			updateOverlay(nx, ny, nw, nh, startW, startH)
+			// ------------------------
+			// Send to your mover channel
+			moveDataChan <- WindowMoveData{
+				Hwnd:  targetWnd,
+				X:     nx,
+				Y:     ny,
+				W:     nw,
+				H:     nh,
+				Flags: SWP_NOZORDER | SWP_NOACTIVATE,
+			}
+			// Trigger the move window
+			procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+			//return 1 //gemini mistake heh
+		} //second 'if', for resizing
 
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
 		if capturing && currentDrag != nil {
@@ -1494,6 +2120,63 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
 			return 1 //eat it
 		} // else let it pass
+		if capturing || currentDrag != nil {
+			panic("race detected2, or at best improper cleanup")
+		}
+
+	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
+		if resizing && currentDrag != nil {
+			//resizing = false
+			softReset()
+			return 1 // Swallow
+		}
+		if resizing || currentDrag != nil {
+			panic("race detected1, or at best improper cleanup")
+		}
+
+	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
+		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		var shiftDown bool = keyDown(VK_SHIFT)
+		var ctrlDown bool = keyDown(VK_CONTROL)
+		var altDown bool = keyDown(VK_MENU)
+		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
+			if !winGestureUsed {
+				winGestureUsed = true
+				injectShiftTapOnly() // prevent releasing of winkey later from popping up Start menu!
+			}
+			// if winGestureUsed {
+			// 	logf("you're already using another gesture") //FIXME: this can happen for other reasons as well, winkey+L ?
+			// 	return 1                                     //eat key
+			// }
+			if resizing {
+				logf("already resizing") //FIXME: like for 'capturing'
+			}
+			if currentDrag != nil {
+				//FIXME: what to do here.
+				logf("didn't clean up last resize/drag gesture")
+				return 1
+			}
+			targetWnd = windowFromPoint(info.Pt)
+			if targetWnd != 0 {
+
+				resizing = true
+
+				var r RECT
+				procGetWindowRect.Call(uintptr(targetWnd), uintptr(unsafe.Pointer(&r)))
+
+				currentDrag = &dragState{startPt: info.Pt, startRect: r,
+					knownMinW: minimumW, // Start with your 300px default
+					knownMinH: minimumH}
+				resizeZone = getResizeZone(info.Pt, r)
+
+				w := float64(r.Right - r.Left)
+				h := float64(r.Bottom - r.Top)
+				initialAspectRatio = w / h
+
+				procSetCapture.Call(uintptr(trayIcon.HWnd))
+				return 1 // Swallow
+			}
+		} //if
 
 	case WM_MBUTTONDOWN: //MMB pressed
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -1505,6 +2188,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
 			if !winGestureUsed { //wasn't set already
 				winGestureUsed = true // we used at least once of our gestures
+				injectShiftTapOnly()  // prevent releasing of winkey later from popping up Start menu!
 			}
 
 			//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
@@ -1638,14 +2322,16 @@ var mouseCallback uintptr
 
 func handleActualMove(data WindowMoveData) {
 	target := data.Hwnd
-	x := data.X
-	y := data.Y
-
+	// //FIXME: remove this 'if' later
+	// if (data.W != 0 || data.H != 0) && data.Flags&SWP_NOSIZE == SWP_NOSIZE {
+	// 	//flags |= SWP_NOSIZE
+	// 	panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
+	// }
 	ret, _, _ := procSetWindowPos.Call(
 		uintptr(target),
 		uintptr(data.InsertAfter),
-		uintptr(x), uintptr(y),
-		0, 0,
+		uintptr(data.X), uintptr(data.Y),
+		uintptr(data.W), uintptr(data.H),
 		uintptr(data.Flags),
 	)
 
@@ -1653,13 +2339,51 @@ func handleActualMove(data WindowMoveData) {
 		errCode, _, _ := procGetLastError.Call()
 		logf("SetWindowPos failed(from within main message loop): hwnd=0x%x error=%d", target, errCode)
 		if errCode == 5 { // Access denied (UIPI likely)
-			showTrayInfo("winbollocks", "Cannot move elevated window (access denied), you'd have to run as admin.")
+			showTrayInfo("winbollocks", "Cannot move/resize elevated window (access denied), you'd have to run as admin.")
 		}
 		// // Optional: fallback to native drag simulation (simulates title-bar drag, often works when SetWindowPos is blocked) - grok
 		// pt := POINT{X: x, Y: y}
 		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
-	}
+	} else if data.W != 0 || data.H != 0 {
+		// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
+		// We asked the OS to resize it to data.W x data.H. Did it listen?
+		var r RECT
+		procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
+		actualW := r.Right - r.Left
+		actualH := r.Bottom - r.Top
+
+		if currentDrag != nil {
+			clamped := false
+			// If actual width is larger than what we requested AND larger than our currently known minimum
+			if actualW > data.W && actualW > currentDrag.knownMinW {
+				currentDrag.knownMinW = actualW
+				clamped = true
+			}
+			if actualH > data.H && actualH > currentDrag.knownMinH {
+				currentDrag.knownMinH = actualH
+				clamped = true
+			}
+
+			// If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
+			// We must immediately correct the window position to restore the anchor.
+			if clamped {
+				var pt POINT
+				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
+
+				nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, pt)
+
+				// Snap the window back to the correct anchor point
+				procSetWindowPos.Call(
+					uintptr(target),
+					uintptr(data.InsertAfter),
+					uintptr(nx), uintptr(ny),
+					uintptr(nw), uintptr(nh),
+					uintptr(data.Flags),
+				)
+			}
+		}
+	} //else
 }
 
 // func makeLParam(x, y int32) uintptr { // chatgpt
@@ -1750,7 +2474,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		// }
 
 		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
-		if low == WM_RBUTTONUP {
+		if low == WM_RBUTTONUP { // RMB on systray aka RMBUp on systray aka RMB button released
 			/*
 				Yes — handling WM_RBUTTONUP (after masking with 0xFFFF) alone would work on every Windows version, because:
 				  XP → only 0x0205
@@ -1881,9 +2605,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 })
 
 func deinit() {
-	//TODO: add the others? or perhaps there's no point?!
-	// capturing = false
-	// procReleaseCapture.Call()
 	hardReset()
 	if mouseHook != 0 {
 		procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -1893,6 +2614,31 @@ func deinit() {
 		procUnhookWindowsHookEx.Call(uintptr(kbdHook))
 		kbdHook = 0
 	}
+
+	cleanupTray()
+
+	if overlayHwnd != 0 {
+		// Destroy the overlay window
+		procDestroyWindow.Call(uintptr(overlayHwnd))
+		overlayHwnd = 0
+	}
+
+	if magentaBrush != 0 {
+		procGdiDeleteObject.Call(uintptr(magentaBrush))
+		magentaBrush = 0
+	}
+	if blackBrush != 0 {
+		procGdiDeleteObject.Call(uintptr(blackBrush))
+		blackBrush = 0
+	}
+
+	instance, _, _ := procGetModuleHandle.Call(0)
+	classNamePtr := mustUTF16("OverlayClass")
+	procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance)
+
+	//This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
+	procPostQuitMessage.Call(0)
+	//however, we are in the same thread that executes that loop so the chances are 0 that we get back to it and more likely that we'll os.Exit
 }
 
 // type exitCode int // Custom type so recover knows it's an intentional exit
@@ -2750,7 +3496,8 @@ func primary_defer() { //primary defer
 			//debug.PrintStack()
 		}
 	}
-	cleanupTray()
+
+	deinit()
 
 	logf("Execution finished.")
 	if writeProfile {
@@ -2858,6 +3605,7 @@ func main() {
 	if err := runApplication(token); err != nil {
 		exitf(2, "Error: %v\n", err)
 	}
+	logf("Went past runApplication main's end.")
 }
 
 func getConsoleWindow() (windows.HWND, error) {
@@ -2914,7 +3662,8 @@ type exitStatus struct {
 
 // exitf allows you to provide a code and a formatted message
 func exitf(code int, format string, a ...interface{}) {
-	deinit()
+	//deinit()
+	//this panic will run the primary and potentially secondary(if primary fails) deferrers! ie. primary_defer
 	panic(exitStatus{
 		Code:    code,
 		Message: fmt.Sprintf(format, a...),
@@ -3011,12 +3760,8 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		defer procUnhookWinEvent.Call(uintptr(winEventHook))
 	}
 
-	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
-	if err != nil {
-		//exitf(1, "Failed to create message window: %v", err)
-		return fmt.Errorf("Failed to create message window: %w", err)
-	}
-	initTray(hwnd)
+	initTray()
+	initOverlay()
 
 	var msg MSG
 	for {

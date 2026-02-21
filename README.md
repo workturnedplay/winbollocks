@@ -9,7 +9,7 @@ Originally located here: https://github.com/workturnedplay/winbollocks
 It is designed to replicate common X11 / Wayland window-manager behaviors on Windows such as, for now only:  
 winkey+LMB drag to move a window and winkey+MMB to send window to back behind all others.  
 
-It was build with the help of AI (chatgpt 5.2 specifically). It works right now as stated below, but the code is a mess(for now) on purpose.
+It was build with the help of AI (chatgpt 5.2 and 5.1Mini, Grok 4 and 4.1, Gemini 3 and 3.1 Pro). It works right now as stated below, but the code is a mess(for now) on purpose.
 
 ---
 
