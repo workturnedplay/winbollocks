@@ -3753,19 +3753,19 @@ func getCurrentProcess() (hProc uintptr) {
 	return hProcLocal
 }
 
+func getCurrentThread() (hThread uintptr) {
+	//Note that GetCurrentThread also returns a pseudo-handle (usually -2), so it doesn't need to be closed either.
+	currThread, _, err := procGetCurrentThread.Call()
+	if currThread == 0 || currThread != CURRENT_THREAD_PSEUDO_HANDLE {
+		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", currThread, err)
+	}
+	return currThread
+}
+
 // required high prio(normal is stuttering) to avoid mouse stuttering during the whole Gemini AI website version reply in Firefox.
 // "By being "High Priority," you tell the Windows Scheduler that your thread should have a longer quantum (more time before being interrupted)
 // and a shorter wait time to be re-scheduled. It ensures that when the "Mouse Interrupt" fires, your Go code is ready to answer the door immediately."
 func setAndVerifyPriority() {
-	// //Unlike most functions that return a real handle you have to track and close, GetCurrentProcess just returns (HANDLE)-1 (or 0xFFFFFFFF).
-	// // It’s a constant that points to "the process that is calling this function."
-	// //Technically, according to Microsoft's documentation, this function cannot fail.
-	// hProc, _, err := procGetCurrentProcess.Call()
-	// if hProc == 0 || hProc != CURRENT_PROCESS_PSEUDO_HANDLE {
-	// 	// This virtually never happens, but if it did,
-	// 	// the system is in a very weird state.
-	// 	exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", hProc, err)
-	// }
 	hProc := getCurrentProcess()
 
 	// Set to HIGH_PRIORITY_CLASS (0x80)
@@ -3785,15 +3785,11 @@ func setAndVerifyPriority() {
 	}
 
 	const wantedThreadPrio int32 = THREAD_PRIORITY_TIME_CRITICAL
-	//By setting the thread to 15, you are at the absolute ceiling of the "Dynamic" priority range.
+	//By setting the thread prio to 15, you are at the absolute ceiling of the "Dynamic" priority range.
 	// Only "Realtime" processes can go higher (16–31). This ensures that even if your Go app's other threads
 	// (like the one doing logging or tray icon management) get bogged down, the thread handling the mouse hook has a "VIP pass" at the CPU's door.
 
-	//Note that GetCurrentThread also returns a pseudo-handle (usually -2), so it doesn't need to be closed either.
-	currThread, _, err := procGetCurrentThread.Call()
-	if currThread == 0 || currThread != CURRENT_THREAD_PSEUDO_HANDLE {
-		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v", currThread, err)
-	}
+	currThread := getCurrentThread()
 
 	//In Go, the Garbage Collector runs on background threads. If your Process Priority is High (13) but your Hook Thread is Time Critical (15),
 	// the Hook Thread will actually preempt the Go Garbage Collector if they both want the CPU at the same time.
@@ -3817,36 +3813,26 @@ func setAndVerifyPriority() {
 		}
 	}
 
+	//FIXME: so since memprio and i/o prio below aren't set to anything different than normal, maybe don't try to set them at all ie. remove the code doing it!
+
 	// --- Memory Priority (Using Kernel32) ---
 	// this is so we don't get paged out to swap/pagefile
 	var wantedMemPrio uint32 = 5 // 6 is Very High(doesn't work, it fails w/ invalid param!), 5 is the value i saw in process explorer if nothing's setting it at all.
-	// Try these classes in order of preference
-	// 9: ProcessMemoryPriority (Standard Win10+)
-	// 39: ProcessPagePriority (Alternative for certain builds/environments)
-	memClasses := []uint32{PROCESS_MEMORY_PRIORITY}
 
-	//wantedType := PROCESS_MEMORY_PRIORITY
+	wantedType := PROCESS_MEMORY_PRIORITY
 	memPrio := MEMORY_PRIORITY_INFORMATION{MemoryPriority: wantedMemPrio}
 
-	var success bool
-	for _, class := range memClasses { //FIXME: loop not needed anymore IF this works!
-		ntStatus, _, err = procSetProcessInformation.Call(
-			hProc,
-			uintptr(class), // 0
-			uintptr(unsafe.Pointer(&memPrio)),
-			unsafe.Sizeof(memPrio),
-		)
+	ntStatus, _, err = procSetProcessInformation.Call(
+		hProc,
+		uintptr(wantedType), // 0
+		uintptr(unsafe.Pointer(&memPrio)),
+		unsafe.Sizeof(memPrio),
+	)
 
-		if ntStatus != 0 {
-			logf("Memory Priority set to %d where 5 is Normal, (Using Class: %d)", memPrio.MemoryPriority, class)
-			success = true
-			break
-		} else {
-			logf("Failed SetProcessInformation (Memory) to %d (Using Class: %d), err: %v", wantedMemPrio, class, err)
-		}
-	}
-	if !success {
-		logf("Warning: Could not set Memory Priority. All %d classes failed!", len(memClasses))
+	if ntStatus != 0 {
+		logf("Memory Priority set to %d where 5 is Normal", memPrio.MemoryPriority)
+	} else {
+		logf("Failed SetProcessInformation (Memory) to %d, err: %v", wantedMemPrio, err)
 	}
 
 	// --- I/O Priority (Using NTDLL) ---
