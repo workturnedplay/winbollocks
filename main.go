@@ -3177,7 +3177,7 @@ type theILockedMainThreadToken struct{}
 
 var currentExitCode int = 0
 
-func secondary_defer() { //secondary defer, never ran unless primary defer is defective(ie. panics in itself)
+func secondary_defer() { //secondary defer, never runs unless primary defer is defective(ie. panics in itself)
 	var exitcode int
 	// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
 	if r2 := recover(); r2 != nil {
@@ -3193,7 +3193,6 @@ func secondary_defer() { //secondary defer, never ran unless primary defer is de
 }
 
 func primary_defer() { //primary defer
-
 	/*
 		What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
 		recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
@@ -3220,39 +3219,11 @@ func primary_defer() { //primary defer
 		writeHeapProfileOnExit()
 	}
 	// 2. Use your high-quality "clrbuf" waiter
-	//detectConsole() // updated global bool even if logf was never executed(if it was then it updated it already) and if we forgot to put this in an init()
 	// Only pause if we have an actual console window and an error occurred
 
-	// hConsole, _, _ := procGetConsoleWindow.Call()
-	// // 2. If no handle, try to attach to the parent's console
-	// if hConsole == 0 {
-	// 	var (
-	// 		procAttachConsole     = kernel32.NewProc("AttachConsole")
-	// 		ATTACH_PARENT_PROCESS = uintptr(^uint32(0)) // -1
-	// 	)
-	// 	ret, _, _ := procAttachConsole.Call(ATTACH_PARENT_PROCESS)
-	// 	if ret != 0 {
-	// 		hConsole, _, _ = procGetConsoleWindow.Call()
-	// 	}
-	// }
-
 	// // 2. Check if Stdin is actually a terminal (not a pipe/null)
-
-	// these 2 lines fixes things:
-	// stat, err := os.Stdin.Stat()
-	// isTerminal := err == nil && ((stat.Mode() & os.ModeCharDevice) != 0)
-	//these two lines instead, broke all logging by causing a panic here: (uncomment them for testing purposes)
-	// stat, _ := os.Stdin.Stat()
-	// isTerminal := (stat.Mode() & os.ModeCharDevice) != 0
-
-	//fixedFIXME: panics in here are silent when build.bat not devbuild.bat was used! not even log file gets them!
-
-	//if hasConsole || hConsole != 0 || isTerminal || true {
 	if stdinIsConsoleInteractive() {
 		releaseSingleInstance() // don't hog the mutex while waiting for key
-		//logf("s2")
-		//todo()
-		//logf("s3")
 		//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this. Or make it a common library or smth, then vendor it.
 		logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
 		var dummy string
