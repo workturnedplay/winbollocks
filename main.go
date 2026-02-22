@@ -1836,12 +1836,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		} //main 'if', for capturing aka moving/dragging window
 
 		if resizing && currentDrag != nil {
-			nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt)
-			// ---- OVERLAY UPDATE ----
-			startW := currentDrag.startRect.Right - currentDrag.startRect.Left
-			startH := currentDrag.startRect.Bottom - currentDrag.startRect.Top
-			updateOverlay(nx, ny, nw, nh, startW, startH)
-			// ------------------------
+			nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
+
 			// Send to your mover channel
 			moveDataChan <- WindowMoveData{
 				Hwnd:  targetWnd,
@@ -1853,7 +1849,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 			// Trigger the move window
 			procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
-			//return 1 //gemini mistake heh
+			//XXX: let it fall thru so the move isn't eaten.
 		} //second 'if', for resizing
 
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
@@ -2072,6 +2068,16 @@ var mouseCallback uintptr
 
 func handleActualMove(data WindowMoveData) {
 	target := data.Hwnd
+	// if resizing {
+	// 	//actually we could be done resizing and still get resize things or move things from the queue due to delays.
+	// 	//so this is no good to check.
+	// 	if data.Flags&SWP_NOSIZE != 0 {
+	// 		//inconsistent state.
+	// 		panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
+	// 	} else {
+	// 		//it's a resize, consistent.
+	// 	}
+	// }
 	// //FIXME: remove this 'if' later
 	// if (data.W != 0 || data.H != 0) && data.Flags&SWP_NOSIZE == SWP_NOSIZE {
 	// 	//flags |= SWP_NOSIZE
@@ -2096,14 +2102,25 @@ func handleActualMove(data WindowMoveData) {
 		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
 	} else if data.W != 0 || data.H != 0 {
-		// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
-		// We asked the OS to resize it to data.W x data.H. Did it listen?
-		var r RECT
-		procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
-		actualW := r.Right - r.Left
-		actualH := r.Bottom - r.Top
-
 		if currentDrag != nil {
+			if !resizing {
+				logf("delayed resizing detected, while not 'resizing'.")
+			}
+			// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
+			// We asked the OS to resize it to data.W x data.H. Did it listen?
+			var r RECT
+			ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
+			if ret == 0 {
+				// Optional: Get the specific system error
+				errCode, _, _ := procGetLastError.Call()
+				logf("GetWindowRect during resize failed: hwnd=0x%x, errCode=%d, err:%v", target, errCode, err)
+				// Safety: If we can't get the Rect, we can't do Anti-Slide or Overlay updates safely.
+				return
+			}
+			actualW := r.Right - r.Left
+			actualH := r.Bottom - r.Top
+			nx, ny, nw, nh := data.X, data.Y, data.W, data.H
+
 			clamped := false
 			// If actual width is larger than what we requested AND larger than our currently known minimum
 			if actualW > data.W && actualW > currentDrag.knownMinW {
@@ -2121,7 +2138,7 @@ func handleActualMove(data WindowMoveData) {
 				var pt POINT
 				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
 
-				nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, pt)
+				nx, ny, nw, nh = calculateResize(currentDrag, resizeZone, pt)
 
 				// Snap the window back to the correct anchor point
 				procSetWindowPos.Call(
@@ -2132,6 +2149,15 @@ func handleActualMove(data WindowMoveData) {
 					uintptr(data.Flags),
 				)
 			}
+
+			//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
+			//	//lacks SWP_NOSIZE so it's a resize!
+			// ---- OVERLAY UPDATE ----
+			startW := currentDrag.startRect.Right - currentDrag.startRect.Left
+			startH := currentDrag.startRect.Bottom - currentDrag.startRect.Top
+			updateOverlay(nx, ny, nw, nh, startW, startH)
+			//}
+			// ------------------------
 		}
 	} //else
 }
