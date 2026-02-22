@@ -37,9 +37,9 @@ import (
 
 // this init() must be first, order of it in source code matters as they're executed in order of seen.
 func init() {
-	// Force the runtime to provide exactly 2 execution contexts
+	// Force the runtime to provide exactly 3 execution contexts: logWorker, main msg loop (wndProc), and hooks!
 	// regardless of what the user set in their Environment Variables.
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(3)
 	/*
 			While you can technically call it in main(), putting it in init() ensures the scheduler is reconfigured before any other code
 			(including third-party library init functions) has a chance to start spawning background goroutines.
@@ -202,9 +202,9 @@ var (
 
 	procAttachThreadInput = user32.NewProc("AttachThreadInput")
 
-	procPostMessage = user32.NewProc("PostMessageW")
+	procPostMessage       = user32.NewProc("PostMessageW")
+	procPostThreadMessage = user32.NewProc("PostThreadMessageW")
 
-	//procGetDesktopWindow = user32.NewProc("GetDesktopWindow")
 	procGetLastError = kernel32.NewProc("GetLastError")
 
 	procSendInput = user32.NewProc("SendInput")
@@ -1020,7 +1020,7 @@ func initTray() error {
 		return fmt.Errorf("failed to create message window: %w", err)
 	}
 
-	trayIcon.HWnd = hwnd
+	trayIcon.HWnd = hwnd //FIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
 	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
@@ -1051,27 +1051,40 @@ func initTray() error {
 	return nil
 }
 
+const WM_DESTROY = 0x0002
+
+/* The WM_DESTROY Breakdown
+   Constant Value: 0x0002
+
+   What triggers it: It is sent by the system to a window after the window has been removed from the screen, but before the child windows are destroyed.
+   Specifically, calling procDestroyWindow.Call(hwnd) is what triggers the WM_DESTROY message to be sent to that hwnd's wndProc.
+
+   The Flow: User clicks Exit (or Hook panics) → WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage().
+*/
+
 func cleanupTray() {
 	if trayIcon.HWnd == 0 {
 		// Never initialized or window creation failed — nothing to clean
 		return
 	}
-	// Optional: Destroy the message-only window first (good hygiene)
 
-	ret, _, err := procDestroyWindow.Call(uintptr(trayIcon.HWnd))
-	if ret == 0 {
-		logf("DestroyWindow failed: %v (probably already destroyed or invalid)", err)
-	}
-
+	savedHwnd := trayIcon.HWnd
 	// Use the same trayIcon struct from initTray
 	trayIcon.UFlags = 0 // NIM_DELETE ignores most fields, but set to be safe
-	ret, _, err = procShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&trayIcon)))
+	ret, _, err := procShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&trayIcon)))
 	//ret is non-zero (success), but err can still be set
 	if ret == 0 {
 		logf("Failed to delete tray icon: %v", err) // optional, for debug
+	} else {
+		// Zero out the struct to avoid reuse confusion
+		trayIcon = NOTIFYICONDATA{}
 	}
-	// Optional: zero out the struct to avoid reuse confusion
-	trayIcon = NOTIFYICONDATA{}
+
+	//yeah this has to be after NIM_DELETE, according to Gemini 3 Thinking
+	ret, _, err = procDestroyWindow.Call(uintptr(savedHwnd))
+	if ret == 0 {
+		logf("DestroyWindow failed of HWND=0x%X: %v (probably already destroyed or invalid)", savedHwnd, err)
+	}
 }
 
 func showTrayInfo(title, msg string) {
@@ -1165,7 +1178,7 @@ func hardReset() {
 }
 
 func initOverlay() {
-	className := mustUTF16("winbollocksOverlay")
+	className := mustUTF16("winbollocksResizingOverlay") //TODO: see if underscores work in this!
 
 	var wc WNDCLASSEX
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
@@ -1289,9 +1302,11 @@ func updateOverlay(x, y, w, h int32, startW, startH int32) {
 	user32.NewProc("InvalidateRect").Call(uintptr(overlayHwnd), 0, 1)
 }
 
+const SW_HIDE = 0
+
 func hideOverlay() {
 	if overlayHwnd != 0 {
-		procShowWindow.Call(uintptr(overlayHwnd), 0) // SW_HIDE
+		procShowWindow.Call(uintptr(overlayHwnd), SW_HIDE)
 	}
 }
 
@@ -1812,6 +1827,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// Now we ring the "Doorbell" to wake up the Main Thread.
 					// PostThreadMessage is an asynchronous "fire and forget" call.
 					//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
 					r, _, err := procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
 					if r == 0 {
 						logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", err)
@@ -2016,6 +2032,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 /* ---------------- Main ---------------- */
 
 func createMessageWindow() (windows.Handle, error) {
+	if curThreadID := windows.GetCurrentThreadId(); mainThreadID != curThreadID {
+		exitf(1, "unexpected: main loop thread and wndProc are on different threads mainThreadID: %d, curThreadID: %d", mainThreadID, curThreadID)
+	}
 	className, err := windows.UTF16PtrFromString("winbollocksHidden")
 	if err != nil {
 		return 0, fmt.Errorf("UTF16PtrFromString failed for class name: %w", err)
@@ -2053,6 +2072,145 @@ func createMessageWindow() (windows.Handle, error) {
 	}
 
 	return windows.Handle(hwndRaw), nil
+}
+
+var (
+	hookThreadId, mainThreadID uint32
+	// Optional: prepare a mutex for later when we secure 'currentDrag'
+	// dragStateMutex sync.RWMutex
+)
+var hookPanicPayload atomic.Value // We use atomic for thread-safety
+var mainAcknowledgedShutdown = make(chan struct{})
+
+func hookWorker() {
+	// 1. Lock this goroutine to a single, dedicated OS thread. Crucial!
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Run this last to catch any secondary panics
+	defer secondary_defer() //this runs second but only if first doesn't os.exit ie. it fails/panics!
+	//defer primary_defer() //this runs first, can't run this here due to needing to be on same thread as main to deinit other things!
+	// defer time.Sleep(2 * time.Second)
+	// defer procPostQuitMessage.Call(0) //FIXME: no effect even with 2 sec delay after it!
+
+	// The Cross-Thread Panic Bridge
+	defer func() {
+		if r := recover(); r != nil {
+			// 1. Store the panic payload so main can read it
+			hookPanicPayload.Store(r)
+
+			if status, ok := r.(exitStatus); ok {
+				currentExitCode = status.Code
+				// This was an intentional exit(code)
+				//if code != 0 {
+				logf("hookWorker thread intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
+				//}
+			} else {
+				currentExitCode = 1 //FIXME: this is accessed from two diff. threads, protect it.
+				stack := debug.Stack()
+				logf("--- hookWorker thread CRASH: %v ---\nStack: %s\n--- END---", r, stack)
+			}
+			logf("CRITICAL: from hookWorker, signaling main thread to die...")
+
+			// 2. Nuke the main thread's GetMessage loop, works only if systray popup menu isn't open!
+			// Use PostThreadMessage to mainThreadId, or post WM_CLOSE to your main HWND
+			procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0)
+			//doneFIXME: what if main is dead too, and would ignore the signal or what, then we exit here? sure after X seconds
+
+			if trayIcon.HWnd != 0 {
+				// Post to the Window Handle, NOT the Thread ID.
+				// This cuts through modal menus like the systray popup menu!
+				procPostMessage.Call(uintptr(trayIcon.HWnd), WM_CLOSE, 0, 0)
+			}
+			/* When you right-click your tray icon and the menu appears, the code is stuck inside the TrackPopupMenu Win32 call.
+				That function runs its own private message loop.
+			   The Problem: It looks for mouse clicks and keyboard hits. If it sees a message with HWND == NULL (which is what PostThreadMessage creates),
+			   it often just throws it away. Your main loop never gets to see it.
+			*/
+
+			const waitForMainSeconds = 2
+			// 2. The Watchdog Timer
+			select {
+			case <-mainAcknowledgedShutdown:
+				//logf("Main acknowledged panic. Handing over control...")
+				logf("hookWorker is now waiting %d seconds for main to exit us...", waitForMainSeconds)
+				// We wait here forever. Why? Because we want the main thread's
+				// deinit() to be the one that finishes and potentially waits for
+				// the user's "Press a key or Enter" keypress.
+				select {}
+
+			case <-time.After(waitForMainSeconds * time.Second):
+				//logf("Main thread UNRESPONSIVE after 2s. Emergency exit.")
+				logf("hookWorker done waiting for main to die, proceeding to secondary_defer which exits...")
+				// Main is frozen. If we don't exit now, the app hangs forever.
+				//we let it continue which means it calls secondary_defer() next!
+			}
+		} //if recover
+		logf("hookWorker clean exit (but not quitting thread)")
+		select {} //infinite wait, or else secondary_defer() will trigger, FIXME: find a better way to not os.Exit and still exit this thread. liek tell secondary_defer to not os.Exit via a global bool?!
+	}() // defer
+
+	// 2. Save the OS Thread ID so our main thread can talk to it later
+	hookThreadId = windows.GetCurrentThreadId()
+	if mainThreadID == hookThreadId { //FIXME: temp, should be == here!
+		exitf(1, "main loop msg and hooks are NOT on two different threads, this will never happen unless code logic is broken!")
+	}
+	logf("Hook worker thread started. ThreadID: %d", hookThreadId)
+
+	setAndVerifyPriority()
+
+	// 3. INSTALL HOOKS HERE
+	mouseCallback = windows.NewCallback(mouseProc)
+	h, _, err := procSetWindowsHookEx.Call(WH_MOUSE_LL, mouseCallback, 0, 0)
+	if h == 0 {
+		exitf(1, "Got error: %v", err)
+		unreachable()
+	} else {
+		mouseHook = windows.Handle(h)
+		defer func() {
+			procUnhookWindowsHookEx.Call(uintptr(mouseHook))
+			mouseHook = 0
+			logf("unhooked mouseHook")
+		}()
+	}
+
+	kbdCB := windows.NewCallback(keyboardProc)
+	hk, _, err := procSetWindowsHookEx.Call(
+		WH_KEYBOARD_LL,
+		kbdCB,
+		0,
+		0,
+	)
+	if hk == 0 {
+		exitf(1, "Got error: %v", err)
+		unreachable()
+	} else {
+		kbdHook = windows.Handle(hk)
+		defer func() {
+			procUnhookWindowsHookEx.Call(uintptr(kbdHook))
+			kbdHook = 0
+			logf("unhooked kbdHook")
+		}()
+	}
+
+	// 4. The Thread's Private Message Loop
+	var msg MSG
+	for {
+		ret, _, _ := procGetMessage.Call(
+			uintptr(unsafe.Pointer(&msg)),
+			0, 0, 0,
+		)
+
+		// ret == 0 means WM_QUIT was received. ret == -1 aka ^uintptr(0) is an error.
+		if ret == 0 || ret == ^uintptr(0) {
+			break
+		}
+
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+
+	logf("Hook worker thread received WM_QUIT or error, exiting and unhooking...")
 }
 
 func mustUTF16(s string) *uint16 {
@@ -2352,9 +2510,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		} // fi RMB context menu
 		return 0
 
-	case WM_CLOSE: //case 0x0010: // WM_CLOSE
-		//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
-		exit(0)
+	case WM_CLOSE:
+		//exit(0)
+		//WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage() -> getmessage() -> break loop -> outside of loop continuation...
+		procDestroyWindow.Call(uintptr(hwnd))
+		return 0
+	case WM_DESTROY:
+		procPostQuitMessage.Call(0)
+		return 0
 	case WM_EXIT_VIA_CTRL_C:
 		var ctrlType uint32 = uint32(wParam)
 		switch ctrlType {
@@ -2380,15 +2543,28 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	return ret
 })
 
+const WM_QUIT = 0x0012
+
 func deinit() {
+	deinitThreadId := windows.GetCurrentThreadId()
 	hardReset()
-	if mouseHook != 0 {
-		procUnhookWindowsHookEx.Call(uintptr(mouseHook))
-		mouseHook = 0
+	if hookThreadId != 0 {
+		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
+		procPostThreadMessage.Call(uintptr(hookThreadId), WM_QUIT, 0, 0)
 	}
-	if kbdHook != 0 {
-		procUnhookWindowsHookEx.Call(uintptr(kbdHook))
-		kbdHook = 0
+	if deinitThreadId == hookThreadId {
+		//XXX:The rule is: The thread that calls SetWindowsHookEx MUST be the thread that calls UnhookWindowsHookEx.
+		//noFIXME: won't the above run the below as defer-ers and thus race ? actually can I even unhook those from this diff. thread?! it won't because those are in defer-ers too, so deferers are serialized.
+		if mouseHook != 0 {
+			procUnhookWindowsHookEx.Call(uintptr(mouseHook))
+			mouseHook = 0
+			logf("cleaned mouseHook from deinit()")
+		}
+		if kbdHook != 0 {
+			procUnhookWindowsHookEx.Call(uintptr(kbdHook))
+			kbdHook = 0
+			logf("cleaned kbdHook from deinit()")
+		}
 	}
 
 	cleanupTray()
@@ -2414,7 +2590,19 @@ func deinit() {
 
 	//This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
 	procPostQuitMessage.Call(0)
-	//however, we are in the same thread that executes that loop so the chances are 0 that we get back to it and more likely that we'll os.Exit
+	/*
+		PostThreadMessage(id, WM_QUIT, ...) literally pushes a message into the queue.
+
+		PostQuitMessage(0) doesn't actually "post" a message immediately. It sets a internal "quit" flag in the thread's message queue.
+		The next time your GetMessage loop looks for work and finds no other messages, it "synthesizes" a WM_QUIT message on the fly.
+	*/
+	//however, we used to be singlethreaded and then we were in the same thread that executes that loop so the chances are 0 that we get back to it and more likely that we'll os.Exit
+	//but now, hmm... well we're in deinit() of the same thread so it's same thing, heh.
+	if winEventHook != 0 {
+		logf("cleaned winEventHook from deinit()")
+		procUnhookWinEvent.Call(uintptr(winEventHook))
+		winEventHook = 0
+	}
 }
 
 // type exitCode int // Custom type so recover knows it's an intentional exit
@@ -3130,6 +3318,8 @@ func writeHeapProfileOnExit() {
 }
 
 func logWorker() {
+	//TODO: find out what happens if a panic or exitf() happens inside this logWorker which is running in a goroutine thus not subject to those 2 deferers we made for nice clean exit!
+
 	// This runs on Thread B.
 	// even If fmt.Fprint blocks for 10 seconds here, Thread A (your mouse hook)
 	// keeps spinning at 100% speed on its own CPU core.
@@ -3203,7 +3393,9 @@ type theILockedMainThreadToken struct{}
 
 var currentExitCode int = 0
 
-func secondary_defer() { //secondary defer, never runs unless primary defer is defective(ie. panics in itself)
+// graceful exit if primary_defer() failed!
+// secondary defer, never runs unless primary defer is defective(ie. panics in itself)
+func secondary_defer() {
 	var exitcode int
 	// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
 	if r2 := recover(); r2 != nil {
@@ -3218,7 +3410,17 @@ func secondary_defer() { //secondary defer, never runs unless primary defer is d
 	os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
 }
 
+// a placeholder for graceful exit
 func primary_defer() { //primary defer
+	// SIGNAL THE WATCHDOG:
+	// Closing this channel releases the hookWorker from its 2s timer.
+	select {
+	case <-mainAcknowledgedShutdown:
+		// already closed
+	default:
+		close(mainAcknowledgedShutdown)
+	}
+
 	/*
 		What does recover() do? If your code has a panic (like a nil pointer dereference), the program usually crashes and closes the window immediately.
 		recover() catches that panic, stops the "dying" process, and lets you print the error and pause before exiting.
@@ -3317,14 +3519,12 @@ func main() {
 	}
 	logf("GOMAXPROCS is set to: %d instead of the default-if-unset %s or wtw value was set in your env. var (if any)", runtime.GOMAXPROCS(0), withCommas(uint64(cpus)))
 
-	setAndVerifyPriority()
-
 	// 3. Your logic (Task 1: don't use log.Fatal inside here!)
 	if err := runApplication(token); err != nil {
 		exitf(2, "Error: %v\n", err)
 	}
-	logf("Went past runApplication main's end.")
-}
+	logf("Went past runApplication, now at  main()'s end.")
+} //main
 
 func getConsoleWindow() (windows.HWND, error) {
 	r1, _, err := procGetConsoleWindow.Call()
@@ -3420,35 +3620,14 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
-	//cb := windows.NewCallback(mouseProc)
-	mouseCallback = windows.NewCallback(mouseProc)
-	h, _, err := procSetWindowsHookEx.Call(WH_MOUSE_LL, mouseCallback, 0, 0)
-	if h == 0 {
-		//return
-		//logf("Got error: %v", err) // has no console!
-		//os.Exit(1)
-		// exit(1)
-		// exitErrorf()
-		return fmt.Errorf("Got error: %v", err)
-	} else {
-		mouseHook = windows.Handle(h)
-		defer procUnhookWindowsHookEx.Call(uintptr(mouseHook))
+	mainThreadID = windows.GetCurrentThreadId()
+	logf("main loop thread started. ThreadID: %d", mainThreadID)
+
+	if err := initTray(); err != nil {
+		exitf(1, "Failed to init tray: %v", err)
 	}
 
-	kbdCB := windows.NewCallback(keyboardProc)
-	hk, _, err := procSetWindowsHookEx.Call(
-		WH_KEYBOARD_LL,
-		kbdCB,
-		0,
-		0,
-	)
-	if hk == 0 {
-		//logf("Got error: %v", err) // has no console!
-		return fmt.Errorf("Got error: %v", err)
-	} else {
-		kbdHook = windows.Handle(hk)
-		defer procUnhookWindowsHookEx.Call(uintptr(kbdHook))
-	}
+	go hookWorker()
 
 	// shellH, _, err := procSetWindowsHookEx.Call(
 	// 	5, // WH_SHELL
@@ -3463,8 +3642,8 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	// 	logf("WH_SHELL hook failed: %v", err)
 	// }
 
-	// Global foreground change hook, this is the WH_SHELL hook, changed tho to accomodate needs.
-	h, _, err = procSetWinEventHook.Call(
+	// Global foreground change hook, this is the WH_SHELL hook, changed tho to accommodate needs.
+	h, _, err := procSetWinEventHook.Call(
 		0x0003, // EVENT_SYSTEM_FOREGROUND min
 		//0x0003, // max
 		0x8005, // EVENT_OBJECT_FOCUS (Catch lower-level focus shifts)
@@ -3478,15 +3657,17 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		logf("SetWinEventHook failed: %v", err)
 	} else {
 		winEventHook = windows.Handle(h)
-		defer procUnhookWinEvent.Call(uintptr(winEventHook))
+		defer func() {
+			procUnhookWinEvent.Call(uintptr(winEventHook))
+			winEventHook = 0
+			logf("normal unhooking of winEventHook, from main thread")
+		}()
 	}
 
-	initTray()
 	initOverlay()
 
 	//You should call lockRAM() at the very end of your initialization sequence, but before you enter the main message loop (GetMessage).
 	lockRAM()
-
 	var msg MSG
 	for {
 		/* GetMessage is the "Event-Driven" king.
@@ -3497,7 +3678,8 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		*/
 		r, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
 		if int32(r) <= 0 {
-			break
+			//WM_QUIT	0x0012	(Not handled in wndProc) This causes GetMessage to return 0.
+			break // Loop breaks because hookWorker sent WM_QUIT, or we did WM_CLOSE or WM_DESTROY on main window which eventually triggered a WM_QUIT !
 		}
 		/*
 					Why Hooks don't need Dispatch
@@ -3517,6 +3699,16 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		// This ensures your wndProc gets called!
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+
+	// THE LOOP EXITED. Why? Let's check if the hook thread crashed.
+	if p := hookPanicPayload.Load(); p != nil {
+		logf("main loop exited because hookThread panic'd")
+		// Re-throw the exact same panic on the MAIN thread.
+		// This will naturally trigger main's primary_defer()!
+		panic(p)
+	} else {
+		logf("main loop exited normally")
 	}
 	return nil // no error
 }
