@@ -2237,9 +2237,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			logf("popping tray menu")
 			hMenu, _, _ := procCreatePopupMenu.Call()
 
-			focusText := mustUTF16("Focus(activate) window on move(uses thread-attaching variant) if not already focused")
-			doLMBClick2FocusAsFallbackText := mustUTF16("If the above focus method fails send LMB click to focus(can click buttons if u start drag from one!)")
-			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU)")
+			focusText := mustUTF16("Activate window when moved if not in focus (uses thread-attaching focus method).")
+			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
+			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 
 			exitText := mustUTF16("Exit")
@@ -3899,9 +3899,10 @@ func getWindowText(hwnd windows.Handle) string {
 	return windows.UTF16ToString(buf)
 }
 
+const TH32CS_SNAPPROCESS = 0x00000002
+
 func getProcessName(pid uint32) string {
-	// TH32CS_SNAPPROCESS = 0x00000002
-	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(0x00000002, 0)
+	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(TH32CS_SNAPPROCESS, 0)
 	if snapshot == uintptr(windows.InvalidHandle) {
 		return "unknown"
 	}
