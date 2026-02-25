@@ -39,7 +39,7 @@ import (
 func init() {
 	// Force the runtime to provide exactly 3 execution contexts: logWorker, main msg loop (wndProc), and hooks!
 	// regardless of what the user set in their Environment Variables.
-	runtime.GOMAXPROCS(3)
+	//runtime.GOMAXPROCS(3) //FIXME: so, don't do this at all, ie. remove this!
 	/*
 			While you can technically call it in main(), putting it in init() ensures the scheduler is reconfigured before any other code
 			(including third-party library init functions) has a chance to start spawning background goroutines.
@@ -3220,7 +3220,11 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 func init() {
 	//defaults:
 	focusOnDrag = true
-	doLMBClick2FocusAsFallback = false
+
+	//XXX: needed for cmd.exe running as Admin(because thread-attaching focus method fails!), not needed for task manager (thread-attaching method works!)
+	//also needed for focusing a target window while start menu is open already, because thread-attaching focus method fails.
+	doLMBClick2FocusAsFallback = true
+
 	ratelimitOnMove = false
 	shouldLogDragRate = false
 
