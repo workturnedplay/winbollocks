@@ -2720,7 +2720,7 @@ var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
 var (
 	logFile *os.File
 	//hasConsole bool
-	useStderr bool // true if os.Stderr is valid/writable
+	canUseConsoleStderr bool // true if os.Stderr is valid/writable and is on console, not on file!
 	//consoleChecked bool
 )
 
@@ -2736,7 +2736,7 @@ var (
 //		consoleChecked = true
 //	}
 func init() {
-	useStderr = false
+	canUseConsoleStderr = false
 
 	// //detectConsole()
 	// h := windows.Handle(os.Stderr.Fd())
@@ -2753,11 +2753,11 @@ func init() {
 	if err != nil {
 		return
 	}
-	useStderr = (n != windows.INVALID_FILE_ATTRIBUTES) // basic validity
+	canUseConsoleStderr = (n != windows.INVALID_FILE_ATTRIBUTES) // basic validity
 	// Optional: Test writability
-	if useStderr {
+	if canUseConsoleStderr {
 		_, writeErr := os.Stderr.WriteString("") // zero-write test
-		useStderr = writeErr == nil
+		canUseConsoleStderr = writeErr == nil
 	}
 }
 
@@ -3448,7 +3448,7 @@ func directLoggerf(format string, args ...any) {
 // never call this directly, instead call directLoggerf()
 func internalLogger(finalMsg string) {
 	//detectConsole()
-	if useStderr {
+	if canUseConsoleStderr {
 		// --- START TIMING ---
 		startPrint := time.Now()
 		//fmt.Fprintf(os.Stderr, "[%s] %s\n", timestamp, s)
