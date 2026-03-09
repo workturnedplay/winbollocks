@@ -1,4 +1,5 @@
 @echo off
+set "bang=^!"
 setlocal enabledelayedexpansion
 :: Yes. Since you have setlocal enabledelayedexpansion at the top, using !VAR! is the "gold standard" for making your script refactor-proof.
 ::In Batch, %VAR% is expanded when a command (or a block of commands inside parentheses) is read, while !VAR! is expanded when the command is executed.
@@ -9,6 +10,23 @@ set "OLD_GTC=!GOTOOLCHAIN!"
 set "GOTOOLCHAIN=local"
 set "INSTALLED_VER="
 set "PROJECT_VER="
+:: 0. Capture Workspace State
+:: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
+set "WS_PATH="
+for /f "tokens=*" %%w in ('go env GOWORK') do set "WS_PATH=%%w"
+
+:: If WS_PATH is "off" or empty, we aren't in a workspace.
+:: Otherwise, WS_PATH contains the full path to your go.work file.
+if NOT "!WS_PATH!"=="off" if NOT "!WS_PATH!"=="" (
+    set "HAS_WORKSPACE=1"
+    :: Extract the directory from the full file path
+    echo Detected Workspace: !WS_PATH!
+) else (
+    set "HAS_WORKSPACE=0"
+)
+
+:: Now you can safely disable GOWORK for the rest of the script
+set "GOWORK=off"
 
 for /f "tokens=3" %%v in ('go version') do (
     set "INSTALLED_VER=%%v"
@@ -31,7 +49,7 @@ if !errorlevel! neq 0 (set "stage=Installed Version Validation" & goto :failed)
 set "PROJECT_VER="
 if exist go.mod (
     for /f "tokens=2" %%v in ('findstr /b "go " go.mod') do (
-				::By default, FOR /F treats spaces and tabs as delimiters and collapses them. This means the variable %%v is usually "pre-trimmed" of horizontal whitespace before it even touches your set command.
+        ::By default, FOR /F treats spaces and tabs as delimiters and collapses them. This means the variable %%v is usually "pre-trimmed" of horizontal whitespace before it even touches your set command.
         set "PROJECT_VER=%%v"
     )
 )
@@ -67,11 +85,43 @@ if "!COMPARE_RESULT!"=="0" (
     if !errorlevel! equ 0 (
         echo [!] WARNING: go.mod wants !PROJECT_VER!, but you only have !INSTALLED_VER!.
         echo [!] Go will attempt to download the toolchain now...
-				go version
-				if !errorlevel! neq 0 (set "stage=Go version self-updating from the internet" & goto :failed)
+        go version
+        if !errorlevel! neq 0 (set "stage=Go version self-updating from the internet" & goto :failed)
     ) else (
         echo [0/4] Versions match. Skipping bump.
     )
+)
+
+:: 4.5 Robustly update go.work in the parent directory
+:: 4.5 Update go.work only if we found one
+if "!HAS_WORKSPACE!"=="1" (
+  if exist "!WS_PATH!" (
+      set "WORK_VER="
+      :: Find the line starting with "go " in the parent go.work
+      for /f "tokens=2" %%v in ('findstr /b "go " "!WS_PATH!"') do set "WORK_VER=%%v"
+
+      if "!WORK_VER!"=="" (
+          echo [!] WARNING: go.work found but no 'go' version line detected. Skipping.
+      ) else (
+          :: Validate the version string found in go.work
+          set "CHECK_TARGET=!WORK_VER!"
+          call :ValidateVersion
+          if !errorlevel! neq 0 (set "stage=go.work Version Validation" & goto :failed)
+
+          :: Compare: Is Installed > go.work?
+          powershell -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!WORK_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
+          
+          if !errorlevel! equ 0 (
+              echo [0.5/4] Bumping parent go.work from !WORK_VER! to !INSTALLED_VER! in file !WS_PATH!
+              go work edit -go=!INSTALLED_VER! "!WS_PATH!"
+              if !errorlevel! neq 0 (set "stage=go.work Version Bump execution" & goto :failed)
+          ) else (
+              echo [0.5/4] Workspace version !WORK_VER! is already up to date.
+          )
+      )
+  ) else (
+    echo "%bang%%bang%%bang% Has GO workspace but the path doesn't exist: !WS_PATH!"
+  )
 )
 
 :: 5. Update and Sync (Standard workflow)
@@ -121,7 +171,7 @@ powershell -command "if ('!V_RAW!' -match '^[0-9.]+$') { exit 0 } else { exit 1 
 
 if !errorlevel! neq 0 (
     ::echo ERROR: Version "!CHECK_TARGET!" (Cleaned: "!V_RAW!") contains illegal characters.
-		echo ERROR: Version !CHECK_TARGET! is invalid.
+    echo ERROR: Version !CHECK_TARGET! is invalid.
     echo Cleaned string was: !V_RAW!
     exit /b 1
 )
