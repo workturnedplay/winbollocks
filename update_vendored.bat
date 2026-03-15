@@ -71,7 +71,7 @@ echo Project's minimum Go: !PROJECT_VER!
 :: 3. PROPER COMPARISON using PowerShell's [version] type
 :: This handles 1.26.0 vs 1.5.0 correctly because it compares them as numbers, not strings.
 ::powershell -command "if ([version]'!INSTALLED_VER!' -gt [version]'!PROJECT_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
-powershell -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!PROJECT_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell -NoProfile -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!PROJECT_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
 ::powershell -command "$v1 = '!PROJECT_VER!'.Split('-')[0]; $v2 = '!INSTALLED_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
 set "COMPARE_RESULT=!errorlevel!"
 
@@ -81,7 +81,7 @@ if "!COMPARE_RESULT!"=="0" (
     if !errorlevel! neq 0 (set "stage=Go Version Bump" & goto :failed)
 ) else (
     :: Check if Project > Installed (The "Future Version" problem)
-    powershell -command "if ([version]'!PROJECT_VER!' -gt [version]'!INSTALLED_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
+    powershell -NoProfile -command "if ([version]'!PROJECT_VER!' -gt [version]'!INSTALLED_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
     if !errorlevel! equ 0 (
         echo [!] WARNING: go.mod wants !PROJECT_VER!, but you only have !INSTALLED_VER!.
         echo [!] Go will attempt to download the toolchain now...
@@ -109,7 +109,7 @@ if "!HAS_WORKSPACE!"=="1" (
           if !errorlevel! neq 0 (set "stage=go.work Version Validation" & goto :failed)
 
           :: Compare: Is Installed > go.work?
-          powershell -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!WORK_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
+          powershell -NoProfile -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!WORK_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
           
           if !errorlevel! equ 0 (
               echo [0.5/4] Bumping parent go.work from !WORK_VER! to !INSTALLED_VER! in file !WS_PATH!
@@ -167,7 +167,7 @@ set "V_RAW=!V_RAW: =!"
 
 :: 3. PowerShell Regex Validation
 :: This checks if the REMAINING string is ONLY digits and dots.
-powershell -command "if ('!V_RAW!' -match '^[0-9.]+$') { exit 0 } else { exit 1 }" >nul 2>&1
+powershell -NoProfile -command "if ('!V_RAW!' -match '^[0-9.]+$') { exit 0 } else { exit 1 }" >nul 2>&1
 
 if !errorlevel! neq 0 (
     ::echo ERROR: Version "!CHECK_TARGET!" (Cleaned: "!V_RAW!") contains illegal characters.

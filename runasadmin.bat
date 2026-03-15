@@ -48,7 +48,7 @@ echo Running %cmd%
 echo Requesting elevation for %cmd%... (spawns in new cmd.exe window, doesn't wait for it here)
 rem %cmd%
 ::powershell -Command "Start-Process cmd -ArgumentList '/k \"\"%cmd%\"\"' -Verb RunAs"
-powershell -Command "Start-Process -FilePath '%cmd%' -WorkingDirectory '%~dp0' -Verb RunAs"
+powershell -NoProfile -Command "Start-Process -FilePath '%cmd%' -WorkingDirectory '%~dp0' -Verb RunAs"
 :: Disable QuickEdit mode for this console session, didn't work! done it in Go code then!
 ::powershell -NoProfile -Command "$st=(Get-ItemProperty 'HKCU:\Console').QuickEdit; Set-ItemProperty 'HKCU:\Console' 'QuickEdit' 0; start-process '%cmd%' -WorkingDirectory '%~dp0' -verb runas; Set-ItemProperty 'HKCU:\Console' 'QuickEdit' $st; exit"
 set "ec=%ERRORLEVEL%"
