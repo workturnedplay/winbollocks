@@ -2231,8 +2231,8 @@ func hookWorker() {
 	hk, _, err := procSetWindowsHookEx.Call(
 		WH_KEYBOARD_LL,
 		kbdCB,
-		0,
-		0,
+		0, // hMod = 0 for low-level
+		0, // dwThreadId = 0 = global
 	)
 	if hk == 0 {
 		exitf(1, "Got error: %v", err)
@@ -2249,21 +2249,21 @@ func hookWorker() {
 	// 4. The Thread's Private Message Loop
 	var msg MSG
 	for {
-		ret, _, _ := procGetMessage.Call(
+		ret, _, _ := procGetMessage.Call( // GetMessage here calls the hook(s)
 			uintptr(unsafe.Pointer(&msg)),
 			0, 0, 0,
 		)
 
+		const minus1 = ^uintptr(0)
 		// ret == 0 means WM_QUIT was received. ret == -1 aka ^uintptr(0) is an error.
-		if ret == 0 || ret == ^uintptr(0) {
+		if ret == 0 || ret == minus1 {
+			logf("Hook worker thread received WM_QUIT(==0) or error(==%d) ret=%d, exiting and unhooking...", minus1, ret)
 			break
 		}
 
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
 		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
 	}
-
-	logf("Hook worker thread received WM_QUIT or error, exiting and unhooking...")
 }
 
 func mustUTF16(s string) *uint16 {
@@ -3679,7 +3679,8 @@ type exitStatus struct {
 }
 
 // exitf allows you to provide a code and a formatted message
-// the hind below has no apparent effect or i didn't use it in proper context and something else was in effect which made it seems as having no effect!
+//
+// the hint below has no apparent effect or i didn't use it in proper context and something else was in effect which made it seems as having no effect!
 //
 //go:panicnhint
 func exitf(code int, format string, a ...interface{}) {
