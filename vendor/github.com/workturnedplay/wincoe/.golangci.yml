@@ -1,0 +1,123 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  skip-dirs-use-default: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: true
+#  exclude-rules:
+#    - linters: [revive]
+#      text: "ALL_CAPS"
+
+linters:
+  disable-all: true
+  enable:
+    # --- correctness & bugs ---
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - nilerr
+    - nilnil
+    - bodyclose
+    - rowserrcheck
+
+    # --- security / footguns ---
+    - gosec
+    - sqlclosecheck
+
+    # --- error handling & logic ---
+    - errorlint
+    - wrapcheck
+    - exhaustive
+    - copyloopvar
+
+    # --- concurrency ---
+    - gocritic
+    - prealloc
+
+    # --- style (light, not pedantic) ---
+    - revive
+    - misspell
+    - unconvert
+    - whitespace
+
+    # --- unused / dead code ---
+    - unused
+  settings:
+    #gocritic:
+    #  disabled-checks:
+    #    - commentFormatting #found where to place it correctly by Gemini 3 Fast! (yes, really) ie. must be in linters: settings: not linters-settings:
+
+#linters-settings:
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # good to know, rarely worth the churn
+
+    staticcheck:
+      checks:
+        - "all"
+        - "-ST1003" #ST1003: should not use ALL_CAPS in Go names; use CamelCase instead (staticcheck)go-golangci-lint-v2
+        - "-QF1011" #QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
+
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    errorlint:
+      asserts: true
+      comparison: true
+
+    wrapcheck:
+      ignoreSigs:
+        - .Errorf(
+        - errors.New(
+        - fmt.Errorf(
+      ignorePackageGlobs:
+        - net/http
+        - database/sql
+
+    revive:
+      #enable-all-rules: false
+      severity: warning
+      rules:
+        - name: var-naming
+          disabled: true
+        - name: early-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: unexported-return
+        - name: unused-parameter
+        - name: empty-lines
+        - name: var-declaration
+          disabled: true
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        - unnamedResult       # you *intentionally* use named returns
+        - ifElseChain
+        - octalLiteral
+        - hugeParam
+        - commentFormatting #commentFormatting: put a space between `//` and comment text (gocritic)go-golangci-lint-v2
+
+    gosec:
+      severity: medium
+      confidence: medium
+      excludes:
+        - G104  # ignoring errors from deferred Close is often fine
+
+    exhaustive:
+      check-generated: false
+

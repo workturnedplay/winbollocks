@@ -27,12 +27,13 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
-
-	"golang.org/x/sys/windows"
-
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
+
+	"github.com/workturnedplay/wincoe"
 )
 
 // this init() must be first, order of it in source code matters as they're executed in order of seen.
@@ -3550,28 +3551,21 @@ func primary_defer() { //primary defer
 	// Only pause if we have an actual console window and an error occurred
 
 	// // 2. Check if Stdin is actually a terminal (not a pipe/null)
-	if stdinIsConsoleInteractive() {
-		releaseSingleInstance() // don't hog the mutex while waiting for key
+	if wincoe.IsStdinConsoleInteractive() {
+		releaseSingleInstance() // don't hog the mutex while waiting for key, else program exit cleans it.
 		//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this. Or make it a common library or smth, then vendor it.
-		logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
-		var dummy string
-		_, _ = fmt.Scanln(&dummy)
+		// logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
+		// var dummy string
+		// _, _ = fmt.Scanln(&dummy)
+		wincoe.WaitAnyKey()
 	} else {
-		logf("not waiting for keypress")
+		logf("Didn't wait for keypress due to not an interactive/terminal.")
 	}
 
 	//XXX: these should be last:
 	closeAndFlushLog()
 	// 3. exit
 	os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
-}
-
-func stdinIsConsoleInteractive() bool {
-	h := windows.Handle(os.Stdin.Fd())
-
-	var mode uint32
-	err := windows.GetConsoleMode(h, &mode)
-	return err == nil
 }
 
 func main() {
