@@ -1391,8 +1391,7 @@ const (
 )
 
 var procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
-var modkernel32 = windows.NewLazySystemDLL("kernel32.dll")
-var procSetLastError = modkernel32.NewProc("SetLastError")
+var procSetLastError = kernel32.NewProc("SetLastError")
 
 func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	if hwnd == 0 {
@@ -3257,9 +3256,9 @@ func init() {
 }
 
 var (
-	procCreateMutex  = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
-	procReleaseMutex = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReleaseMutex")
-	procCloseHandle  = windows.NewLazySystemDLL("kernel32.dll").NewProc("CloseHandle")
+	procCreateMutex  = kernel32.NewProc("CreateMutexW")
+	procReleaseMutex = kernel32.NewProc("ReleaseMutex")
+	procCloseHandle  = kernel32.NewProc("CloseHandle")
 )
 
 type MutexScope int
