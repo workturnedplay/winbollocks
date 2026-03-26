@@ -3809,7 +3809,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 }
 
 var (
-	psapi                 = windows.NewLazyDLL("psapi.dll")
+	psapi                 = windows.NewLazySystemDLL("psapi.dll")
 	procQueryWorkingSetEx = psapi.NewProc("QueryWorkingSetEx")
 )
 
@@ -3995,7 +3995,7 @@ const CURRENT_PROCESS_PSEUDO_HANDLE = ^uintptr(0) // All bits set to 1
 const CURRENT_THREAD_PSEUDO_HANDLE uintptr = ^uintptr(1)
 
 var (
-	ntdll                       = windows.NewLazyDLL("ntdll.dll")
+	ntdll                       = windows.NewLazySystemDLL("ntdll.dll")
 	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
 )
 
