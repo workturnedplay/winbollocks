@@ -83,5 +83,6 @@ if "!ec!"=="0" (
     echo Started it successfully in a new cmd.exe^(as admin^) window^(which lingers only if it's the devbuild and thus has a console^).
 ) else (
     echo couldn't start it, exited with error code "!ec!"
+    pause
+    exit !ec!
 )
-pause

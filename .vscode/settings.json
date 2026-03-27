@@ -19,8 +19,9 @@
     "diagnosticsDelay": "0s",
     "analyses": {
       "unsafeptr": false,
-      "printf": true
-    },
+      "printf": true,
+      "shadow": true
+    }
   },
   "go.lintFlags": [
   ],
@@ -31,5 +32,5 @@
   "go.showWelcome": false,
   "go.survey.prompt": false,
   "go.toolsManagement.checkForUpdates": "off",
-  "go.trace.server": "verbose",
+  "go.trace.server": "verbose"
 }
