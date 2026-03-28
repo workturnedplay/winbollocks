@@ -21,7 +21,9 @@ import (
 	"errors"
 	"fmt"
 	//"strings"
+	"encoding/binary"
 	"math"
+	"net"
 	"unsafe"
 
 	//"github.com/workturnedplay/wincoe/internal/wincall"
@@ -36,6 +38,7 @@ var (
 	Iphlpapi = windows.NewLazySystemDLL("iphlpapi.dll")
 	//procGetExtendedUdpTable = Iphlpapi.NewProc("GetExtendedUdpTable")
 	callGetExtendedUdpTable = NewBoundProc(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
+	callGetExtendedTcpTable = NewBoundProc(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
 
 	Kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
@@ -159,10 +162,21 @@ func callWithRetry(initialSize uint32, call func(p uintptr, s *uint32) error) ([
 			return buf, nil
 		}
 
-		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		// Windows uses both INSUFFICIENT_BUFFER and MORE_DATA
+		// to signal that we need a bigger boat.
+		//GetExtendedUdpTable usually returns ERROR_INSUFFICIENT_BUFFER when the buffer is too small.
+		//EnumServicesStatusEx (and many Enumeration APIs) returns ERROR_MORE_DATA.
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) &&
+			!errors.Is(err, windows.ERROR_MORE_DATA) {
 			return nil, err
 		}
 		// Loop continues, using the updated 'size' from the failed call
+		//however:
+		// If size didn't increase but we still got an error,
+		// we should nudge it upward to prevent an infinite loop.
+		if size <= uint32(len(buf)) {
+			size += 1024
+		}
 	}
 	return nil, fmt.Errorf("buffer growth exceeded max retries(%d)", MAX_RETRIES)
 }
@@ -214,6 +228,22 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 			boolToUintptr(order),
 			uintptr(family),
 			uintptr(UDP_TABLE_OWNER_PID),
+			0,
+		)
+		return err
+	})
+}
+
+// GetExtendedTCPTable retrieves the system TCP table.
+// It follows the same contract as GetExtendedUDPTable.
+func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
+	return callWithRetry(0, func(p uintptr, s *uint32) error {
+		_, _, err := callGetExtendedTcpTable(
+			p,
+			uintptr(unsafe.Pointer(s)),
+			boolToUintptr(order),
+			uintptr(family),
+			uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
 			0,
 		)
 		return err
@@ -398,4 +428,247 @@ func Process32First(snapshot windows.Handle, entry *windows.ProcessEntry32) erro
 func Process32Next(snapshot windows.Handle, entry *windows.ProcessEntry32) error {
 	_, _, err := callProcess32Next(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
 	return err
+}
+
+// GetServiceNamesFromPID queries the Service Control Manager to find all service
+// names currently associated with a specific Process ID (PID).
+//
+// This function encapsulates:
+//   - opening a remote handle to the SCM with SC_MANAGER_ENUMERATE_SERVICE rights
+//   - utilizing callWithRetry to handle the "snapshot" race condition where the
+//     number of services changes between the size query and the data fetch
+//   - parsing the resulting ENUM_SERVICE_STATUS_PROCESS structure array
+//
+// Returns a slice of service display names associated with the PID. If no
+// services are found for the given PID, it returns (nil, nil).
+//
+// Guarantees:
+//   - returns a non-nil error if SCM access is denied or the RPC call fails
+//   - handles ERROR_INSUFFICIENT_BUFFER internally via the retry loop
+//   - ensures the SCM handle is closed via defer, even on internal retry failure
+//
+// Edge cases handled:
+//   - services starting/stopping mid-enumeration (handled by 10-try retry logic)
+//   - PIDs with zero associated services (returns nil slice, no error)
+//   - stale resume handles (reset to 0 on each retry for a fresh full snapshot)
+//   - race conditions where the service list grows mid-call (handled by treating ERROR_MORE_DATA as a retry signal)
+//
+// Note:
+//   - This performs a full enumeration of all Win32 services to filter by PID;
+//     on systems with hundreds of services, this may involve a ~100KB+ buffer.
+func GetServiceNamesFromPID(targetPID uint32) ([]string, error) {
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_ENUMERATE_SERVICE)
+	if err != nil {
+		return nil, fmt.Errorf("OpenSCManager failed: %w", err)
+	}
+	defer windows.CloseServiceHandle(scm)
+
+	// We'll need these to persist across the closure calls
+	var servicesReturned uint32
+
+	// Use our retry helper to handle the buffer growth logic
+	// We use callWithRetry because the service list is highly volatile.
+	buffer, err := callWithRetry(0, func(p uintptr, s *uint32) error {
+		// Reset these for each attempt to ensure a fresh enumeration if it retries
+		servicesReturned = 0
+		// Note: we usually keep resumeHandle at 0 for a fresh start on each retry
+		// unless we are specifically doing paged enumeration.
+		var currentResumeHandle uint32
+
+		errEnum := windows.EnumServicesStatusEx(
+			scm,
+			windows.SC_ENUM_PROCESS_INFO,
+			windows.SERVICE_WIN32,
+			windows.SERVICE_STATE_ALL,
+			(*byte)(unsafe.Pointer(p)),
+			*s,
+			s, // bytesNeeded
+			&servicesReturned,
+			&currentResumeHandle,
+			nil,
+		)
+		return errEnum
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("EnumServicesStatusEx failed: %w", err)
+	}
+
+	// Parsing logic remains the same, but now it's protected by the retry logic
+	var serviceNames []string
+	entrySize := unsafe.Sizeof(windows.ENUM_SERVICE_STATUS_PROCESS{})
+
+	for i := uint32(0); i < servicesReturned; i++ {
+		offset := uintptr(i) * entrySize
+		data := (*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[offset]))
+
+		if data.ServiceStatusProcess.ProcessId == targetPID {
+			// We use UTF16PtrToString because ServiceName is a *uint16
+			// pointing into the same buffer returned by the API.
+			serviceNames = append(serviceNames, windows.UTF16PtrToString(data.ServiceName))
+		}
+	}
+
+	return serviceNames, nil
+}
+
+// pidAndExeForUDP returns (pid, exePath_or_exeName, error).
+// clientAddr should be the remote UDP address observed on the server side (e.g., 127.0.0.1:49936).
+func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
+	//capital P in PidAndExeForUDP means exported, apparently!
+	if clientAddr == nil {
+		return 0, "", errors.New("nil clientAddr")
+	}
+	ip4 := clientAddr.IP.To4()
+	if ip4 == nil {
+		return 0, "", errors.New("only IPv4 supported")
+	}
+	port := uint16(clientAddr.Port)
+
+	buf, err := GetExtendedUDPTable(false, AF_INET)
+	if err != nil {
+		return 0, "", err
+	}
+
+	if buf == nil {
+		return 0, "", errors.New("GetExtendedUdpTable returned empty buffer which means there were no UDP entries in the table")
+	}
+
+	// Buffer layout: DWORD dwNumEntries; then array of MIB_UDPROW_OWNER_PID entries.
+	if len(buf) < 4 {
+		return 0, "", errors.New("GetExtendedUdpTable returned too small buffer")
+	}
+	num := binary.LittleEndian.Uint32(buf[:4])
+	const rowSize = 12 // MIB_UDPROW_OWNER_PID has 3 DWORDs = 12 bytes
+	offset := 4
+	for i := uint32(0); i < num; i++ {
+		if offset+rowSize > len(buf) {
+			break
+		}
+		localAddr := binary.LittleEndian.Uint32(buf[offset : offset+4])
+		localPortRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
+		owningPid := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
+		offset += rowSize
+
+		// localPortRaw stores port in network byte order in low 16 bits.
+		localPort := uint16(localPortRaw & 0xFFFF)
+		localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8 // convert to host order
+
+		// convert DWORD IP (little-endian) to net.IP
+		ipb := []byte{
+			byte(localAddr & 0xFF),
+			byte((localAddr >> 8) & 0xFF),
+			byte((localAddr >> 16) & 0xFF),
+			byte((localAddr >> 24) & 0xFF),
+		}
+		entryIP := net.IPv4(ipb[0], ipb[1], ipb[2], ipb[3])
+
+		//fmt.Println("Checking:",entryIP,ip4, localPort, port)
+
+		if localPort == port {
+			// treat 0.0.0.0 as wildcard match
+			if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip4) {
+				// found PID
+				exe, err := ExePathFromPID(owningPid)
+				if err != nil {
+					//fmt.Println(err)
+					// got error due to permissions needed for abs. path? this will work but it's just the .exe:
+					//exe, err2 := wincoe.GetProcessName(owningPid) // shadowing is only a warning here, major footgun otherwise.
+
+					var err2 error // Declare err2 so we don't have to use :=
+					exe, err2 = GetProcessName(owningPid)
+
+					if err2 != nil {
+						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", num, clientAddr.String(), err, err2)
+					}
+
+					//_ = exe // enable when trying for shadowing
+				}
+				return owningPid, exe, nil
+			}
+		}
+	}
+
+	return 0, "", fmt.Errorf("pid %d not found for %s", num, clientAddr.String())
+}
+
+// clientAddr should be the remote TCP address observed on the server side (e.g., 127.0.0.1:49936).
+func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
+	if clientAddr == nil {
+		return 0, "", errors.New("nil clientAddr")
+	}
+	ip4 := clientAddr.IP.To4()
+	if ip4 == nil {
+		return 0, "", errors.New("only IPv4 supported")
+	}
+	port := uint16(clientAddr.Port)
+
+	// Fetch the table
+	buf, err := GetExtendedTCPTable(false, AF_INET) //FIXME: do I need here to include the AF_INET6 ?! probably, and for UDP func too!
+	if err != nil {
+		return 0, "", err
+	}
+	if buf == nil {
+		return 0, "", errors.New("GetExtendedTcpTable returned empty buffer")
+	}
+
+	if len(buf) < 4 {
+		return 0, "", errors.New("GetExtendedTcpTable buffer too small for header")
+	}
+
+	num := binary.LittleEndian.Uint32(buf[:4])
+
+	// MIB_TCPROW_OWNER_PID structure:
+	// 0: dwState (4 bytes)
+	// 4: dwLocalAddr (4 bytes)
+	// 8: dwLocalPort (4 bytes)
+	// 12: dwRemoteAddr (4 bytes)
+	// 16: dwRemotePort (4 bytes)
+	// 20: dwOwningPid (4 bytes)
+	const rowSize = 24
+	offset := 4
+
+	for i := uint32(0); i < num; i++ {
+		if offset+rowSize > len(buf) {
+			break
+		}
+
+		// Extract fields based on the 24-byte MIB_TCPROW_OWNER_PID layout
+		localAddrRaw := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
+		localPortRaw := binary.LittleEndian.Uint32(buf[offset+8 : offset+12])
+		owningPid := binary.LittleEndian.Uint32(buf[offset+20 : offset+24])
+
+		// Advance offset for next iteration
+		offset += rowSize
+
+		// Port conversion (Network Byte Order in low 16 bits)
+		localPort := uint16(localPortRaw & 0xFFFF)
+		localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+
+		if localPort == port {
+			// Convert DWORD IP (little-endian) to net.IP
+			entryIP := net.IPv4(
+				byte(localAddrRaw&0xFF),
+				byte((localAddrRaw>>8)&0xFF),
+				byte((localAddrRaw>>16)&0xFF),
+				byte((localAddrRaw>>24)&0xFF),
+			)
+
+			// Match logic (Wildcard 0.0.0.0 or specific IP)
+			if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip4) {
+				exe, err := ExePathFromPID(owningPid)
+				if err != nil {
+					// Fallback to process name if path is inaccessible
+					var err2 error
+					exe, err2 = GetProcessName(owningPid)
+					if err2 != nil {
+						return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err2)
+					}
+				}
+				return owningPid, exe, nil
+			}
+		}
+	}
+
+	return 0, "", fmt.Errorf("no TCP owner found for %s", clientAddr.String())
 }

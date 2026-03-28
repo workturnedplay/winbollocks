@@ -83,9 +83,11 @@ const (
 )
 
 const (
-	AF_INET             = 2
-	AF_INET6            = 23
-	UDP_TABLE_OWNER_PID = 1 // MIB_UDPTABLE_OWNER_PID
+	AF_INET  = 2
+	AF_INET6 = 23
+
+	UDP_TABLE_OWNER_PID     = 1 // MIB_UDPTABLE_OWNER_PID
+	TCP_TABLE_OWNER_PID_ALL = 5
 )
 
 //MaxExtendedPath is the maximum character count supported by the Unicode (W) versions of Windows API functions when using the \\?\ prefix, and it's the limit for QueryFullProcessNameW.
