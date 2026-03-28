@@ -46,11 +46,11 @@ go vet !MOD_FLAG! -unsafeptr=false ./...
 if errorlevel 1 goto :fail
 
 echo Running go build
-go build !MOD_FLAG! .
+go build !MOD_FLAG! ./...
 if errorlevel 1 goto :fail
 
 echo Running go test
-go test !MOD_FLAG! -v
+go test !MOD_FLAG! -v ./...
 if errorlevel 1 goto :fail
 
 echo all succeeded.

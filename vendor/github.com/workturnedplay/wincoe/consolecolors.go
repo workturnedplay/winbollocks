@@ -14,49 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package consolecolors
+package wincoe
 
 import (
 	"errors"
 	"fmt"
-	"github.com/workturnedplay/wincoe/internal/wincall"
+	//"github.com/workturnedplay/wincoe/internal/wincall"
 	"golang.org/x/sys/windows"
 )
 
 var (
-	kernel32                    = windows.NewLazySystemDLL("kernel32.dll")
-	procSetConsoleTextAttribute = wincall.RealProc(kernel32.NewProc("SetConsoleTextAttribute"))
-)
-
-const (
-	// STD_OUTPUT_HANDLE to be used with windows.GetStdHandle(STD_OUTPUT_HANDLE) only!
-	STD_OUTPUT_HANDLE = uint32(-11 & 0xFFFFFFFF) // cast to uint32
-	// STD_ERROR_HANDLE to be used with windows.GetStdHandle(STD_OUTPUT_HANDLE) only!
-	STD_ERROR_HANDLE = uint32(-12 & 0xFFFFFFFF)
-
-	FOREGROUND_RED       uint16 = 0x0004
-	FOREGROUND_GREEN     uint16 = 0x0002
-	FOREGROUND_BLUE      uint16 = 0x0001
-	FOREGROUND_NORMAL    uint16 = 0x0007
-	FOREGROUND_INTENSITY uint16 = 0x0008
-	FOREGROUND_GRAY      uint16 = FOREGROUND_INTENSITY // dark gray / bright black
-
-	// derived colors
-	FOREGROUND_YELLOW        uint16 = FOREGROUND_RED | FOREGROUND_GREEN
-	FOREGROUND_BRIGHT_YELLOW uint16 = FOREGROUND_YELLOW | FOREGROUND_INTENSITY
-
-	FOREGROUND_MAGENTA        uint16 = FOREGROUND_RED | FOREGROUND_BLUE
-	FOREGROUND_BRIGHT_MAGENTA uint16 = FOREGROUND_MAGENTA | FOREGROUND_INTENSITY
-
-	FOREGROUND_CYAN        uint16 = FOREGROUND_GREEN | FOREGROUND_BLUE
-	FOREGROUND_BRIGHT_CYAN uint16 = FOREGROUND_CYAN | FOREGROUND_INTENSITY
-
-	FOREGROUND_WHITE        uint16 = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE
-	FOREGROUND_BRIGHT_WHITE uint16 = FOREGROUND_WHITE | FOREGROUND_INTENSITY
-
-	FOREGROUND_BRIGHT_RED uint16 = FOREGROUND_RED | FOREGROUND_INTENSITY
-
-	FOREGROUND_BRIGHT_GREEN uint16 = FOREGROUND_GREEN | FOREGROUND_INTENSITY
+	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	//procSetConsoleTextAttribute  = wincall.RealProc(kernel32.NewProc("SetConsoleTextAttribute"))
+	//procSetConsoleTextAttribute2 = wincall.BindFunc(wincall.RealProc2(kernel32, "SetConsoleTextAttribute"), wincall.CheckBool)
+	callSetConsoleTextAttribute3 = NewBoundProc(kernel32, "SetConsoleTextAttribute", CheckBool)
 )
 
 // WithConsoleColor temporarily changes text attribute, runs fn, then restores original
@@ -118,10 +89,18 @@ func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
 	// We use CheckBool because the docs say this returns a BOOL.
 	// We pass nil for onFail because we just want to return the error to the caller.
 	// Execute the syscall
+	// //works:
 	// r1, _, callErr := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color))
 	// err := CheckWinResult(CheckBool, r1, callErr)
 
-	_, _, err := wincall.WinCall(procSetConsoleTextAttribute, wincall.CheckBool, uintptr(h), uintptr(color))
+	// //works:
+	// _, _, err := wincall.WinCall(procSetConsoleTextAttribute, wincall.CheckBool, uintptr(h), uintptr(color))
+
+	// //works too:
+	// _, _, err := procSetConsoleTextAttribute2(uintptr(h), uintptr(color))
+
+	//works too:
+	_, _, err := callSetConsoleTextAttribute3(uintptr(h), uintptr(color))
 
 	return err
 }

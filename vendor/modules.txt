@@ -1,9 +1,6 @@
-# github.com/workturnedplay/wincoe v0.0.5
+# github.com/workturnedplay/wincoe v0.0.7
 ## explicit; go 1.26.0
 github.com/workturnedplay/wincoe
-github.com/workturnedplay/wincoe/internal/consolecolors
-github.com/workturnedplay/wincoe/internal/waitanykey
-github.com/workturnedplay/wincoe/internal/wincall
 # golang.org/x/sys v0.42.0
 ## explicit; go 1.25.0
 golang.org/x/sys/plan9

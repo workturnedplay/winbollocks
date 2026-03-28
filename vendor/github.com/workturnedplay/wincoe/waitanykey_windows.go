@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package waitanykey
+package wincoe
 
 import (
 	"fmt"
@@ -129,9 +129,9 @@ type keyEventRecord struct {
 }
 
 var (
-	kernel32              = syscall.NewLazyDLL("kernel32.dll")
-	procReadConsoleInputW = kernel32.NewProc("ReadConsoleInputW")
-	procPeekConsoleInputW = kernel32.NewProc("PeekConsoleInputW")
+	//kernel32              = syscall.NewLazyDLL("kernel32.dll")
+	procReadConsoleInputW = Kernel32.NewProc("ReadConsoleInputW")
+	procPeekConsoleInputW = Kernel32.NewProc("PeekConsoleInputW")
 	//procFlushConsoleInputBuf = kernel32.NewProc("FlushConsoleInputBuffer")
 )
 
