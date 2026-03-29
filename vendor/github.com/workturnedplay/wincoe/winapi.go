@@ -145,19 +145,21 @@ func loadDll(dll *windows.LazyDLL) {
 //
 // Returns the populated byte slice on success, or an error if the API fails
 // for reasons other than buffer size, or if it fails to stabilize after retries.
-func callWithRetry(initialSize uint32, call func(p uintptr, s *uint32) error) ([]byte, error) {
+func callWithRetry(initialSize uint32, call func(bufPtr *byte, s *uint32) error) ([]byte, error) {
 	size := initialSize
 	const MAX_RETRIES = 10
 	for tries := 0; tries < MAX_RETRIES; tries++ {
 		// If size is 0, we're just probing. If > 0, we're allocating.
 		var buf []byte
-		var p uintptr
+		//var p uintptr
+		var ptr *byte
 		if size > 0 {
 			buf = make([]byte, size)
-			p = uintptr(unsafe.Pointer(&buf[0]))
+			//p = uintptr(unsafe.Pointer(&buf[0]))
+			ptr = &buf[0] // Keep it as a real, GC-visible pointer
 		}
 
-		err := call(p, &size)
+		err := call(ptr, &size)
 		if err == nil {
 			return buf, nil
 		}
@@ -174,8 +176,16 @@ func callWithRetry(initialSize uint32, call func(p uintptr, s *uint32) error) ([
 		//however:
 		// If size didn't increase but we still got an error,
 		// we should nudge it upward to prevent an infinite loop.
-		if size <= uint32(len(buf)) {
-			size += 1024
+		// We use uint64 casts to satisfy gosec G115.
+		// 1. Convert both to uint64 to compare safely without narrowing (Fixes G115)
+		if uint64(size) <= uint64(len(buf)) {
+			// 2. Check for overflow before adding 1024
+			const increment = 1024
+			const MaxInt = math.MaxUint32
+			if MaxInt-size < increment {
+				return nil, fmt.Errorf("buffer size(%d) would overflow uint32(%d) if adding %d", size, MaxInt, increment)
+			}
+			size += increment
 		}
 	}
 	return nil, fmt.Errorf("buffer growth exceeded max retries(%d)", MAX_RETRIES)
@@ -221,13 +231,21 @@ func boolToUintptr(b bool) uintptr {
 //   - this function intentionally operates on raw bytes to avoid committing
 //     to a specific struct layout; build a typed parser on top if needed.
 func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
-	return callWithRetry(0, func(p uintptr, s *uint32) error {
+	return callWithRetry(0, func(bufPtr *byte, s *uint32) error {
+		// _, _, err := callGetExtendedUdpTable(
+		// 	uintptr(unsafe.Pointer(bufPtr)),
+		// 	uintptr(unsafe.Pointer(s)),
+		// 	boolToUintptr(order),
+		// 	uintptr(family),
+		// 	uintptr(UDP_TABLE_OWNER_PID),
+		// 	0,
+		// )
 		_, _, err := callGetExtendedUdpTable(
-			p,
-			uintptr(unsafe.Pointer(s)),
-			boolToUintptr(order),
-			uintptr(family),
-			uintptr(UDP_TABLE_OWNER_PID),
+			bufPtr,
+			s,
+			order,
+			family,
+			UDP_TABLE_OWNER_PID,
 			0,
 		)
 		return err
@@ -237,13 +255,21 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 // GetExtendedTCPTable retrieves the system TCP table.
 // It follows the same contract as GetExtendedUDPTable.
 func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
-	return callWithRetry(0, func(p uintptr, s *uint32) error {
+	return callWithRetry(0, func(bufPtr *byte, s *uint32) error {
+		// _, _, err := callGetExtendedTcpTable(
+		// 	uintptr(unsafe.Pointer(bufPtr)),
+		// 	uintptr(unsafe.Pointer(s)),
+		// 	boolToUintptr(order),
+		// 	uintptr(family),
+		// 	uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
+		// 	0,
+		// )
 		_, _, err := callGetExtendedTcpTable(
-			p,
-			uintptr(unsafe.Pointer(s)),
-			boolToUintptr(order),
-			uintptr(family),
-			uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
+			bufPtr,
+			s,
+			order,
+			family,
+			TCP_TABLE_OWNER_PID_ALL, // Value 5: Get all states + PID
 			0,
 		)
 		return err
@@ -284,11 +310,17 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		// Note: QueryFullProcessNameW expects 'size' to include the null terminator
 		// on input, and returns the length WITHOUT the null terminator on success.
 		_, _, err = callQueryFullProcessName(
-			uintptr(h),
+			h,
 			0,
-			uintptr(unsafe.Pointer(&buf[0])),
-			uintptr(unsafe.Pointer(&size)),
+			&buf[0],
+			&size,
 		)
+		// _, _, err = callQueryFullProcessName(
+		// 	uintptr(h),
+		// 	0,
+		// 	uintptr(unsafe.Pointer(&buf[0])),
+		// 	uintptr(unsafe.Pointer(&size)),
+		// )
 
 		if err == nil {
 			// Success! Convert the returned size to string
@@ -401,9 +433,13 @@ func GetProcessName(pid uint32) (string, error) {
 // TH32CS_SNAPPROCESS specifically tells the API to include all processes in the snapshot. Without it, Process32First/Process32Next won’t enumerate any processes.
 func CreateToolhelp32Snapshot(dwFlags, th32ProcessID uint32) (windows.Handle, error) {
 	r1, _, err := callCreateToolhelp32Snapshot(
-		uintptr(dwFlags),
-		uintptr(th32ProcessID),
+		dwFlags,
+		th32ProcessID,
 	)
+	// r1, _, err := callCreateToolhelp32Snapshot(
+	// 	uintptr(dwFlags),
+	// 	uintptr(th32ProcessID),
+	// )
 	if err != nil {
 		return 0, err
 	}
@@ -420,13 +456,15 @@ func CreateToolhelp32Snapshot(dwFlags, th32ProcessID uint32) (windows.Handle, er
 
 // Process32First wraps callProcess32First.
 func Process32First(snapshot windows.Handle, entry *windows.ProcessEntry32) error {
-	_, _, err := callProcess32First(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	//_, _, err := callProcess32First(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	_, _, err := callProcess32First(snapshot, entry)
 	return err
 }
 
 // Process32Next wraps callProcess32Next.
 func Process32Next(snapshot windows.Handle, entry *windows.ProcessEntry32) error {
-	_, _, err := callProcess32Next(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	//_, _, err := callProcess32Next(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	_, _, err := callProcess32Next(snapshot, entry)
 	return err
 }
 
@@ -468,7 +506,7 @@ func GetServiceNamesFromPID(targetPID uint32) ([]string, error) {
 
 	// Use our retry helper to handle the buffer growth logic
 	// We use callWithRetry because the service list is highly volatile.
-	buffer, err := callWithRetry(0, func(p uintptr, s *uint32) error {
+	buffer, err := callWithRetry(0, func(bufPtr *byte, s *uint32) error {
 		// Reset these for each attempt to ensure a fresh enumeration if it retries
 		servicesReturned = 0
 		// Note: we usually keep resumeHandle at 0 for a fresh start on each retry
@@ -480,7 +518,8 @@ func GetServiceNamesFromPID(targetPID uint32) ([]string, error) {
 			windows.SC_ENUM_PROCESS_INFO,
 			windows.SERVICE_WIN32,
 			windows.SERVICE_STATE_ALL,
-			(*byte)(unsafe.Pointer(p)),
+			//(*byte)(unsafe.Pointer(p)),
+			bufPtr,
 			*s,
 			s, // bytesNeeded
 			&servicesReturned,

@@ -20,7 +20,9 @@ package wincoe
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -135,12 +137,111 @@ const UnspecifiedWinApi string = "unspecified_winapi"
 // failure checker. It returns r1, r2, and an error that is never nil when r1 indicates failure.
 //
 // This version accepts any type that implements LazyProcish, which allows easy mocking in tests.
-func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) (uintptr, uintptr, error) {
+func WinCall(proc LazyProcish, check WinCheckFunc, args ...any) (uintptr, uintptr, error) {
+	if proc == nil {
+		//return 0, 0,
+		panic(fmt.Errorf("WinCall: nil proc"))
+	}
+
 	op := strings.TrimSpace(proc.Name())
 	if op == "" {
 		op = UnspecifiedWinApi
 	}
-	r1, r2, callErr := proc.Call(args...)
+
+	//FIXME: this is shit! so either get back to their .Call() or switch to Rust.
+	//XXX: to be clear, THIS isn't good enough either! I'd have to cast to uintptr in the .Call() args instead! which means separate func for each, no WinCall possible! Or maybe there's a way via //go:uintptrescapes
+	// Prepare the raw uintptr arguments for the real syscall
+	uintArgs := make([]uintptr, len(args))
+	keepAlive := make([]any, len(args))
+
+	for i, arg := range args {
+		switch v := arg.(type) {
+		case uintptr:
+			//uintArgs[i] = v
+			panic(fmt.Errorf("WinCall: No uintptr(s) allowed, at index %d for %q windows call", i, op))
+		case unsafe.Pointer:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v) // Convert at the LAST possible moment
+
+		case int:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case int16:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case int32:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case int64:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+
+		case uint:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case uint32:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case uint16:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case uint64:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+
+		case windows.Handle:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(v)
+		case bool:
+			keepAlive[i] = v
+			if v {
+				uintArgs[i] = 1
+			} else {
+				uintArgs[i] = 0
+			}
+
+		case *uint8:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(unsafe.Pointer(v))
+		case *uint16:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(unsafe.Pointer(v))
+		case *uint32:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(unsafe.Pointer(v))
+		case *uint64:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(unsafe.Pointer(v))
+
+		// If you have a custom struct, you'll need its pointer type here too
+		case *windows.ProcessEntry32:
+			keepAlive[i] = v
+			uintArgs[i] = uintptr(unsafe.Pointer(v))
+
+		default:
+			// If it's a pointer but not cast to unsafe.Pointer yet
+			// we can use reflection as a fallback(but we shouldn't as it will trigger GC), but unsafe.Pointer is faster
+			panic(fmt.Errorf("TODO: WinCall: unsupported argument type %T at index %d for %q windows call", arg, i, op))
+		}
+	}
+
+	// This is the "Danger Zone" - we have converted to uintptr.
+	// We must call proc.Call IMMEDIATELY.
+	//When you call proc.Call(uintArgs...), you are passing a slice header. The compiler looks at the uintptrescapes directive and says:
+	//  "Okay, I need to protect the arguments. Oh, look, the argument is a slice. Slices are just a pointer and two integers.
+	// None of those are uintptr conversions from pointers, so I have nothing to pin."
+	//The compiler does not look inside your uintArgs slice to see what those numbers represent.
+	// The "Shield" of the LazyProc.Call directive is protecting the slice itself, not the memory addresses inside the slice.
+	//If args[0] is a pointer to a variable on the stack (e.g., &target), and the Go runtime decides to grow the stack between your for loop
+	// and the proc.Call (which could happen during the interface method dispatch or the p.mustFind() call inside LazyProc),
+	// the uintptr in your slice will point to a "Ghost" address on the old stack.
+	//workaround (in callers): If you want to keep this architecture and be as close to Rust-level safety as possible, there is one rule you must follow when using your WinCall:
+	//    "Never pass a pointer to a local stack variable."
+	//If you always ensure the pointers you pass into WinCall come from the Heap (e.g., use new(uint32) or make([]byte, n)),
+	//  the stack-move problem disappears. Objects on the Go Heap never move. They stay at the same memory address until they are collected.
+	r1, r2, callErr := proc.Call(uintArgs...)
+	//runtime.KeepAlive prevents the memory from being deleted, but it does not prevent the stack from being moved.
+	runtime.KeepAlive(keepAlive) //Using runtime.KeepAlive(args) at the very end of WinCall is the standard Go way to say: "Don't you dare reap these pointers until this line is reached."
 	err := CheckWinResult(op, check, r1, callErr)
 	return r1, r2, err
 }
@@ -211,8 +312,8 @@ func RealProc2(dll *windows.LazyDLL, name string) LazyProcish {
 	return RealProc(dll.NewProc(name))
 }
 
-// WinCall will handle the error type properly, wrap it nicely so if err != nil you can then always do errors.Is on it!
 // BoundFunc represents a bound Windows procedure call with fixed failure semantics.
+// WinCall will handle the error type properly, wrap it nicely so if err != nil you can then always do errors.Is on it!
 //
 // It behaves like a preconfigured syscall wrapper:
 //   - accepts raw uintptr arguments
@@ -225,7 +326,7 @@ func RealProc2(dll *windows.LazyDLL, name string) LazyProcish {
 //
 // BoundFunc makes no guarantees about argument arity or type safety beyond what
 // the underlying Windows API expects.
-type BoundFunc func(args ...uintptr) (uintptr, uintptr, error)
+type BoundFunc func(args ...any) (uintptr, uintptr, error)
 
 // BindFunc binds a LazyProcish together with a WinCheckFunc into a callable function.
 //
@@ -254,7 +355,7 @@ func BindFunc(proc LazyProcish, check WinCheckFunc) BoundFunc {
 		panic("BindFunc: nil check")
 	}
 
-	return func(args ...uintptr) (uintptr, uintptr, error) {
+	return func(args ...any) (uintptr, uintptr, error) {
 		return WinCall(proc, check, args...)
 	}
 }
@@ -299,7 +400,7 @@ func NewBoundProc(
 
 	proc := RealProc(dll.NewProc(name))
 
-	return func(args ...uintptr) (uintptr, uintptr, error) {
+	return func(args ...any) (uintptr, uintptr, error) {
 		return WinCall(proc, check, args...)
 	}
 }

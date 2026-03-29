@@ -1601,12 +1601,12 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		return ret
 	}
 
-	// nolint:govet //for unsafeptr
+	// nolint:govet //for unsafeptr, has no effect actually, still warns even with settings.json only this works(outside of vscode): go vet -unsafeptr=false
 	info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam)) // XXX: warns without the .\.vscode\settings.json the unsafeptr false part.
-	// Trick the linter: convert to pointer via an interface or a helper
-	// that doesn't trigger the "unsafeptr" heuristic.
+	// // Trick the linter: convert to pointer via an interface or a helper
+	// // that doesn't trigger the "unsafeptr" heuristic.
 	// var p interface{} = lParam
-	// //nolint:govet,unsafeptr
+	// //nolint:govet,unsafeptr // because
 	// info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(p.(uintptr)))
 
 	if info.Flags&LLMHF_INJECTED != 0 {
@@ -3686,6 +3686,7 @@ func exitf(code int, format string, a ...interface{}) {
 }
 
 // XXX: in here, return errors like 'return fmt.Errorf("something went wrong")' instead of using log.Fatal or os.Exit(1)
+// however exitf and panics are fine because they're defer-caught properly and thus graceful exit still happens!
 func runApplication(_token theILockedMainThreadToken) error { //XXX: must be called on main() and after that runtime.LockOSThread()
 	_ = _token // silence warning!
 	assertStructSizes()

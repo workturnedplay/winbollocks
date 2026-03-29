@@ -24,10 +24,9 @@ import (
 )
 
 var (
-	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	//procSetConsoleTextAttribute  = wincall.RealProc(kernel32.NewProc("SetConsoleTextAttribute"))
 	//procSetConsoleTextAttribute2 = wincall.BindFunc(wincall.RealProc2(kernel32, "SetConsoleTextAttribute"), wincall.CheckBool)
-	callSetConsoleTextAttribute3 = NewBoundProc(kernel32, "SetConsoleTextAttribute", CheckBool)
+	callSetConsoleTextAttribute3 = NewBoundProc(Kernel32, "SetConsoleTextAttribute", CheckBool)
 )
 
 // WithConsoleColor temporarily changes text attribute, runs fn, then restores original
@@ -100,7 +99,8 @@ func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
 	// _, _, err := procSetConsoleTextAttribute2(uintptr(h), uintptr(color))
 
 	//works too:
-	_, _, err := callSetConsoleTextAttribute3(uintptr(h), uintptr(color))
+	//_, _, err := callSetConsoleTextAttribute3(uintptr(h), uintptr(color))
+	_, _, err := callSetConsoleTextAttribute3(h, color)
 
 	return err
 }
