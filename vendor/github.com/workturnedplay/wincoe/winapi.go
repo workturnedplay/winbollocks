@@ -661,7 +661,7 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 				i, offset, entrySize, len(buffer))
 		}
 		data := (*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[offset]))
-		runtime.GC() //Grok says this will crash because of 'data' being a pointer into buffer
+		//runtime.GC() //Grok says this will crash because of 'data' being a pointer into buffer, wrong, it doesn't crash!
 
 		// Validate ServiceName pointer is within buffer before dereferencing
 		bufStart := uintptr(unsafe.Pointer(&buffer[0]))

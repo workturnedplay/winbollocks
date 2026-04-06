@@ -56,6 +56,11 @@ linters:
 #linters-settings:
 
     govet:
+      enable:
+        - shadow # Explicitly enable the shadowing check
+      settings:
+        shadow:
+          strict: false # This makes it even more aggressive, if 'true'
       enable-all: true
       disable:
         - fieldalignment  # good to know, rarely worth the churn
