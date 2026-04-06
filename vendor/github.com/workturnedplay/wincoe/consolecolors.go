@@ -26,7 +26,8 @@ import (
 var (
 	//procSetConsoleTextAttribute  = wincall.RealProc(kernel32.NewProc("SetConsoleTextAttribute"))
 	//procSetConsoleTextAttribute2 = wincall.BindFunc(wincall.RealProc2(kernel32, "SetConsoleTextAttribute"), wincall.CheckBool)
-	callSetConsoleTextAttribute3 = NewBoundProc(Kernel32, "SetConsoleTextAttribute", CheckBool)
+	//procSetConsoleTextAttribute = NewBoundProc(Kernel32, "SetConsoleTextAttribute", CheckBool)
+	procSetConsoleTextAttribute = Kernel32.NewProc("SetConsoleTextAttribute")
 )
 
 // WithConsoleColor temporarily changes text attribute, runs fn, then restores original
@@ -89,8 +90,8 @@ func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
 	// We pass nil for onFail because we just want to return the error to the caller.
 	// Execute the syscall
 	// //works:
-	// r1, _, callErr := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color))
-	// err := CheckWinResult(CheckBool, r1, callErr)
+	r1, _, callErr := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color))
+	err := CheckWinResult("SetConsoleTextAttribute via LazyProc.Call", CheckBool, r1, callErr)
 
 	// //works:
 	// _, _, err := wincall.WinCall(procSetConsoleTextAttribute, wincall.CheckBool, uintptr(h), uintptr(color))
@@ -99,8 +100,7 @@ func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
 	// _, _, err := procSetConsoleTextAttribute2(uintptr(h), uintptr(color))
 
 	//works too:
-	//_, _, err := callSetConsoleTextAttribute3(uintptr(h), uintptr(color))
-	_, _, err := callSetConsoleTextAttribute3(h, color)
+	//	_, _, err := procSetConsoleTextAttribute.Call(uintptr(h), uintptr(color)) //FIXME: restore this
 
 	return err
 }

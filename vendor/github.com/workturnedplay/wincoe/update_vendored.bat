@@ -31,7 +31,13 @@ set "GOWORK=off"
 for /f "tokens=3" %%v in ('go version') do (
     set "INSTALLED_VER=%%v"
     set "INSTALLED_VER=!INSTALLED_VER:go=!"
+    :: 1b. Create CLEAN_GO_VERSION for use in go.mod / go.work (strip devel + commit)
+:: For devel builds like 1.27-devel_081aa64e61, we want "1.27" (or "1.27.0" if you prefer)
+set "CLEAN_INSTALLED_VER=!INSTALLED_VER!"
+:: First, remove everything after the first '-' (devel suffix and hash)
+for /f "tokens=1 delims=-" %%a in ("!CLEAN_INSTALLED_VER!") do set "CLEAN_INSTALLED_VER=%%a"
 )
+set INSTALLED_VER=!CLEAN_INSTALLED_VER!
 set "GOTOOLCHAIN=!OLD_GTC!"
 
 :: 2. Safety check: Did 'go version' actually work?
