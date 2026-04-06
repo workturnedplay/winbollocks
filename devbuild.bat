@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+echo building WITH console I/O
 
 :: 0. Capture Workspace State
 :: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
