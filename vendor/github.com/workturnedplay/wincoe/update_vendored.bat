@@ -140,7 +140,7 @@ if "!HAS_WORKSPACE!"=="1" (
 :: 5. Update and Sync (Standard workflow)
 echo [1/4] Updating all dependencies... needs internet access to check if new versions are available.
 go get -u ./...
-if !errorlevel! neq 0 (set "stage=Dependencies Update (needs internet access)" & goto :failed)
+if !errorlevel! neq 0 (set "stage=Dependencies Update (needs internet access, go.exe and C:\Program Files\Git\mingw64\libexec\git-core\git-remote-https.exe due to GOPRIVATE must can do TCP 443)" & goto :failed)
 
 echo [2/4] Cleaning up go.mod...
 go mod tidy
@@ -151,6 +151,14 @@ echo [3/4] Not deleting vendor folder.
 echo [4/4] Updating vendor folder...
 go mod vendor
 if !errorlevel! neq 0 (set "stage=Creating and populating 'vendor' dir" & goto :failed)
+
+if "!HAS_WORKSPACE!"=="1" (
+  echo [5/4] Detected Workspace. Syncing Workspace Vendor...
+  rem We must temporarily re-enable GOWORK so the command knows which workspace to vendor
+  set "GOWORK=!WS_PATH!"
+  go work vendor
+  if !errorlevel! neq 0 (set "stage=Workspace Vendoring" & goto :failed)
+)
 
 echo.
 echo ========================================
