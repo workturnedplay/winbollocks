@@ -433,6 +433,9 @@ type BoundProc struct {
 // any Go pointer passed as an argument MUST be converted to uintptr using
 // uintptr(unsafe.Pointer(&x)) directly within the argument list of the
 // call site.
+// So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
+// The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
+// for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
 //
 // Example:
 //

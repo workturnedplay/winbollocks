@@ -41,11 +41,11 @@ import (
 //type Exported struct{}
 
 var (
-	Iphlpapi                = windows.NewLazySystemDLL("iphlpapi.dll")
-	procGetExtendedUdpTable = Iphlpapi.NewProc("GetExtendedUdpTable")
-	//procGetExtendedUdpTable = NewBoundProc(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
-	procGetExtendedTcpTable = Iphlpapi.NewProc("GetExtendedTcpTable")
-	//procGetExtendedTcpTable = NewBoundProc(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
+	Iphlpapi = windows.NewLazySystemDLL("iphlpapi.dll")
+	//procGetExtendedUdpTable = Iphlpapi.NewProc("GetExtendedUdpTable")
+	procGetExtendedUdpTable = NewBoundProc(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
+	//procGetExtendedTcpTable = Iphlpapi.NewProc("GetExtendedTcpTable")
+	procGetExtendedTcpTable = NewBoundProc(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
 
 	Kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
@@ -189,8 +189,8 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 		}
 		//fmt.Printf("[GoR:%d]!%s before7 try %d, ptr=%p &size=%p size=%d\n", GoRoutineId(), who, tries, ptr, &size, size)
 		err := call(ptr, &size)
-		runtime.KeepAlive(buf)   // probably not needed but hey, ChatGPT.
-		runtime.KeepAlive(&size) // to satisfy Gemini 3.1 Thinking, no effect, still crashed. (cause was this https://github.com/golang/go/issues/77975 )
+		//runtime.KeepAlive(buf)   // probably not needed but hey, ChatGPT.
+		//runtime.KeepAlive(&size) // to satisfy Gemini 3.1 Thinking, no effect, still crashed. (cause was this https://github.com/golang/go/issues/77975 )
 		//fmt.Printf("[GoR:%d]!%s after7 try %d, ptr=%p &size=%p size=%d\n", GoRoutineId(), who, tries, ptr, &size, size)
 		// //check canary immediately after
 		// if buf != nil { // guard for first iteration when size==0
@@ -282,7 +282,7 @@ func boolToUintptr(b bool) uintptr {
 //     to a specific struct layout; build a typed parser on top if needed.
 func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 	return callWithRetry("GetExtendedUDPTable", 0, func(bufPtr *byte, s *uint32) error {
-		r1, _, err := procGetExtendedUdpTable.Call(
+		_, _, err := procGetExtendedUdpTable.Call(
 			uintptr(unsafe.Pointer(bufPtr)),
 			uintptr(unsafe.Pointer(s)),
 			boolToUintptr(order),
@@ -290,10 +290,10 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(UDP_TABLE_OWNER_PID),
 			0,
 		)
-		err = CheckWinResult("LazyProc.Call() for procGetExtendedUdpTable", CheckErrno, r1, err)
-		//these keepalives are probably not needed but hey, ChatGPT.
-		runtime.KeepAlive(bufPtr)
-		runtime.KeepAlive(s)
+		//err = CheckWinResult("LazyProc.Call() for procGetExtendedUdpTable", CheckErrno, r1, err)
+		//these keepalives are probably not needed but hey, ChatGPT. they're not because go:uintptrescapes implies go:uintptrkeepalive plus escapes(makes them be, automatically) them to heap!
+		//runtime.KeepAlive(bufPtr)
+		//runtime.KeepAlive(s)
 		return err
 	})
 }
@@ -302,7 +302,7 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 // It follows the same contract as GetExtendedUDPTable.
 func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 	return callWithRetry("GetExtendedTCPTable", 0, func(bufPtr *byte, s *uint32) error {
-		r1, _, err := procGetExtendedTcpTable.Call(
+		_, _, err := procGetExtendedTcpTable.Call(
 			uintptr(unsafe.Pointer(bufPtr)),
 			uintptr(unsafe.Pointer(s)),
 			boolToUintptr(order),
@@ -310,10 +310,10 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
 			0,
 		)
-		err = CheckWinResult("LazyProc.Call() for GetExtendedTCPTable", CheckErrno, r1, err)
+		//err = CheckWinResult("LazyProc.Call() for GetExtendedTCPTable", CheckErrno, r1, err)
 		//these keepalives are probably not needed but hey, ChatGPT.
-		runtime.KeepAlive(bufPtr)
-		runtime.KeepAlive(s)
+		//runtime.KeepAlive(bufPtr)
+		//runtime.KeepAlive(s)
 		return err
 	})
 }
@@ -353,23 +353,20 @@ func QueryFullProcessName(pid uint32) (string, error) {
 
 		// Note: QueryFullProcessNameW expects 'size' to include the null terminator
 		// on input, and returns the length WITHOUT the null terminator on success.
-		// _, _, err = callQueryFullProcessName(
-		// 	h,
-		// 	0,
-		// 	&buf[0],
-		// 	&size,
-		// )
-		err = windows.QueryFullProcessImageName(h, 0, &buf[0], &size)
-		r1 := (bool)(err == nil)
-		err = CheckWinResult("windows.QueryFullProcessImageName", CheckBool, boolToUintptr(r1), err)
-		// _, _, err = procQueryFullProcessName.Call( // FIXME: restore this?
-		// 	uintptr(h),
-		// 	0,
-		// 	uintptr(unsafe.Pointer(&buf[0])),
-		// 	uintptr(unsafe.Pointer(&size)),
-		// )
-		runtime.KeepAlive(&size)
-		runtime.KeepAlive(size)
+
+		// this works too:
+		// err = windows.QueryFullProcessImageName(h, 0, &buf[0], &size)
+		// r1 := (bool)(err == nil)
+		// err = CheckWinResult("windows.QueryFullProcessImageName", CheckBool, boolToUintptr(r1), err)
+		_, _, err = procQueryFullProcessName.Call(
+			uintptr(h),
+			0,
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)),
+		)
+		//These 2 are not needed because implied by BoundProc.Call()'s //go:uintptrescapes
+		// runtime.KeepAlive(&size)
+		// runtime.KeepAlive(size)
 
 		if err == nil {
 			// Success! Convert the returned size to string
@@ -497,19 +494,19 @@ func GetProcessName(pid uint32) (string, error) {
 // TH32CS_SNAPPROCESS specifically tells the API to include all processes in the snapshot. Without it, Process32First/Process32Next won’t enumerate any processes.
 func CreateToolhelp32Snapshot(dwFlags, th32ProcessID uint32) (windows.Handle, error) {
 	// fmt.Printf("[GoR:%d] !starting CreateToolhelp32Snapshot\n", GoRoutineId())
-	// r1, _, err := procCreateToolhelp32Snapshot.Call( //FIXME: restore this?
-	// 	uintptr(dwFlags),
-	// 	uintptr(th32ProcessID),
-	// )
-	r1, err := windows.CreateToolhelp32Snapshot(dwFlags, th32ProcessID)
-	err = CheckWinResult("windows.CreateToolhelp32Snapshot", CheckHandle, 0, err)
+	r1, _, err := procCreateToolhelp32Snapshot.Call(
+		uintptr(dwFlags),
+		uintptr(th32ProcessID),
+	)
+	// r1, err := windows.CreateToolhelp32Snapshot(dwFlags, th32ProcessID)
+	// err = CheckWinResult("windows.CreateToolhelp32Snapshot", CheckHandle, 0, err)
 	if err != nil {
 		// fmt.Printf("[GoR:%d] !ending CreateToolhelp32Snapshot err=%v\n", GoRoutineId(), err)
 		return 0, err
 	}
 	// fmt.Printf("[GoR:%d] !ending CreateToolhelp32Snapshot OK\n", GoRoutineId())
-	//return windows.Handle(r1), nil
-	return r1, nil
+	return windows.Handle(r1), nil
+	//return r1, nil
 }
 
 // // CreateProcessSnapshot is a convenience wrapper for creating a snapshot of all processes.
@@ -527,16 +524,15 @@ func Process32First(snapshot windows.Handle, entry *windows.ProcessEntry32) erro
 		// fmt.Printf("[GoR:%d] !ending Process32First err=nil entry\n", GoRoutineId())
 		return errors.New("Process32First: nil entry")
 	}
-	//_, _, err := procProcess32First.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry))) //FIXME: restore this?
-	err := windows.Process32First(snapshot, entry)
-	var r1 bool = err == nil // true means r1 is 1, but when r1 is 0 it means error happened!
-	err = CheckWinResult("windows.Process32First", CheckBool, boolToUintptr(r1), err)
-	//_, _, err := callProcess32First(snapshot, entry)
+	_, _, err := procProcess32First.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	// err := windows.Process32First(snapshot, entry)
+	// var r1 bool = err == nil // true means r1 is 1, but when r1 is 0 it means error happened!
+	// err = CheckWinResult("windows.Process32First", CheckBool, boolToUintptr(r1), err)
 
 	// THIS is the anchor, says Gemini
 	// It ensures 'entry' is considered "live" by the GC
 	// until this specific line is reached.
-	runtime.KeepAlive(entry)
+	// runtime.KeepAlive(entry) // no need due to go:uintptrescapes implying go:uintptrkeepalive
 	// fmt.Printf("[GoR:%d] !ending Process32First err=%v\n", GoRoutineId(), err)
 	return err
 }
@@ -548,15 +544,14 @@ func Process32Next(snapshot windows.Handle, entry *windows.ProcessEntry32) error
 		// fmt.Printf("[GoR:%d] !ending Process32Next err=nil entry\n", GoRoutineId())
 		return errors.New("Process32Next: nil entry")
 	}
-	//_, _, err := procProcess32Next.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry))) //FIXME: restore this?
-	err := windows.Process32Next(snapshot, entry)
-	var r1 bool = err == nil
-	err = CheckWinResult("windows.Process32Next", CheckBool, boolToUintptr(r1), err)
-	//_, _, err := callProcess32Next(snapshot, entry)
+	_, _, err := procProcess32Next.Call(uintptr(snapshot), uintptr(unsafe.Pointer(entry)))
+	// err := windows.Process32Next(snapshot, entry)
+	// var r1 bool = err == nil
+	// err = CheckWinResult("windows.Process32Next", CheckBool, boolToUintptr(r1), err)
 	// THIS is the anchor, says Gemini
 	// It ensures 'entry' is considered "live" by the GC
 	// until this specific line is reached.
-	runtime.KeepAlive(entry)
+	// runtime.KeepAlive(entry) // no need due to go:uintptrescapes implying go:uintptrkeepalive
 	// fmt.Printf("[GoR:%d] !ending Process32Next err=%v\n", GoRoutineId(), err)
 	return err
 }
@@ -622,8 +617,8 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 			nil,
 		)
 		//these keepalives are very likely not needed here, but hey, ChatGPT.
-		runtime.KeepAlive(bufPtr)
-		runtime.KeepAlive(s)
+		//runtime.KeepAlive(bufPtr)
+		//runtime.KeepAlive(s)
 
 		// fmt.Printf("[GoR:%d] !after5(after windows.EnumServicesStatusEx) servicesReturned=%d\n", GoRoutineId(), servicesReturned)
 		return errEnum
@@ -686,8 +681,8 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 	}
 	// fmt.Printf("[GoR:%d] !after3(end of 'for' listing servicesReturned in GetServiceNamesFromPIDUncached)\n", GoRoutineId())
 
-	runtime.KeepAlive(buffer)     // keep buffer alive until all ServiceName pointer dereferences are done, because: windows.UTF16PtrToString(data.ServiceName) dereferences an absolute pointer written by the API into the buffer.
-	runtime.KeepAlive(&buffer[0]) //just in case
+	//runtime.KeepAlive(buffer)     // keep buffer alive until all ServiceName pointer dereferences are done, because: windows.UTF16PtrToString(data.ServiceName) dereferences an absolute pointer written by the API into the buffer.
+	//runtime.KeepAlive(&buffer[0]) //just in case
 	//On KeepAlive: &buffer[offset] inside the loop is a live reference to buffer's backing array. The compiler can see that. buffer cannot be collected while the loop body executes because the loop body literally holds a pointer into it. KeepAlive there is redundant — it would only matter if you had extracted the pointer before the loop and used it after the last visible reference to buffer. That's not the case here. Drop it.
 	return serviceNames, nil
 }

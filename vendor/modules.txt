@@ -1,4 +1,4 @@
-# github.com/workturnedplay/wincoe v0.0.12
+# github.com/workturnedplay/wincoe v0.0.13
 ## explicit; go 1.27
 github.com/workturnedplay/wincoe
 # golang.org/x/sys v0.42.0
