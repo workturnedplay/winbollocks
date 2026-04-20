@@ -45,7 +45,7 @@ echo Running go vet...
 go vet !MOD_FLAG! -unsafeptr=false
 if errorlevel 1 goto :fail
 
-go build !MOD_FLAG! .
+go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! .
 if errorlevel 1 goto :fail
 ::pause
 

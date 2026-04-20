@@ -27,6 +27,7 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
+	//"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -1754,7 +1755,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			// 	break
 			// }
 
-			if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			if !ShouldThrottle() {
 				// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
 				var now time.Time
 				if ratelimitOnMove {
@@ -1881,7 +1883,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		} //main 'if', for capturing aka moving/dragging window
 
 		if resizing && currentDrag != nil {
-			if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			if !ShouldThrottle() {
 				nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
 
 				// Send to your mover channel
@@ -1991,7 +1994,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				injectShiftTapOnly()  // prevent releasing of winkey later from popping up Start menu!
 			}
 
-			if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+			if !ShouldThrottle() {
 				//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
 				var data WindowMoveData // stack allocated — zero cost
 
@@ -2277,21 +2281,100 @@ func mustUTF16(s string) *uint16 {
 
 var mouseCallback uintptr
 
-var lastResize time.Time
+// var lastResize time.Time
+// type SafeTimer struct {
+// 	mu         sync.RWMutex
+// 	lastResize time.Time
+// }
+
+// func (s *SafeTimer) Set(t time.Time) {
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+// 	s.lastResize = t
+// }
+
+//	func (s *SafeTimer) Get() time.Time {
+//		s.mu.RLock()
+//		defer s.mu.RUnlock()
+//		return s.lastResize
+//	}
+//var lastResize atomic.Value
+// type Manager struct {
+//     // We store a pointer to time.Time to use atomic.Pointer
+//     lastResize atomic.Pointer[time.Time]
+// }
+
+// // SetLastResize updates the time atomically
+// func (m *Manager) SetLastResize(t time.Time) {
+//     m.lastResize.Store(&t)
+// }
+
+// // LastResize reads the time atomically
+// // The compiler will likely inline this automatically
+// func (m *Manager) LastResize() time.Time {
+//     ptr := m.lastResize.Load()
+//     if ptr == nil {
+//         return time.Time{} // Return zero value if never set
+//     }
+//     return *ptr
+// }
+
+// type WindowState struct {
+// 	// atomic.Pointer[T] is the gold standard for this now
+// 	lastResize atomic.Pointer[time.Time]
+// }
+
+// // GetLastResize is safe, atomic, and will be inlined by the compiler.
+// func (w *WindowState) GetLastResize() time.Time {
+// 	if t := w.lastResize.Load(); t != nil {
+// 		return *t
+// 	}
+// 	return time.Time{}
+// }
+
+// // UpdateResize keeps the spam from breaking things
+// func (w *WindowState) UpdateResize() {
+// 	now := time.Now()
+// 	w.lastResize.Store(&now)
+// }
+
+// Use an atomic Int64 to store UnixNano
+var lastResizeUnixNano atomic.Int64
+
+// ShouldThrottle returns true if the last action happened too recently.
+// Uses the constant directly for a zero-allocation, fast check.
+func ShouldThrottle() bool {
+	var now int64 = time.Now().UnixNano()
+	var last int64 = lastResizeUnixNano.Load()
+
+	// thresholdNanos is calculated at compile-time/startup
+	const thresholdNanos int64 = int64(forceMoveOrResizeActionsToBeThisManyMSApart) * int64(time.Millisecond)
+
+	return (now - last) < thresholdNanos
+}
+
+// MarkAsResized records the completion of a move/resize event.
+func MarkAsResized() {
+	lastResizeUnixNano.Store(time.Now().UnixNano())
+}
 
 const forceMoveOrResizeActionsToBeThisManyMSApart = 10
 
 func handleActualMoveOrResize(data WindowMoveData) {
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
 	// Most monitors are 60Hz-144Hz. Anything faster than 10ms is wasted CPU.
-	if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+	//if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+	if ShouldThrottle() {
 		//logf("ignored move/resize")
 		droppedMoveEvents.Add(1)
 		return
 	}
 
 	defer func() {
-		lastResize = time.Now()
+		//lastResize = time.Now() //doneFIXME: this is racey
+		// To set the value:
+		//lastResize.Store(time.Now())
+		MarkAsResized()
 	}()
 
 	target := data.Hwnd
@@ -2380,6 +2463,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
 			//	//lacks SWP_NOSIZE so it's a resize!
 			// ---- OVERLAY UPDATE ----
+			//FIXME: crashes here due to nil pointer deref, likely due to currentDrag being nil race.
 			startW := currentDrag.startRect.Right - currentDrag.startRect.Left
 			startH := currentDrag.startRect.Bottom - currentDrag.startRect.Top
 			updateOverlay(nx, ny, nw, nh, startW, startH)
