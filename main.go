@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
@@ -1582,7 +1583,7 @@ func logLMBState(prefix string) {
 }
 
 /* ---------------- Mouse Hook ---------------- */
-const fiveMs = 5 * time.Millisecond
+const fiveMs = 5 * time.Millisecond // aka 5 million ns aka nanosec
 
 /*
 "High-input scenarios (gaming, rapid typing) may queue many events, but your callbacks still run one-by-one — the queue just grows temporarily. If you take too long in a callback (> ~1 second, controlled by LowLevelHooksTimeout registry key), Windows may drop or timeout subsequent calls, but it won't parallelize them." - Grok
@@ -2080,7 +2081,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 	// Always pass the event down the chain so other apps don't break
 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, lParam)
 	if nowDiff := time.Since(start); nowDiff > fiveMs {
-		logf("stutter4 %d ns", nowDiff.Nanoseconds())
+		logf("stutter4 %d ns", nowDiff.Nanoseconds()) // 1 million ns is 1 ms
 	}
 
 	return ret
@@ -3546,10 +3547,10 @@ func internalLogger(finalMsg string) {
 		duration := time.Since(startPrint)
 		// --- END TIMING ---
 		// Only alert us if the print took longer than a "frame" (16ms)
-		if duration > 16*time.Millisecond {
+		if duration > 16*time.Millisecond { //TODO: make it a const
 			// Note: Printing this might trigger another lag, but it's for science!
 			// XXX: used to happen when running as admin and u LMB drag the scroll bar or LMB on the text area which begins selection and auto selects 1 char already! when logging was happening on same thread as hooks and msg.loop.
-			fmt.Fprintf(os.Stderr, "!!! LOG LAG DETECTED: %v !!!\n", duration)
+			fmt.Fprintf(os.Stderr, "!!! LOG LAG DETECTED: %v !!!\n", duration) //this won't be seen when compiled without console ie. 'go build -ldflags "-H=windowsgui"'
 		}
 		return
 	}
@@ -4257,37 +4258,37 @@ var (
 	procProcess32Next            = kernel32.NewProc("Process32NextW")
 )
 
-func getWindowText(hwnd windows.Handle) string {
-	ret, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
-	if ret == 0 {
-		return ""
-	}
-	buf := make([]uint16, ret+1)
-	procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), ret+1)
-	return windows.UTF16ToString(buf)
-}
+// func getWindowText(hwnd windows.Handle) string {
+// 	ret, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
+// 	if ret == 0 {
+// 		return ""
+// 	}
+// 	buf := make([]uint16, ret+1)
+// 	procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), ret+1) //so this sends a message and blocks until receives reply, apparently.
+// 	return windows.UTF16ToString(buf)
+// }
 
-const TH32CS_SNAPPROCESS = 0x00000002
+// const TH32CS_SNAPPROCESS = 0x00000002
 
-func getProcessName(pid uint32) string {
-	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(TH32CS_SNAPPROCESS, 0)
-	if snapshot == uintptr(windows.InvalidHandle) {
-		return "unknown"
-	}
-	defer windows.CloseHandle(windows.Handle(snapshot))
+// func getProcessName(pid uint32) string {
+// 	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(TH32CS_SNAPPROCESS, 0)
+// 	if snapshot == uintptr(windows.InvalidHandle) {
+// 		return "unknown"
+// 	}
+// 	defer windows.CloseHandle(windows.Handle(snapshot))
 
-	var entry windows.ProcessEntry32
-	entry.Size = uint32(unsafe.Sizeof(entry))
+// 	var entry windows.ProcessEntry32
+// 	entry.Size = uint32(unsafe.Sizeof(entry))
 
-	ret, _, _ := procProcess32First.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
-	for ret != 0 {
-		if entry.ProcessID == pid {
-			return windows.UTF16ToString(entry.ExeFile[:])
-		}
-		ret, _, _ = procProcess32Next.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
-	}
-	return "not found"
-}
+// 	ret, _, _ := procProcess32First.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
+// 	for ret != 0 {
+// 		if entry.ProcessID == pid {
+// 			return windows.UTF16ToString(entry.ExeFile[:])
+// 		}
+// 		ret, _, _ = procProcess32Next.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
+// 	}
+// 	return "not found"
+// }
 
 var procGetClassName = user32.NewProc("GetClassNameW")
 
@@ -4301,11 +4302,27 @@ func getClassName(hwnd windows.Handle) string {
 }
 
 var shouldLogFocusChanges = false
+var shouldLogWindowEvents = true
+
+var (
+	eventCount uint64
+	lastReport time.Time = time.Now()
+)
 
 func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
-	//fmt.Println("DEBUG: hook called")
+	// ONLY process if it's the actual window, not a sub-control/caret/item
+	if idObject != 0 { // 0 is OBJID_WINDOW
+		return 0 // WinEvent callbacks return 0 (no chaining)
+	}
 
-	var eventName string
+	//fmt.Println("DEBUG: hook called")
+	var nowCount uint64
+	if shouldLogWindowEvents {
+		nowCount = atomic.AddUint64(&eventCount, 1)
+	}
+
+	var eventName string = "unclassified&untracked"
+	var untrackedEvent bool = false
 
 	switch event {
 	case 0x0003:
@@ -4314,12 +4331,20 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		eventName = "EVENT_SYSTEM_MENUSTART"
 	case 0x0009:
 		eventName = "EVENT_SYSTEM_MENUEND"
+	case 0x4002:
+		//This fires when an object (window, button, menu item) is made visible. During a Regedit search,
+		// it might fire if the UI is dynamically popping elements in and out of the view.
+		eventName = "EVENT_OBJECT_SHOW"
+	case 0x4005:
+		//It fires every time a window or an element moves or changes size.
+		eventName = "EVENT_OBJECT_LOCATIONCHANGE"
+		untrackedEvent = true
 	case 0x8000:
 		eventName = "EVENT_OBJECT_CREATE"
-		return 0
+		untrackedEvent = true
 	case 0x8001:
 		eventName = "EVENT_OBJECT_DESTROY"
-		return 0
+		untrackedEvent = true
 	case 0x8002:
 		eventName = "EVENT_OBJECT_SHOW"
 	case 0x8003:
@@ -4330,21 +4355,56 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		eventName = "EVENT_OBJECT_FOCUS"
 	default:
 		// Return early if it's an event we aren't tracking to keep logs clean
+		untrackedEvent = true
+	}
+
+	if shouldLogWindowEvents {
+		// 1. Monitor Event Frequency (Every 1 second)
+		if time.Since(lastReport) > time.Second && nowCount > 160 { //TODO: make it a const; can get 122 events per sec during resizes, or less than 50 during wtw else not-our-gesture events.
+			count := atomic.SwapUint64(&eventCount, 0)
+			//fmt.Printf
+			logf("[DEBUG] Events per second: %d | Last Event: 0x%x(%s)", count, event, eventName)
+			lastReport = time.Now()
+		}
+
+		// 2. Time the execution of the callback
+		start := time.Now()
+		defer func() {
+			elapsed := time.Since(start)
+			if elapsed > 5*time.Millisecond { // TODO: make it a const
+				logf("[PERF] Slow Event 0x%x(%s): %v (HWND: 0x%x, ObjId: %d)", event, eventName, elapsed, hwnd, idObject)
+			}
+		}()
+	}
+
+	if untrackedEvent {
+		// Return early if it's an event we aren't tracking to keep logs clean
 		return 0
 	}
 
-	// Get the top-level owner of this HWND to see if it belongs to CMD
-	// GA_ROOT (2) gets the "real" parent window
-	rootHwnd, _, _ := procGetAncestor.Call(uintptr(hwnd), 2)
-
 	var pid uint32
-	procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
-
-	title := getWindowText(windows.Handle(rootHwnd))
-	procName := getProcessName(pid)
-	class := getClassName(hwnd)
+	if shouldLogFocusChanges || event == 0x0003 /*EVENT_SYSTEM_FOREGROUND*/ {
+		//then pid is needed in one OR two places
+		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+		//"Pro-tip: You don't need to check err for this specific API because it doesn't set LastError in the traditional way; you just check if the return value (or the written pid variable) is 0. Your current check if pid == 0 is the correct way to handle it." - gemini 3 Fast
+		if pid == 0 {
+			//some error or wtw
+			logf("Couldn't get pid(it's 0) for HWND=0x%x for event 0x%x(%s)", hwnd, event, eventName)
+			return 0 // WinEvent callbacks return 0 (no chaining)
+		}
+	}
 
 	if shouldLogFocusChanges {
+		//procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+
+		// Get the top-level owner of this HWND to see if it belongs to CMD
+		// GA_ROOT (2) gets the "real" parent window
+		rootHwnd, _, _ := procGetAncestor.Call(uintptr(hwnd), 2)
+
+		title := getWindowTextFast(windows.Handle(rootHwnd)) //getWindowText(windows.Handle(rootHwnd))
+		procName := getProcessNameFast(pid)                  //getProcessName(pid)
+		class := getClassName(hwnd)
+
 		logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
 			eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
 	}
@@ -4355,8 +4415,14 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		}
 
 		// Optional: Check for elevated
-		var pid uint32
-		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+		//var pid uint32
+		// if !shouldLogFocusChanges || pid == 0 { //then pid wasn't already computed above so we should do it
+		// 	procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+
+		// }
+		if pid == 0 {
+			badprogramming("pid is 0 here, code logic was changed!")
+		}
 		il, err := processIntegrityLevel(pid)
 		if err == nil && il >= 0x3000 {
 			if shouldLogFocusChanges {
@@ -4375,4 +4441,48 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		//	logf("event: %v hwnd=0x%x", event, hwnd)
 	}
 	return 0 // WinEvent callbacks return 0 (no chaining)
+}
+
+func badprogramming(msg string) {
+	panic(msg)
+}
+
+func getProcessNameFast(pid uint32) string {
+	// PROCESS_QUERY_LIMITED_INFORMATION is very fast and doesn't require a snapshot
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return "<failed>"
+	}
+	defer windows.CloseHandle(h)
+
+	buf := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(buf))
+	// QueryFullProcessImageName is significantly faster than Toolhelp snapshots
+	err = windows.QueryFullProcessImageName(h, 0, &buf[0], &size)
+	if err != nil {
+		return "<not found>"
+	}
+
+	// Just return the base name (regedit.exe)
+	fullPath := windows.UTF16ToString(buf[:size])
+	return filepath.Base(fullPath)
+}
+
+// Add this proc
+var procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
+
+// InternalGetWindowText is a "non-blocking" call. It reads from the Desktop Heap (kernel memory) rather than sending a WM_GETTEXT message.
+// This prevents your program from freezing when Regedit is too busy to respond to messages.
+func getWindowTextFast(hwnd windows.Handle) string {
+	buf := make([]uint16, 512)
+	// This API does NOT send a message; it reads from kernel memory.
+	ret, _, _ := procInternalGetWindowText.Call(
+		uintptr(hwnd),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if ret == 0 {
+		return "<failed>"
+	}
+	return windows.UTF16ToString(buf[:ret])
 }
