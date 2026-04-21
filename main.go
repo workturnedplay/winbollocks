@@ -4279,15 +4279,15 @@ func drainMoveChannel() {
 	}
 }
 
-var (
-	// ... your existing procs ...
-	procGetWindowText       = user32.NewProc("GetWindowTextW")
-	procGetWindowTextLength = user32.NewProc("GetWindowTextLengthW")
+// var (
+// 	// ... your existing procs ...
+// 	procGetWindowText       = user32.NewProc("GetWindowTextW")
+// 	procGetWindowTextLength = user32.NewProc("GetWindowTextLengthW")
 
-	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
-	procProcess32First           = kernel32.NewProc("Process32FirstW")
-	procProcess32Next            = kernel32.NewProc("Process32NextW")
-)
+// 	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
+// 	procProcess32First           = kernel32.NewProc("Process32FirstW")
+// 	procProcess32Next            = kernel32.NewProc("Process32NextW")
+// )
 
 // func getWindowText(hwnd windows.Handle) string {
 // 	ret, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
