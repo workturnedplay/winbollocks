@@ -1136,18 +1136,20 @@ func startDrag(hwnd windows.Handle, pt POINT) {
 	targetIL, e1 := processIntegrityLevel(pid)
 	//selfIL, e2 := processIntegrityLevel(uint32(windows.GetCurrentProcessId())) //bugged it said, it noticed.
 	// #nosec G115 --- it's actually uint32 wrapped in an int
-	selfPID := uint32(os.Getpid())
-	selfIL, e2 := processIntegrityLevel(selfPID)
-	if e1 == nil && e2 == nil && targetIL > selfIL {
-		showTrayInfo("winbollocks", "Cannot use native drag on elevated window")
+
+	//selfIL, e2 := processIntegrityLevel(selfPID)
+	if e1 == nil && targetIL > selfIntegrityLevel {
+		//XXX: this actually never gets reached because windows doesn't allow winbollocks to see the events(while higher itegrity window is focused) thus the gesture to drag it can never trigger!
+		procName := getProcessNameFast(pid)
+		showTrayInfo("winbollocks", fmt.Sprintf("Cannot use native drag on elevated window with pid=%d (%s)", pid, procName))
 		return
 	}
 	if e1 != nil {
 		logf("e1: %v", e1)
 	}
-	if e2 != nil {
-		logf("e2: %v", e2)
-	}
+	//if e2 != nil {
+	//		logf("e2: %v", e2)
+	//	}
 	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
 
 	startManualDrag(hwnd, pt)
@@ -1186,7 +1188,7 @@ func hardReset(releaseCapture bool) {
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 	if winGestureUsed && winDown {
 		injectShiftTapOnly() // this way when winUP happens it won't pop up start menu
-		//TODO: inject shift tap at the time gesture is detected!
+		//alreadydoingitTODO: inject shift tap at the time gesture is detected!
 		winGestureUsed = false
 	}
 	softReset(releaseCapture)
@@ -1349,7 +1351,7 @@ func isOwnWindow(hwnd windows.Handle) bool {
 		return false
 	}
 
-	return pid == windows.GetCurrentProcessId()
+	return pid == selfPID //windows.GetCurrentProcessId()
 }
 
 // FIXME: make these two funcs be one and return two bools: (samePID, sameTID) and sameTID would be false if samePID is false!
@@ -3327,6 +3329,19 @@ func init() {
 	lastMovePostedTime = now
 }
 
+var selfPID uint32
+
+func init() {
+	selfPID = uint32(os.Getpid())
+	if selfPID == 0 {
+		badprogramming("shouldn't happen that own pid is 0")
+	}
+	anotherWay := windows.GetCurrentProcessId()
+	if selfPID != anotherWay {
+		badprogramming(fmt.Sprintf("own pid is reported differently by the 2 different ways: %d vs %d", selfPID, anotherWay))
+	}
+}
+
 var isAdmin bool // Package level
 func init() {
 	// This runs automatically before main()
@@ -3338,6 +3353,22 @@ func init() {
 	*/
 	token := windows.GetCurrentProcessToken()
 	isAdmin = token.IsElevated()
+}
+
+var selfIntegrityLevel uint32
+
+func init() {
+	if selfPID == 0 {
+		badprogramming("shouldn't happen that own pid is 0, unless init() is currently in a different order than initially programmed")
+	}
+	// In your main or init, cache your own IL
+	il, err := processIntegrityLevel(selfPID)
+	if err != nil {
+		//myIntegrityLevel = 0x2000 // Default to Medium if check fails
+		panic("can't get own integrity level!") // and don't wanna default to anything
+	} else {
+		selfIntegrityLevel = il
+	}
 }
 
 var (
@@ -4233,7 +4264,7 @@ func drainMoveChannel() {
 		if currentFill > maxChannelFillForMoveEvents.Load() {
 			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
 			maxChannelFillForMoveEvents.Store(currentFill)
-			logf("New Channel Peak: %s events queued (Dropped: %s)",
+			logf("New MoveChannel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
 				withCommas(currentFill), withCommas(droppedMoveEvents.Load()))
 		}
 
@@ -4423,23 +4454,32 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		if pid == 0 {
 			badprogramming("pid is 0 here, code logic was changed!")
 		}
-		il, err := processIntegrityLevel(pid)
-		if err == nil && il >= 0x3000 {
-			if shouldLogFocusChanges {
-				logf("Elevated foreground (IL=0x%x) → reconciling state", il)
-			}
+		targetIL, err := processIntegrityLevel(pid)
+		if err == nil && targetIL > selfIntegrityLevel {
+			// 		Quick Cheat Sheet for Levels:
+			// 0x0000: Untrusted
+			// 0x1000: Low (Browsers / AppContainers)
+			// 0x2000: Medium (Standard User)
+			// 0x3000: High (Administrator / Elevated)
+			// 0x4000: System
+
+			//if shouldLogFocusChanges {
+			logf("Target window HWND=0x%x is higher integrity (0x%x > 0x%x). UIPI will block movement(no key/mouse events will be received while it is focused!thus can't trigger the gesture).", hwnd, targetIL, selfIntegrityLevel)
+			//logf("Focus changed to HWND=0x%x event 0x%x(%s) which is Elevated foreground (IL=0x%x) → reconciling state (and you won't be able to use gestures on this window, run winbollocks as admin to can)", hwnd, event, eventName, targetIL)
+			//}
 			//hardResetIfDesynced() // your recovery function, TODO:
 			// Or force suppression if Win held, etc.
+			softReset(true)
 		} else {
 			if shouldLogFocusChanges {
 				//logf("Err: %v, IL=0x%x", err, il)
-				logf("PID=%d IL=0x%x err=%v", pid, il, err)
+				logf("PID=%d IL=0x%x err=%v", pid, targetIL, err)
 				//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
 			}
 		}
 		//} else {
 		//	logf("event: %v hwnd=0x%x", event, hwnd)
-	}
+	} //endif focus event happened.
 	return 0 // WinEvent callbacks return 0 (no chaining)
 }
 
