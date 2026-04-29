@@ -31,7 +31,7 @@ While the Windows key is held down:
 * Pressing and holding **RMB** over a window initiates a resize operation.
 * The screen is divided into a 9-zone grid. Dragging from the edges or corners resizes the window in that specific direction.
 * Dragging from the **center zone** resizes the window uniformly while respecting its initial aspect ratio.
-* While resizing, a helpful green-on-black/magenta overlay appears on screen, displaying the live dimensions and pixel delta.
+* While resizing, a helpful green-on-black overlay appears on screen, displaying the live dimensions and pixel delta.
 
 **3. Win + Middle Mouse Button (send to back)**
 While the Windows key is held:
@@ -81,9 +81,9 @@ When `winbollocks` is run without administrative privileges, it cannot reliably 
 ### What it explicitly does *not* do
 
 * It does **not** modify system keyboard mappings.
-* It does **not** require administrator privileges (unless you want to manipulate admin windows).
+* It does **not** require administrator privileges (unless you want to manipulate admin windows like Task Manager's window).
 
-The keyboard hook exists **solely** to track modifier key state (Win / Shift / Ctrl / Alt) and suppress Start menu activation after handled gestures (by swallowing the `winkey_UP` event and injecting a quick Shift tap). No other key combinations are acted upon.
+The keyboard hook exists **solely** to track modifier key state (Win / Shift / Ctrl / Alt) and suppress Start menu activation after handled gestures (by swallowing the `winkey_UP` event and injecting a quick RShift tap). No other key combinations are acted upon.
 
 ---
 
