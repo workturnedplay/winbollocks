@@ -3,11 +3,11 @@ cd /d "%~dp0" 2>nul || rem Stay in current directory if already correct
 
 set "bang=^!"
 setlocal enabledelayedexpansion
-:: Yes. Since you have setlocal enabledelayedexpansion at the top, using !VAR! is the "gold standard" for making your script refactor-proof.
-::In Batch, %VAR% is expanded when a command (or a block of commands inside parentheses) is read, while !VAR! is expanded when the command is executed.
+rem  Yes. Since you have setlocal enabledelayedexpansion at the top, using !VAR! is the "gold standard" for making your script refactor-proof.
+rem In Batch, %VAR% is expanded when a command (or a block of commands inside parentheses) is read, while !VAR! is expanded when the command is executed.
 
-:: 1. Get Installed Go Version (e.g., 1.26.0)
-:: 1. Get the REAL Go version on your SSD (bypassing go.mod requirements)
+rem  1. Get Installed Go Version (e.g., 1.26.0)
+rem  1. Get the REAL Go version on your SSD (bypassing go.mod requirements)
 set "OLD_GTC=!GOTOOLCHAIN!"
 set "GOTOOLCHAIN=local"
 
@@ -17,13 +17,13 @@ set "GOPRIVATE=github.com/workturnedplay/*"
 
 set "INSTALLED_VER="
 set "PROJECT_VER="
-:: 0. Capture Workspace State
-:: Run this BEFORE you 'set GOWORK=off' if you want to know the original state
+rem  0. Capture Workspace State
+rem  Run this BEFORE you 'set GOWORK=off' if you want to know the original state
 set "WS_PATH="
 for /f "tokens=*" %%w in ('go env GOWORK') do set "WS_PATH=%%w"
 
-:: If WS_PATH is "off" or empty, we aren't in a workspace.
-:: Otherwise, WS_PATH contains the full path to your go.work file.
+rem  If WS_PATH is "off" or empty, we aren't in a workspace.
+rem  Otherwise, WS_PATH contains the full path to your go.work file.
 if NOT "!WS_PATH!"=="off" if NOT "!WS_PATH!"=="" (
     set "HAS_WORKSPACE=1"
     rem Extract the directory from the full file path
@@ -32,12 +32,17 @@ if NOT "!WS_PATH!"=="off" if NOT "!WS_PATH!"=="" (
     set "HAS_WORKSPACE=0"
 )
 
-:: Now you can safely disable GOWORK for the rest of the script
+rem  Now you can safely disable GOWORK for the rest of the script
 set "GOWORK=off"
-
+rem echo on
+set "IS_DEVEL=0"
 for /f "tokens=3" %%v in ('go version') do (
     set "INSTALLED_VER=%%v"
     set "INSTALLED_VER=!INSTALLED_VER:go=!"
+    
+    rem Check if the original version string contains "devel"
+    echo !INSTALLED_VER! | findstr /i "devel" >nul && set "IS_DEVEL=1"
+    
     rem 1b. Create CLEAN_GO_VERSION for use in go.mod / go.work (strip devel + commit)
     rem For devel builds like 1.27-devel_081aa64e61, we want "1.27" (or "1.27.0" if you prefer)
     set "CLEAN_INSTALLED_VER=!INSTALLED_VER!"
@@ -47,18 +52,18 @@ for /f "tokens=3" %%v in ('go version') do (
 set INSTALLED_VER=!CLEAN_INSTALLED_VER!
 set "GOTOOLCHAIN=!OLD_GTC!"
 
-:: 2. Safety check: Did 'go version' actually work?
+rem  2. Safety check: Did 'go version' actually work?
 if "!INSTALLED_VER!"=="" (
     set "stage=Local Go Check (Is Go installed and in your PATH?)"
     goto :failed
 )
 
-:: Validate Installed Version
+rem Validate Installed Version
 set "CHECK_TARGET=!INSTALLED_VER!"
 call :ValidateVersion
 if !errorlevel! neq 0 (set "stage=Installed Version Validation" & goto :failed)
 
-:: 3. Get Current Project Go Version from go.mod
+rem 3. Get Current Project Go Version from go.mod
 set "PROJECT_VER="
 if exist go.mod (
     for /f "tokens=2" %%v in ('findstr /b "go " go.mod') do (
@@ -72,7 +77,7 @@ if "!PROJECT_VER!"=="" (
     goto :failed
 )
 
-:: Validate Project Version
+rem Validate Project Version
 set "CHECK_TARGET=!PROJECT_VER!"
 call :ValidateVersion
 if !errorlevel! neq 0 (set "stage=Project Version Validation" & goto :failed)
@@ -81,11 +86,14 @@ echo Checking 'go version' alignment...
 echo Installed Go        : !INSTALLED_VER!
 echo Project's minimum Go: !PROJECT_VER!
 
-:: 3. PROPER COMPARISON using PowerShell's [version] type
-:: This handles 1.26.0 vs 1.5.0 correctly because it compares them as numbers, not strings.
-::powershell -command "if ([version]'!INSTALLED_VER!' -gt [version]'!PROJECT_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
+if "!IS_DEVEL!"=="1" (
+        echo [0/4] Devel version detected "!INSTALLED_VER!" ergo skipping go.mod bump.
+  ) else (
+rem 3. PROPER COMPARISON using PowerShell's [version] type
+rem  This handles 1.26.0 vs 1.5.0 correctly because it compares them as numbers, not strings.
+rem powershell -command "if ([version]'!INSTALLED_VER!' -gt [version]'!PROJECT_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
 powershell -NoProfile -command "$v1 = '!INSTALLED_VER!'.Split('-')[0]; $v2 = '!PROJECT_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
-::powershell -command "$v1 = '!PROJECT_VER!'.Split('-')[0]; $v2 = '!INSTALLED_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
+rem powershell -command "$v1 = '!PROJECT_VER!'.Split('-')[0]; $v2 = '!INSTALLED_VER!'.Split('-')[0]; if ([version]$v1 -gt [version]$v2) { exit 0 } else { exit 1 }" >nul 2>&1
 set "COMPARE_RESULT=!errorlevel!"
 
 if "!COMPARE_RESULT!"=="0" (
@@ -105,8 +113,9 @@ if "!COMPARE_RESULT!"=="0" (
     )
 )
 
-:: 4.5 Robustly update go.work in the parent directory
-:: 4.5 Update go.work only if we found one
+
+rem 4.5 Robustly update go.work in the parent directory
+rem 4.5 Update go.work only if we found one
 if "!HAS_WORKSPACE!"=="1" (
   if exist "!WS_PATH!" (
       set "WORK_VER="
@@ -136,8 +145,10 @@ if "!HAS_WORKSPACE!"=="1" (
     echo "%bang%%bang%%bang% Has GO workspace but the path doesn't exist: !WS_PATH!"
   )
 )
+)
+rem above is end of 'if' it isn't Go devel version
 
-:: 5. Update and Sync (Standard workflow)
+rem  5. Update and Sync (Standard workflow)
 echo [1/4] Updating all dependencies... needs internet access to check if new versions are available.
 go get -u ./...
 if !errorlevel! neq 0 (set "stage=Dependencies Update (needs internet access, go.exe and C:\Program Files\Git\mingw64\libexec\git-core\git-remote-https.exe due to GOPRIVATE must can do TCP 443)" & goto :failed)
@@ -176,18 +187,18 @@ pause
 exit /b !errorlevel!
 
 
-::shouldn't be reached:
+rem shouldn't be reached:
 exit /b 111
 :ValidateVersion
-:: 1. Extract only the part before a hyphen (e.g., 1.26.0-rc1 -> 1.26.0)
+rem  1. Extract only the part before a hyphen (e.g., 1.26.0-rc1 -> 1.26.0)
 for /f "tokens=1 delims=-" %%a in ("!CHECK_TARGET!") do set "V_RAW=%%a"
 
-:: 2. Nuclear whitespace/garbage trim
+rem  2. Nuclear whitespace/garbage trim
 for /f "delims=" %%a in ("!V_RAW!") do set "V_RAW=%%a"
 set "V_RAW=!V_RAW: =!"
 
-:: 3. PowerShell Regex Validation
-:: This checks if the REMAINING string is ONLY digits and dots.
+rem  3. PowerShell Regex Validation
+rem  This checks if the REMAINING string is ONLY digits and dots.
 powershell -NoProfile -command "if ('!V_RAW!' -match '^[0-9.]+$') { exit 0 } else { exit 1 }" >nul 2>&1
 
 if !errorlevel! neq 0 (
