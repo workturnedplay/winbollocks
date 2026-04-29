@@ -177,6 +177,8 @@ var (
 	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
 	procDestroyWindow   = user32.NewProc("DestroyWindow")
 
+	procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
+
 	procGetWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
 	procGetWindowPlacement       = user32.NewProc("GetWindowPlacement")
 	procGetWindowRect            = user32.NewProc("GetWindowRect")
@@ -370,7 +372,15 @@ const (
 	WM_CLOSE = 0x0010
 )
 
+// if target window doesn't respond in 150ms we consider it hung and don't attempt to attach our input thread to it in an attempt to succeed at focusing it because it would also hang us.
+const HungWindowTimeout = 150 // ms
 const (
+	SMTO_NORMAL      = 0x0000
+	SMTO_ABORTIFHUNG = 0x0002
+)
+
+const (
+	WM_NULL      = 0
 	WM_MYSYSTRAY = WM_USER + 2
 	//WM_WAKE_UP           = WM_USER + 3
 	WM_INJECT_SEQUENCE             = WM_USER + 100
@@ -861,6 +871,65 @@ func injectLMBClick() {
 	}
 }
 
+const (
+	MOUSEEVENTF_ABSOLUTE    = 0x8000
+	MOUSEEVENTF_VIRTUALDESK = 0x4000
+	MOUSEEVENTF_MOVE        = 0x0001
+	SM_CXVIRTUALSCREEN      = 78
+	SM_CYVIRTUALSCREEN      = 79
+)
+
+var procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+var procSetCursorPos = user32.NewProc("SetCursorPos")
+
+func injectLMBClickAtCoords(x, y int32) {
+	// Win32 absolute coords use a 0-65535 scale across the virtual screen
+
+	w, _, _ := procGetSystemMetrics.Call(SM_CXVIRTUALSCREEN)
+	h, _, _ := procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
+
+	// Normalize to 0..65535
+	// We use 65536 because Windows maps pixels to "mickeys"
+	normalizedX := (int32(x) * 65536) / int32(w)
+	normalizedY := (int32(y) * 65536) / int32(h)
+
+	// 3. Prepare the Input array (Move + Down + Up)
+	// You can combine MOVE | ABSOLUTE | LEFTDOWN in one event,
+	// but separate events are sometimes more reliable for focus.
+	inputs := []INPUT{
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{}, // placeholder for union
+		},
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{},
+		},
+	}
+
+	// Move + Down
+	m0 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki))
+	m0.Dx = normalizedX
+	m0.Dy = normalizedY
+	m0.DwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN
+
+	// Up
+	m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
+	m1.Dx = normalizedX
+	m1.Dy = normalizedY
+	m1.DwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP
+
+	//you can "save and restore" the cursor position. Since GetCursorPos and SetCursorPos are extremely fast
+	// and don't involve the message queue, this will happen so quickly (sub-millisecond) that the user won't perceive the jump.
+	// 1. Capture current physical mouse position to restore it later
+	var currentPt POINT
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&currentPt)))
+	// 2. Inject the click at the original gesture location
+	procSendInput.Call(uintptr(len(inputs)), uintptr(unsafe.Pointer(&inputs[0])), unsafe.Sizeof(inputs[0]))
+	// 3. Teleport the mouse back to where the user had it a millisecond ago
+	procSetCursorPos.Call(uintptr(currentPt.X), uintptr(currentPt.Y))
+}
+
 func injectLMBDown() {
 	inputs := []INPUT{
 		{
@@ -1332,6 +1401,8 @@ func isWindowForeground(hwnd windows.Handle) bool {
 		logf("!! attempted to check the focus of a windows with handle 0")
 		return false
 	}
+	//To answer your performance and safety concerns: GetForegroundWindow and GetCursorPos are both "safe" to call within your mouseProc because they are simple getters
+	// that query the system's internal state without sending messages to other windows.
 	fg, _, _ := procGetForegroundWindow.Call()
 	return windows.Handle(fg) == hwnd
 }
@@ -1369,13 +1440,14 @@ func isInSameThreadID(hwnd windows.Handle) bool {
 	return uint32(tid) == windows.GetCurrentThreadId()
 }
 
+// requires: procAttachThreadInput
 func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 	fgRet, _, fgErr := procSetForegroundWindow.Call(uintptr(target))
 	if fgRet != 1 {
 		lastErr := windows.GetLastError()
 		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
 		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-		logf("failed SetForegroundWindow ret=%d err='%v' lastErr:'%v'", fgRet, fgErr, lastErr)
+		logf("failed SetForegroundWindow ret=%d(0 is false) err='%v' lastErr:'%v'", fgRet, fgErr, lastErr)
 		return false
 	} else { // ie. 1 is TRUE
 		return true
@@ -1561,7 +1633,37 @@ func forceForeground(target windows.Handle) bool {
 	}
 	var targetThreadID uint32 = uint32(r1)
 
+	// XXX: assuming we're used on mainThreadID only! we should remove these checks and just use mainThreadID
 	curTid := windows.GetCurrentThreadId()
+	if curTid != mainThreadID {
+		logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
+	}
+
+	/*
+		When you call AttachThreadInput, you aren't just giving yourself permission to move a window; you are literally merging the input message queues of the two threads.
+
+		As shown in the logic of Windows message queues, each thread usually has its own "mailbox." AttachThreadInput solders those two mailboxes together.
+		 If the target thread stops checking its mail, your thread's mail also piles up. By using the SendMessageTimeout "ping" first, you ensure that
+		 the other thread is currently checking its mailbox before you solder yours to it.
+	*/
+	// Use SendMessageTimeout to see if the window is alive
+	var result uintptr
+	ret, _, _ := procSendMessageTimeout.Call(
+		uintptr(target),
+		WM_NULL, // WM_NULL (harmless ping)
+		0,
+		0,
+		SMTO_ABORTIFHUNG,  //0x0002, // SMTO_ABORTIFHUNG
+		HungWindowTimeout, // 150ms timeout
+		uintptr(unsafe.Pointer(&result)),
+	)
+
+	if ret == 0 {
+		logf("Target window HWND 0x%X is HUNG. Aborting AttachThreadInput to prevent deadlock.", target)
+		return false
+	}
+
+	// Only if the window responds do we proceed with the attachment
 	attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(1))
 	if attachRet == 0 {
 		logf("AttachThreadInput failed: %v", attachErr)
@@ -1717,13 +1819,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			startDrag(targetWnd, info.Pt)
 
 			//FIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
-			capturing = true //FIXME: this probably needs to be atomic if we go multi-threaded later(it's not m.t. yet) like if we make hooks go on their own thread!
+			capturing = true //FIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
 			if focusOnDrag && !isWindowForeground(targetWnd) {
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
 					WM_FOCUS_TARGET_WINDOW_SOMEHOW,
-					0, // no args to that function
-					0,
+					0,                                // wParam
+					makeLParam(info.Pt.X, info.Pt.Y), // lParam contains X and Y
 				)
 			}
 			//}
@@ -2531,8 +2633,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		injectShiftTapThenWinUp(which) // it's correct casting, as per AI.
 		return 0
 	case WM_FOCUS_TARGET_WINDOW_SOMEHOW:
+
+		// 2. Perform your focus logic...
+
 		//this is here because avoids focusing window or injecting LMB from the hook
 		if !forceForeground(targetWnd) {
+			// 3. If fallback click is needed, use absolute coordinates:
+
 			var extra string
 			if doLMBClick2FocusAsFallback {
 				extra = "; next, falling back to injected LMB click which, unfortunately, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!"
@@ -2542,10 +2649,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open(ie. press and release winkey once)%s", extra)
 
 			if doLMBClick2FocusAsFallback {
+				// 1. Extract coordinates from lParam
+				x := int32(lParam & 0xFFFF)
+				y := int32((lParam >> 16) & 0xFFFF)
 				//logf("injecting LMB click")
 				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
-				injectLMBClick()
+				//we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/inital window where gesture started upon.
+				injectLMBClickAtCoords(x, y)
 			}
 			// // Non-attachment focus: Simulate safe click to focus, doesn't work due to focus stealing prevention (win11) and thus only flashes the taskbar button of the target window. Actually the flashing is due to the above focus try(via attach thread first) failing! This may or may not do it alone, unsure.
 			// ret, _, err := procPostMessage.Call(uintptr(targetWnd), WM_LBUTTONDOWN, 1, makeLParam(10, 10)) // MK_LBUTTON = 1, safe pos
@@ -2638,7 +2749,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				0,
 			)
 			// Required by MSDN to dismiss menu correctly
-			procSendMessage.Call(hwnd, 0, 0, 0) // Send WM_NULL
+			procSendMessage.Call(hwnd, WM_NULL, 0, 0) // Send WM_NULL
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
