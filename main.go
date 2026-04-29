@@ -177,7 +177,7 @@ var (
 	procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
 	procDestroyWindow   = user32.NewProc("DestroyWindow")
 
-	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procGetWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
 	procGetWindowPlacement       = user32.NewProc("GetWindowPlacement")
 	procGetWindowRect            = user32.NewProc("GetWindowRect")
 	procShowWindow               = user32.NewProc("ShowWindow")
@@ -931,7 +931,7 @@ func windowFromPoint(pt POINT) windows.Handle {
 
 func getWindowPID(hwnd windows.Handle) uint32 {
 	var pid uint32
-	procGetWindowThreadProcessId.Call(
+	procGetWindowThreadProcessID.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&pid)),
 	)
@@ -1343,7 +1343,7 @@ func isOwnWindow(hwnd windows.Handle) bool {
 	}
 
 	var pid uint32
-	r1, _, _ := procGetWindowThreadProcessId.Call(
+	r1, _, _ := procGetWindowThreadProcessID.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&pid)),
 	)
@@ -1359,7 +1359,7 @@ func isOwnWindow(hwnd windows.Handle) bool {
 // is window in the same thread ID as the caller thread ID (could still be two diff. processes tho!)
 func isInSameThreadID(hwnd windows.Handle) bool {
 	var pid uint32
-	tid, _, _ := procGetWindowThreadProcessId.Call(
+	tid, _, _ := procGetWindowThreadProcessID.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&pid)),
 	)
@@ -1553,24 +1553,24 @@ func forceForeground(target windows.Handle) bool {
 	// 	return true // so it doesn't try the LMB click way next.
 	// }
 
-	var targetProcessId uint32
-	r1, _, err := procGetWindowThreadProcessId.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessId)))
+	var targetProcessID uint32
+	r1, _, err := procGetWindowThreadProcessID.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessID)))
 	if r1 == 0 {
 		logf("GetWindowThreadProcessId failed: %v", err)
 		return false
 	}
-	targetThreadId := uint32(r1)
+	var targetThreadID uint32 = uint32(r1)
 
 	curTid := windows.GetCurrentThreadId()
-	attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(1))
+	attachRet, _, attachErr := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(1))
 	if attachRet == 0 {
 		logf("AttachThreadInput failed: %v", attachErr)
 		return false
 	}
 
-	succeeded := focusThisHwnd(target)
+	defer procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)) // Detach always
 
-	procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadId), uintptr(0)) // Detach always
+	succeeded := focusThisHwnd(target) // still attached here.
 
 	return succeeded //fgRet != 0
 }
@@ -2135,7 +2135,7 @@ func createMessageWindow() (windows.Handle, error) {
 }
 
 var (
-	hookThreadId, mainThreadID uint32
+	hookThreadID, mainThreadID uint32
 	// Optional: prepare a mutex for later when we secure 'currentDrag'
 	// dragStateMutex sync.RWMutex
 )
@@ -2211,11 +2211,11 @@ func hookWorker() {
 	}() // defer
 
 	// 2. Save the OS Thread ID so our main thread can talk to it later
-	hookThreadId = windows.GetCurrentThreadId()
-	if mainThreadID == hookThreadId { //FIXME: temp, should be == here!
+	hookThreadID = windows.GetCurrentThreadId()
+	if mainThreadID == hookThreadID { //FIXME: temp, should be == here!
 		exitf(1, "main loop msg and hooks are NOT on two different threads, this will never happen unless code logic is broken!")
 	}
-	logf("Hook worker thread started. ThreadID: %d", hookThreadId)
+	logf("Hook worker thread started. ThreadID: %d", hookThreadID)
 
 	setAndVerifyPriority()
 
@@ -2702,13 +2702,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 const WM_QUIT = 0x0012
 
 func deinit() {
-	deinitThreadId := windows.GetCurrentThreadId()
+	deinitThreadID := windows.GetCurrentThreadId()
 	hardReset(false)
-	if hookThreadId != 0 {
+	if hookThreadID != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
-		procPostThreadMessage.Call(uintptr(hookThreadId), WM_QUIT, 0, 0)
+		procPostThreadMessage.Call(uintptr(hookThreadID), WM_QUIT, 0, 0)
 	}
-	if deinitThreadId == hookThreadId {
+	if deinitThreadID == hookThreadID {
 		//XXX:The rule is: The thread that calls SetWindowsHookEx MUST be the thread that calls UnhookWindowsHookEx.
 		//noFIXME: won't the above run the below as defer-ers and thus race ? actually can I even unhook those from this diff. thread?! it won't because those are in defer-ers too, so deferers are serialized.
 		if mouseHook != 0 {
@@ -4416,7 +4416,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	var pid uint32
 	if shouldLogFocusChanges || event == 0x0003 /*EVENT_SYSTEM_FOREGROUND*/ {
 		//then pid is needed in one OR two places
-		procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+		procGetWindowThreadProcessID.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
 		//"Pro-tip: You don't need to check err for this specific API because it doesn't set LastError in the traditional way; you just check if the return value (or the written pid variable) is 0. Your current check if pid == 0 is the correct way to handle it." - gemini 3 Fast
 		if pid == 0 {
 			//some error or wtw
