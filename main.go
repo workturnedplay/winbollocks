@@ -28,7 +28,7 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
-	//"sync"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -616,8 +616,11 @@ var (
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
 	capturing atomic.Bool
 	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
-	targetWnd   windows.Handle
+	targetWnd windows.Handle
+	//The Problem: targetWnd and currentDrag are highly volatile. mouseProc (Hook Thread) initializes currentDrag and reads its coordinates. Meanwhile, handleActualMoveOrResize (Main Thread) mutates currentDrag.knownMinW and knownMinH dynamically during a resize.
+	//Because currentDrag is a composite struct being read and mutated across threads, simple atomics aren't enough to prevent (state)tearing.
 	currentDrag *dragState
+	dragMutex   sync.Mutex
 
 	trayIcon NOTIFYICONDATA
 )
