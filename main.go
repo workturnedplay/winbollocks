@@ -462,7 +462,7 @@ const (
 
 /* ---------------- Types ---------------- */
 var (
-	resizing           bool
+	resizing           atomic.Bool
 	resizeZone         int
 	initialAspectRatio float64
 	respectAspectRatio bool = true // Default value for your toggle
@@ -591,16 +591,27 @@ var (
 	// ctrlDown  atomic.Bool
 	// altDown   atomic.Bool
 
+	//The Problem: winGestureUsed, capturing, and resizing manage your state machine. They are flipped by keyboardProc/mouseProc but cleared by hardReset/softReset (which can be triggered by the Main Thread via winEventProc).
 	// used exclusively to know when to inject shift key tap (shiftdown+shiftUP) at the point when physical winkeyUP aka winUP is detected //TODO: maybe remove because we do it(shifttap) now at gesture start
-	winGestureUsed bool = false //false initially
+	winGestureUsed atomic.Bool /*= func() atomic.Bool {
+		var b atomic.Bool
+		b.Store(false)
+		return b       //XXX: "return copies lock value: sync/atomic.Bool contains sync/atomic.noCopy copylocks"
+		//avoiding this copylocks means do it as a pointer *atomic.Bool (syntax doesn't change tho) or via init() below, i picked the latter.
+	}()*/
 )
+
+func init() {
+	// Initialize it here. It's clean, idiomatic, and performance-optimal.
+	winGestureUsed.Store(false) //false initially, but done this way in case you wanna set it to 'true' later on!
+}
 
 var (
 	mouseHook windows.Handle
 	kbdHook   windows.Handle
 
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
-	capturing bool
+	capturing atomic.Bool
 	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
 	targetWnd   windows.Handle
 	currentDrag *dragState
@@ -1232,8 +1243,8 @@ func keyDown(vk uintptr) bool {
 
 func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	//do this first
-	capturing = false
-	resizing = false
+	capturing.Store(false)
+	resizing.Store(false)
 	//do this second
 	targetWnd = 0
 
@@ -1256,10 +1267,10 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 
 func hardReset(releaseCapture bool) {
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	if winGestureUsed && winDown {
+	if winGestureUsed.Load() && winDown {
 		injectShiftTapOnly() // this way when winUP happens it won't pop up start menu
 		//alreadydoingitTODO: inject shift tap at the time gesture is detected!
-		winGestureUsed = false
+		winGestureUsed.Store(false)
 	}
 	softReset(releaseCapture)
 }
@@ -1734,9 +1745,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		var ctrlDown bool = keyDown(VK_CONTROL)
 		var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if !winGestureUsed { //wasn't set already
-				winGestureUsed = true // we used at least once of our gestures
-				injectShiftTapOnly()  // prevent releasing of winkey later from popping up Start menu!
+			if !winGestureUsed.Load() { //wasn't set already
+				winGestureUsed.Store(true) // we used at least once of our gestures
+				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
 			}
 
 			//var start bool = true // do we start the drag on the window under mouse?
@@ -1747,7 +1758,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				return 1 // swallow LMB
 			}
 
-			if capturing {
+			if capturing.Load() {
 				//XXX: happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
 				// if you now start to hold winkey(it will drag if you move mouse) and then press(or hold) LMB (you're here) and
 				// move mouse while LMB is held it continues to drag/move that same window.
@@ -1820,7 +1831,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			startDrag(targetWnd, info.Pt)
 
 			//FIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
-			capturing = true //FIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
+			capturing.Store(true) //FIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
 			if focusOnDrag.Load() && !isWindowForeground(targetWnd) {
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
@@ -1838,7 +1849,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		}
 
 	case WM_MOUSEMOVE:
-		if capturing && currentDrag != nil {
+		if capturing.Load() && currentDrag != nil {
 			//var stopDrag bool = false
 			// //FIXME: LMB is swallowed during our gesture move, even tho it would be down physically! so can't use async state! and in case of Winkey+L the LMB UP event is never seen by us, thus we don't know if LMB is UP physically when session is unlocked!
 			// var isLMBstillDown bool = keyDown(VK_LBUTTON)
@@ -1988,7 +1999,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			} //>=10ms
 		} //main 'if', for capturing aka moving/dragging window
 
-		if resizing && currentDrag != nil {
+		if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
 				nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
@@ -2009,7 +2020,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		} //second 'if', for resizing
 
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
-		if capturing && currentDrag != nil {
+		if capturing.Load() && currentDrag != nil {
 			//logf("was manual-capturing, now resetting state and releasing mouse capture")
 			// capturing = false
 			// currentDrag = nil
@@ -2023,12 +2034,12 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
 			return 1 //eat it
 		} // else let it pass
-		if capturing || currentDrag != nil {
+		if capturing.Load() || currentDrag != nil {
 			panic("race detected2, or at best improper cleanup")
 		}
 
 	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
-		if resizing && currentDrag != nil {
+		if resizing.Load() && currentDrag != nil {
 			softReset(true)
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // FIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
@@ -2036,7 +2047,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 			return 1 // Swallow
 		}
-		if resizing || currentDrag != nil {
+		if resizing.Load() || currentDrag != nil {
 			panic("race detected1, or at best improper cleanup")
 		}
 
@@ -2046,15 +2057,15 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		var ctrlDown bool = keyDown(VK_CONTROL)
 		var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if !winGestureUsed {
-				winGestureUsed = true
+			if !winGestureUsed.Load() {
+				winGestureUsed.Store(true)
 				injectShiftTapOnly() // prevent releasing of winkey later from popping up Start menu!
 			}
 			// if winGestureUsed {
 			// 	logf("you're already using another gesture") //FIXME: this can happen for other reasons as well, winkey+L ?
 			// 	return 1                                     //eat key
 			// }
-			if resizing {
+			if resizing.Load() {
 				logf("already resizing") //FIXME: like for 'capturing'
 			}
 			if currentDrag != nil {
@@ -2065,7 +2076,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			targetWnd = windowFromPoint(info.Pt)
 			if targetWnd != 0 {
 
-				resizing = true
+				resizing.Store(true)
 
 				var r RECT
 				procGetWindowRect.Call(uintptr(targetWnd), uintptr(unsafe.Pointer(&r)))
@@ -2095,9 +2106,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
-			if !winGestureUsed { //wasn't set already
-				winGestureUsed = true // we used at least once of our gestures
-				injectShiftTapOnly()  // prevent releasing of winkey later from popping up Start menu!
+			if !winGestureUsed.Load() { //wasn't set already
+				winGestureUsed.Store(true) // we used at least once of our gestures
+				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
 			}
 
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
@@ -2519,7 +2530,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
 	} else if data.W != 0 || data.H != 0 {
 		if currentDrag != nil {
-			if !resizing {
+			if !resizing.Load() {
 				logf("delayed resizing detected, while not 'resizing'.")
 			}
 			// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
@@ -3289,9 +3300,9 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 			//return 0 // pass thru the winkeyUP
 			//XXX: let it fall thru(aka pass thru the winkeyUP), so that procCallNextHookEx is called!
 			//} else
-			if winGestureUsed {
+			if winGestureUsed.Load() {
 				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
-				winGestureUsed = false // gesture ends with winkey_UP
+				winGestureUsed.Store(false) // gesture ends with winkey_UP
 
 				// • Injecting input from inside a WH_KEYBOARD_LL hook is documented as undefined.
 				// great, it was correct and other do it before, but now it's bad!
