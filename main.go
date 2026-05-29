@@ -608,10 +608,11 @@ var (
 	trayIcon NOTIFYICONDATA
 )
 
-var focusOnDrag bool                // whether or not to (also)focus dragged window
-var doLMBClick2FocusAsFallback bool // if normal(thread attach) focus fails, then do the LMB click on the window to focus it(caveat: can click inside it eg. on its buttons!)
-var ratelimitOnMove bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
-var shouldLogDragRate bool          // but only when ratelimitOnMove is true
+// Variables like focusOnDrag are modified in wndProc (Main Thread) when the user clicks the tray menu, but they are read constantly in mouseProc (Hook Thread).
+var focusOnDrag atomic.Bool                // whether or not to (also)focus dragged window
+var doLMBClick2FocusAsFallback atomic.Bool // if normal(thread attach) focus fails, then do the LMB click on the window to focus it(caveat: can click inside it eg. on its buttons!)
+var ratelimitOnMove atomic.Bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
+var shouldLogDragRate atomic.Bool          // but only when ratelimitOnMove is true
 
 /* ---------------- Utilities ---------------- */
 
@@ -1820,7 +1821,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 			//FIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
 			capturing = true //FIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
-			if focusOnDrag && !isWindowForeground(targetWnd) {
+			if focusOnDrag.Load() && !isWindowForeground(targetWnd) {
 				procPostMessage.Call(
 					uintptr(trayIcon.HWnd),
 					WM_FOCUS_TARGET_WINDOW_SOMEHOW,
@@ -1864,7 +1865,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			if !ShouldThrottle() {
 				// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
 				var now time.Time
-				if ratelimitOnMove {
+				if ratelimitOnMove.Load() {
 					now = time.Now()
 					// Count every potential move (even if we skip due to debounce)
 					moveCounter++
@@ -1895,14 +1896,14 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				// )
 
 				//THISIGNORESALLfrom_staticcheck//nolint:staticcheck,QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
-				var willPostMessage bool = !ratelimitOnMove || (newX != lastPostedX || newY != lastPostedY) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
+				var willPostMessage bool = !ratelimitOnMove.Load() || (newX != lastPostedX || newY != lastPostedY) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
 				// Optional: Also count only the ones that would have posted (uncomment if you want both stats)
-				if ratelimitOnMove && shouldLogDragRate && willPostMessage {
+				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && willPostMessage {
 					actualPostCounter++
 				}
 
 				// Periodic logging every ~1 second
-				if ratelimitOnMove && shouldLogDragRate && now.Sub(lastRateLogTime) >= rateLogInterval {
+				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && now.Sub(lastRateLogTime) >= rateLogInterval {
 					var secondsElapsed float64 = now.Sub(lastRateLogTime).Seconds()
 					if secondsElapsed > 0 {
 						rate := float64(moveCounter) / secondsElapsed
@@ -1976,7 +1977,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						droppedMoveEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
 					}
 
-					if ratelimitOnMove {
+					if ratelimitOnMove.Load() {
 						lastMovePostedTime = now
 						lastPostedX = newX
 						lastPostedY = newY
@@ -2641,14 +2642,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// 3. If fallback click is needed, use absolute coordinates:
 
 			var extra string
-			if doLMBClick2FocusAsFallback {
+			if doLMBClick2FocusAsFallback.Load() {
 				extra = "; next, falling back to injected LMB click which, unfortunately, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!"
 			} else {
 				extra = "."
 			}
 			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open(ie. press and release winkey once)%s", extra)
 
-			if doLMBClick2FocusAsFallback {
+			if doLMBClick2FocusAsFallback.Load() {
 				// 1. Extract coordinates from lParam
 				x := int32(lParam & 0xFFFF)
 				y := int32((lParam >> 16) & 0xFFFF)
@@ -2696,7 +2697,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			exitText := mustUTF16("Exit")
 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
-			if focusOnDrag {
+			if focusOnDrag.Load() {
 				actFlags |= MF_CHECKED
 			}
 
@@ -2704,17 +2705,17 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				uintptr(unsafe.Pointer(focusText)))
 
 			var lmbFlags uintptr = MF_STRING
-			if doLMBClick2FocusAsFallback {
+			if doLMBClick2FocusAsFallback.Load() {
 				lmbFlags |= MF_CHECKED
 			}
-			if !focusOnDrag {
+			if !focusOnDrag.Load() {
 				lmbFlags |= MF_DISABLED | MF_GRAYED
 			}
 			procAppendMenu.Call(hMenu, lmbFlags, MENU_USE_LMB_TO_FOCUS_AS_FALLBACK,
 				uintptr(unsafe.Pointer(doLMBClick2FocusAsFallbackText)))
 
 			var rlFlags uintptr = MF_STRING
-			if ratelimitOnMove {
+			if ratelimitOnMove.Load() {
 				rlFlags |= MF_CHECKED
 			}
 
@@ -2722,11 +2723,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				uintptr(unsafe.Pointer(ratelimitText)))
 
 			var sldrFlags uintptr = MF_STRING
-			if shouldLogDragRate {
+			if shouldLogDragRate.Load() {
 				sldrFlags |= MF_CHECKED
 			}
 			// Disable (grey) the "Log rate of moves" item when rate-limit is off
-			if !ratelimitOnMove {
+			if !ratelimitOnMove.Load() {
 				sldrFlags |= MF_DISABLED | MF_GRAYED
 			}
 			procAppendMenu.Call(hMenu, sldrFlags, MENU_LOG_RATE_OF_MOVES,
@@ -2753,12 +2754,12 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
-				focusOnDrag = !focusOnDrag
+				focusOnDrag.Store(!focusOnDrag.Load())
 			case MENU_USE_LMB_TO_FOCUS_AS_FALLBACK:
-				doLMBClick2FocusAsFallback = !doLMBClick2FocusAsFallback
+				doLMBClick2FocusAsFallback.Store(!doLMBClick2FocusAsFallback.Load())
 			case MENU_RATELIMIT_MOVES:
-				ratelimitOnMove = !ratelimitOnMove
-				if !ratelimitOnMove {
+				ratelimitOnMove.Store(!ratelimitOnMove.Load())
+				if !ratelimitOnMove.Load() {
 					moveCounter = 0
 					actualPostCounter = 0
 					now := time.Now()
@@ -2768,7 +2769,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 					lastPostedY = -1
 				}
 			case MENU_LOG_RATE_OF_MOVES:
-				shouldLogDragRate = !shouldLogDragRate
+				shouldLogDragRate.Store(!shouldLogDragRate.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -3423,14 +3424,14 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 */
 func init() {
 	//defaults:
-	focusOnDrag = true
+	focusOnDrag.Store(true)
 
 	//XXX: needed for cmd.exe running as Admin(because thread-attaching focus method fails!), not needed for task manager (thread-attaching method works!)
 	//also needed for focusing a target window while start menu is open already, because thread-attaching focus method fails.
-	doLMBClick2FocusAsFallback = true
+	doLMBClick2FocusAsFallback.Store(true)
 
-	ratelimitOnMove = false
-	shouldLogDragRate = false
+	ratelimitOnMove.Store(false)
+	shouldLogDragRate.Store(false)
 
 	lastPostedX = -1
 	lastPostedY = -1
