@@ -138,16 +138,17 @@ var (
 )
 
 var (
-	moveCounter     uint64    // how many move events we saw since last log
-	lastRateLogTime time.Time // when we last printed the rate
+	//The Problem: Variables like moveCounter and lastPostedX are incremented in the Hook Thread but get reset from the Main Thread when the user toggles the rate limiter in the system tray.
+	moveCounter     atomic.Uint64 // how many move events we saw since last log
+	lastRateLogTime time.Time     // when we last printed the rate
 	rateLogInterval = 1 * time.Second
 )
-var actualPostCounter uint64
+var actualPostCounter atomic.Uint64
 
 // Globals
 var (
 	lastMovePostedTime       time.Time
-	lastPostedX, lastPostedY int32
+	lastPostedX, lastPostedY atomic.Int32
 )
 
 // XXX: yes this works too, here: //revive:disable:var-naming
@@ -1879,7 +1880,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				if ratelimitOnMove.Load() {
 					now = time.Now()
 					// Count every potential move (even if we skip due to debounce)
-					moveCounter++
+					//moveCounter++
+					moveCounter.Add(1)
 					//FIXME: should allow logging even if rate limiting isn't enabled.
 					//logf("%d", moveCounter) //FIXME: temp, remove
 				}
@@ -1907,29 +1909,30 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				// )
 
 				//THISIGNORESALLfrom_staticcheck//nolint:staticcheck,QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
-				var willPostMessage bool = !ratelimitOnMove.Load() || (newX != lastPostedX || newY != lastPostedY) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
+				var willPostMessage bool = !ratelimitOnMove.Load() || (newX != lastPostedX.Load() || newY != lastPostedY.Load()) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
 				// Optional: Also count only the ones that would have posted (uncomment if you want both stats)
 				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && willPostMessage {
-					actualPostCounter++
+					//actualPostCounter++
+					actualPostCounter.Add(1)
 				}
 
 				// Periodic logging every ~1 second
 				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && now.Sub(lastRateLogTime) >= rateLogInterval {
 					var secondsElapsed float64 = now.Sub(lastRateLogTime).Seconds()
 					if secondsElapsed > 0 {
-						rate := float64(moveCounter) / secondsElapsed
+						rate := float64(moveCounter.Load()) / secondsElapsed
 						// logf("Drag move rate: %d events in %.2fs → %.1f moves/sec",
 						// 	moveCounter, secondsElapsed, rate)
 						// In the periodic log block:
 						logf("Drag move rate: %s potential / %s actual moves in %.2fs → %.1f / %.1f per sec",
-							withCommas(moveCounter), withCommas(actualPostCounter), secondsElapsed,
+							withCommas(moveCounter.Load()), withCommas(actualPostCounter.Load()), secondsElapsed,
 							rate, //float64(moveCounter)/secondsElapsed,
-							float64(actualPostCounter)/secondsElapsed)
+							float64(actualPostCounter.Load())/secondsElapsed)
 					}
 
 					// Reset counters
-					moveCounter = 0
-					actualPostCounter = 0
+					moveCounter.Store(0)
+					actualPostCounter.Store(0)
 					lastRateLogTime = now
 				}
 
@@ -1990,8 +1993,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 					if ratelimitOnMove.Load() {
 						lastMovePostedTime = now
-						lastPostedX = newX
-						lastPostedY = newY
+						lastPostedX.Store(newX)
+						lastPostedY.Store(newY)
 					}
 					//return 0 //0 = let it thru
 					//XXX: let it fall thru so CallNextHookEx is also called!
@@ -2274,13 +2277,13 @@ func hookWorker() {
 			hookPanicPayload.Store(r)
 
 			if status, ok := r.(exitStatus); ok {
-				currentExitCode = status.Code
+				currentExitCode.Store(int32(status.Code))
 				// This was an intentional exit(code)
 				//if code != 0 {
-				logf("hookWorker thread intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
+				logf("hookWorker thread intentionally exited with code: '%d' and error message: '%s'", currentExitCode.Load(), status.Message)
 				//}
 			} else {
-				currentExitCode = 1 //FIXME: this is accessed from two diff. threads, protect it.
+				currentExitCode.Store(1) //doneFIXME: this is accessed from two diff. threads, protect it.
 				stack := debug.Stack()
 				logf("--- hookWorker thread CRASH: %v ---\nStack: %s\n--- END---", r, stack)
 			}
@@ -2771,13 +2774,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			case MENU_RATELIMIT_MOVES:
 				ratelimitOnMove.Store(!ratelimitOnMove.Load())
 				if !ratelimitOnMove.Load() {
-					moveCounter = 0
-					actualPostCounter = 0
+					moveCounter.Store(0)
+					actualPostCounter.Store(0)
 					now := time.Now()
 					lastRateLogTime = now
 					lastMovePostedTime = now
-					lastPostedX = -1
-					lastPostedY = -1
+					lastPostedX.Store(-1)
+					lastPostedY.Store(-1)
 				}
 			case MENU_LOG_RATE_OF_MOVES:
 				shouldLogDragRate.Store(!shouldLogDragRate.Load())
@@ -3444,8 +3447,8 @@ func init() {
 	ratelimitOnMove.Store(false)
 	shouldLogDragRate.Store(false)
 
-	lastPostedX = -1
-	lastPostedY = -1
+	lastPostedX.Store(-1)
+	lastPostedY.Store(-1)
 	now := time.Now()
 	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
 	lastRateLogTime = now
@@ -3730,7 +3733,10 @@ func closeAndFlushLog() {
 
 type theILockedMainThreadToken struct{}
 
-var currentExitCode int = 0
+// The Problem: currentExitCode is currently an int. If the hookWorker thread crashes, it catches the panic, modifies currentExitCode, and tells the Main thread to die. This is a classic data race if the main thread happens to be in a defer simultaneously.
+// the standard library package sync/atomic does not offer an atomic.Int type. Instead, it forces you to be explicit about the memory width—providing atomic.Int32 and atomic.Int64.
+// Since your exit code maps directly to OS processes and Windows APIs (where exit codes are standard 32-bit integers), using atomic.Int32 ensures explicit compatibility across any CPU architecture you compile for.
+var currentExitCode atomic.Int32 // = 0
 
 // graceful exit if primary_defer() failed!
 // secondary defer, never runs unless primary defer is defective(ie. panics in itself)
@@ -3744,7 +3750,7 @@ func secondary_defer() {
 		logf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
 		exitcode = 121
 	}
-	logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode, exitcode)
+	logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode.Load(), exitcode)
 	closeAndFlushLog()
 	os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
 }
@@ -3766,13 +3772,13 @@ func primary_defer() { //primary defer
 	*/
 	if r := recover(); r != nil {
 		if status, ok := r.(exitStatus); ok {
-			currentExitCode = status.Code
+			currentExitCode.Store(int32(status.Code))
 			// This was an intentional exit(code)
 			//if code != 0 {
-			logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode, status.Message)
+			logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode.Load(), status.Message)
 			//}
 		} else {
-			currentExitCode = 1
+			currentExitCode.Store(1)
 			stack := debug.Stack()
 			logf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
 			//debug.PrintStack()
@@ -3803,7 +3809,7 @@ func primary_defer() { //primary defer
 	//XXX: these should be last:
 	closeAndFlushLog()
 	// 3. exit
-	os.Exit(currentExitCode) // XXX: oughtta be the only os.Exit! well 1of2
+	os.Exit(int(currentExitCode.Load())) // XXX: oughtta be the only os.Exit! well 1of2
 }
 
 func main() {
@@ -4459,10 +4465,32 @@ var shouldLogFocusChanges = false
 var shouldLogWindowEvents = true
 
 var (
+	// XXX: You already safely manage eventCount using atomic.AddUint64 and atomic.SwapUint64, which is good practice. Because you passed WINEVENT_OUTOFCONTEXT to SetWinEventHook, Windows delivers those callbacks to the message queue of the thread that registered the hook (the Main Thread). Therefore, lastReport and eventCount are technically single-threaded in this specific architecture, but keeping the atomics there is a smart defensive move against future refactors.
+	//well, read the comment for winEventProc below (didn't double check it, Geminit 3.5 Flash made)
 	eventCount uint64
 	lastReport time.Time = time.Now()
 )
 
+/*
+3. Can winEventProc be called recursively?
+
+Yes, absolutely. Windows hooks and event hooks (winEventProc) are notoriously prone to re-entrancy and recursive callbacks.
+
+When the user opens a system tray menu, Windows enters a modal loop. During this time, Windows continues pumping specialized messages and hooks entirely on the Main Thread. If a window in the background changes focus or generates an event while that menu is open, Windows will immediately interrupt the current thread state to invoke your winEventProc function.
+Why your eventCount is safe anyway:
+
+Even though re-entrancy can happen, your counter updates remain secure because you used atomic operations (like atomic.AddUint64 and atomic.SwapUint64).
+
+If you had written it as a standard assignment (eventCount++), a recursive interrupt could result in a lost update:
+
+	The thread reads the current value of eventCount (e.g., 5).
+
+	A recursive event interrupts the thread and executes winEventProc entirely. It reads 5, increments it to 6, and saves it.
+
+	The interrupt finishes, control returns to the original assignment, which still holds the stale value 5 in its CPU register, increments it to 6, and overwrites the variable. The recursive increment is completely lost.
+
+By treating them as atomic assignments, you effectively forced the CPU to perform the increment as an indivisible operation at the hardware level, preventing recursion from causing corrupted calculations.
+*/
 func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
 	// ONLY process if it's the actual window, not a sub-control/caret/item
 	if idObject != 0 { // 0 is OBJID_WINDOW

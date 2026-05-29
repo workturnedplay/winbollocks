@@ -8,7 +8,7 @@ run:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-use-default: true
+  exclude-use-default: false
 #  exclude-rules:
 #    - linters: [revive]
 #      text: "ALL_CAPS"
@@ -58,6 +58,7 @@ linters:
     govet:
       enable:
         - shadow # Explicitly enable the shadowing check
+        - copylocks # if you use atomic var without .Load() in a printf, it should be an err not warn
       settings:
         shadow:
           strict: false # This makes it even more aggressive, if 'true'
