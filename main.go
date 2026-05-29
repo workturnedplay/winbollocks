@@ -137,17 +137,19 @@ var (
 	winEventCallback = windows.NewCallback(winEventProc)
 )
 
+var appStartTime = time.Now() //only useful because time.Time keeps track of monotonic clock, good for .Sub() operations!
+
 var (
 	//The Problem: Variables like moveCounter and lastPostedX are incremented in the Hook Thread but get reset from the Main Thread when the user toggles the rate limiter in the system tray.
 	moveCounter     atomic.Uint64 // how many move events we saw since last log
-	lastRateLogTime time.Time     // when we last printed the rate
+	lastRateLogTime atomic.Int64  // when we last printed the rate // Monotonic nanoseconds from appStartTime
 	rateLogInterval = 1 * time.Second
 )
 var actualPostCounter atomic.Uint64
 
 // Globals
 var (
-	lastMovePostedTime       time.Time
+	lastMovePostedTime       atomic.Int64 // Monotonic nanoseconds from appStartTime
 	lastPostedX, lastPostedY atomic.Int32
 )
 
@@ -1877,8 +1879,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			if !ShouldThrottle() {
 				// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
 				var now time.Time
+				var nowOffset time.Duration
 				if ratelimitOnMove.Load() {
 					now = time.Now()
+					nowOffset = now.Sub(appStartTime)
 					// Count every potential move (even if we skip due to debounce)
 					//moveCounter++
 					moveCounter.Add(1)
@@ -1909,7 +1913,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				// )
 
 				//THISIGNORESALLfrom_staticcheck//nolint:staticcheck,QF1011: could omit type bool from declaration; it will be inferred from the right-hand side (staticcheck)go-golangci-lint-v2
-				var willPostMessage bool = !ratelimitOnMove.Load() || (newX != lastPostedX.Load() || newY != lastPostedY.Load()) && now.Sub(lastMovePostedTime) >= MIN_MOVE_INTERVAL
+				var willPostMessage bool = !ratelimitOnMove.Load() || (newX != lastPostedX.Load() || newY != lastPostedY.Load()) && (nowOffset-time.Duration(lastMovePostedTime.Load())) >= MIN_MOVE_INTERVAL
 				// Optional: Also count only the ones that would have posted (uncomment if you want both stats)
 				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && willPostMessage {
 					//actualPostCounter++
@@ -1917,23 +1921,26 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				}
 
 				// Periodic logging every ~1 second
-				if ratelimitOnMove.Load() && shouldLogDragRate.Load() && now.Sub(lastRateLogTime) >= rateLogInterval {
-					var secondsElapsed float64 = now.Sub(lastRateLogTime).Seconds()
-					if secondsElapsed > 0 {
-						rate := float64(moveCounter.Load()) / secondsElapsed
-						// logf("Drag move rate: %d events in %.2fs → %.1f moves/sec",
-						// 	moveCounter, secondsElapsed, rate)
-						// In the periodic log block:
-						logf("Drag move rate: %s potential / %s actual moves in %.2fs → %.1f / %.1f per sec",
-							withCommas(moveCounter.Load()), withCommas(actualPostCounter.Load()), secondsElapsed,
-							rate, //float64(moveCounter)/secondsElapsed,
-							float64(actualPostCounter.Load())/secondsElapsed)
-					}
+				if ratelimitOnMove.Load() && shouldLogDragRate.Load() {
+					foo := (nowOffset - time.Duration(lastRateLogTime.Load()))
+					if foo >= rateLogInterval {
+						var secondsElapsed float64 = foo.Seconds()
+						if secondsElapsed > 0 {
+							rate := float64(moveCounter.Load()) / secondsElapsed
+							// logf("Drag move rate: %d events in %.2fs → %.1f moves/sec",
+							// 	moveCounter, secondsElapsed, rate)
+							// In the periodic log block:
+							logf("Drag move rate: %s potential / %s actual moves in %.2fs \xbb %.1f / %.1f per sec", // \xbb is »
+								withCommas(moveCounter.Load()), withCommas(actualPostCounter.Load()), secondsElapsed,
+								rate, //float64(moveCounter)/secondsElapsed,
+								float64(actualPostCounter.Load())/secondsElapsed)
+						}
 
-					// Reset counters
-					moveCounter.Store(0)
-					actualPostCounter.Store(0)
-					lastRateLogTime = now
+						// Reset counters
+						moveCounter.Store(0)
+						actualPostCounter.Store(0)
+						lastRateLogTime.Store(int64(nowOffset))
+					}
 				}
 
 				// Then proceed with your existing debounce/post logic...
@@ -1992,7 +1999,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					}
 
 					if ratelimitOnMove.Load() {
-						lastMovePostedTime = now
+						lastMovePostedTime.Store(int64(nowOffset))
 						lastPostedX.Store(newX)
 						lastPostedY.Store(newY)
 					}
@@ -2776,14 +2783,28 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				if !ratelimitOnMove.Load() {
 					moveCounter.Store(0)
 					actualPostCounter.Store(0)
-					now := time.Now()
-					lastRateLogTime = now
-					lastMovePostedTime = now
+					//nowOffset := time.Now().Sub(appStartTime)
+					nowOffset := time.Since(appStartTime)
+					lastRateLogTime.Store(int64(nowOffset))
+					lastMovePostedTime.Store(int64(nowOffset))
 					lastPostedX.Store(-1)
 					lastPostedY.Store(-1)
 				}
 			case MENU_LOG_RATE_OF_MOVES:
 				shouldLogDragRate.Store(!shouldLogDragRate.Load())
+				// If the user just turned logging ON, flush out old state
+				// so the very first log statement starts fresh!
+				if shouldLogDragRate.Load() { // When turning ON
+					moveCounter.Store(0)
+					actualPostCounter.Store(0)
+
+					nowOffset := time.Since(appStartTime)
+					lastRateLogTime.Store(int64(nowOffset))
+					lastMovePostedTime.Store(int64(nowOffset))
+
+					lastPostedX.Store(-1)
+					lastPostedY.Store(-1)
+				}
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -3449,10 +3470,11 @@ func init() {
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
-	now := time.Now()
+	//nowOffset := time.Now().Sub(appStartTime)
+	nowOffset := time.Since(appStartTime)
 	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
-	lastRateLogTime = now
-	lastMovePostedTime = now
+	lastRateLogTime.Store(int64(nowOffset))
+	lastMovePostedTime.Store(int64(nowOffset))
 }
 
 var selfPID uint32
