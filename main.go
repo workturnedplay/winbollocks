@@ -28,7 +28,7 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
-	"sync"
+	//"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -465,8 +465,6 @@ const (
 
 /* ---------------- Types ---------------- */
 var (
-	resizing           atomic.Bool
-	resizeZone         int
 	initialAspectRatio float64
 	respectAspectRatio bool = true // Default value for your toggle
 )
@@ -614,16 +612,38 @@ var (
 	kbdHook   windows.Handle
 
 	//"the app is effectively single-threaded for these vars (pinned thread, serialized hooks/message loop), so no concurrency risks."- grok expert
-	capturing atomic.Bool
-	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
-	targetWnd windows.Handle
-	//The Problem: targetWnd and currentDrag are highly volatile. mouseProc (Hook Thread) initializes currentDrag and reads its coordinates. Meanwhile, handleActualMoveOrResize (Main Thread) mutates currentDrag.knownMinW and knownMinH dynamically during a resize.
-	//Because currentDrag is a composite struct being read and mutated across threads, simple atomics aren't enough to prevent (state)tearing.
-	currentDrag *dragState
-	dragMutex   sync.Mutex
+	//so capturing here means window is grabbed, not that mouse is captured
+	//capturing atomic.Bool
+	//	targetWnd windows.Handle
+	//	//The Problem: targetWnd and currentDrag are highly volatile. mouseProc (Hook Thread) initializes currentDrag and reads its coordinates. Meanwhile, handleActualMoveOrResize (Main Thread) mutates currentDrag.knownMinW and knownMinH dynamically during a resize.
+	//	//Because currentDrag is a composite struct being read and mutated across threads, simple atomics aren't enough to prevent (state)tearing.
+	//	currentDrag *dragState
 
 	trayIcon NOTIFYICONDATA
 )
+
+type DragMode int
+
+const (
+	ModeMove   DragMode = iota // aka drag-move
+	ModeResize                 // resizing window
+)
+
+type dragSession struct {
+	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
+	targetWnd  windows.Handle
+	state      dragState
+	resizeZone int
+	mode       DragMode
+}
+
+// A single atomic pointer handles the entire active state machine.
+// Perfect Safety via Immutability
+// The golden rule that makes this work is: Once a dragSession struct is created, its fields are never altered.
+//
+//	To stop a drag: You point the global variable to nil (softReset).
+//	To start a new drag: You allocate a brand new struct on the heap and point the global variable to it (startDrag).
+var activeSession atomic.Pointer[dragSession]
 
 // Variables like focusOnDrag are modified in wndProc (Main Thread) when the user clicks the tray menu, but they are read constantly in mouseProc (Hook Thread).
 var focusOnDrag atomic.Bool                // whether or not to (also)focus dragged window
@@ -657,7 +677,7 @@ func getResizeZone(pt POINT, r RECT) int {
 const minimumW = 300
 const minimumH = 300
 
-func calculateResize(drag *dragState, zone int, currentPt POINT) (x, y, w, h int32) {
+func calculateResize(drag dragState, zone int, currentPt POINT) (x, y, w, h int32) {
 	dx := currentPt.X - drag.startPt.X
 	dy := currentPt.Y - drag.startPt.Y
 
@@ -1208,16 +1228,21 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 	//capture is released cleanly
 	//no weird input edge cases
 
-	currentDrag = &dragState{startPt: pt, startRect: r}
+	//currentDrag = &dragState{startPt: pt, startRect: r}
+	// Both variables are published to the rest of the application simultaneously
+
+	if cur := activeSession.Load(); cur != nil {
+		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
+	}
+	activeSession.Store(&dragSession{
+		targetWnd: hwnd,
+		mode:      ModeMove,
+		state:     dragState{startPt: pt, startRect: r},
+	})
 }
 
-func startDrag(hwnd windows.Handle, pt POINT) {
+func startDrag(hwnd windows.Handle, pt POINT) bool {
 	//logf("startDrag")
-	if isMaximized(hwnd) {
-		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
-		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
-		//TODO: should I re-maximize if it was maximized, after drag/move is done?
-	}
 
 	pid := getWindowPID(hwnd)
 	targetIL, e1 := processIntegrityLevel(pid)
@@ -1229,7 +1254,7 @@ func startDrag(hwnd windows.Handle, pt POINT) {
 		//XXX: this actually never gets reached because windows doesn't allow winbollocks to see the events(while higher itegrity window is focused) thus the gesture to drag it can never trigger!
 		procName := getProcessNameFast(pid)
 		showTrayInfo("winbollocks", fmt.Sprintf("Cannot use native drag on elevated window with pid=%d (%s)", pid, procName))
-		return
+		return false
 	}
 	if e1 != nil {
 		logf("e1: %v", e1)
@@ -1238,8 +1263,13 @@ func startDrag(hwnd windows.Handle, pt POINT) {
 	//		logf("e2: %v", e2)
 	//	}
 	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
-
+	if isMaximized(hwnd) {
+		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
+		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
+		//TODO: should I re-maximize if it was maximized, after drag/move is done?
+	}
 	startManualDrag(hwnd, pt)
+	return true
 }
 
 func keyDown(vk uintptr) bool {
@@ -1249,12 +1279,7 @@ func keyDown(vk uintptr) bool {
 
 func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	//do this first
-	capturing.Store(false)
-	resizing.Store(false)
-	//do this second
-	targetWnd = 0
-
-	currentDrag = nil
+	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
 
 	/*
 		The Problem: If you call it in the hook, you are releasing capture on the Hook Thread. But window capture is thread-specific.
@@ -1764,16 +1789,18 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				return 1 // swallow LMB
 			}
 
-			if capturing.Load() {
+			session := activeSession.Load()
+			if session != nil && session.mode == ModeMove {
+				//if capturing.Load() {
 				//XXX: happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
 				// if you now start to hold winkey(it will drag if you move mouse) and then press(or hold) LMB (you're here) and
 				// move mouse while LMB is held it continues to drag/move that same window.
-				logf("already capturing, means you were moving a window pressed winkey+L released all then unlocked session then held winkey(again) " +
+				logf("already drag-moving a window, means you were moving a window then pressed winkey+L then released all then unlocked session then held winkey(again) " +
 					"and pressed(or held) LMB (on same or new window target!) thus you're now here.")
 				//In Go, when you use the + operator with string literals (text wrapped in double quotes), the compiler performs constant folding.
 				// This means it joins them together while building your binary, so there is zero performance penalty at runtime.
 
-				if targetWnd == 0 {
+				if session.targetWnd == 0 {
 					//start = false
 					panic("impossible state(while single-threaded win32 app in 20feb2026), logic error: you were 'capturing' " +
 						"but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window! even softReset does capturing=0 then targetWnd=0 first!")
@@ -1784,9 +1811,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// if it's same old one, the dragging is still thought to happen (if winkey is held down anew before moving mouse, else you'd not be here), so don't start a new drag?
 					// if it's new, have to softReset() first because otherwise it will still drag the old one! and let it start drag again?
 
-					if targetWnd == wantTargetWnd {
+					if session.targetWnd == wantTargetWnd {
 						//same old window
-						logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", targetWnd)
+						logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", session.targetWnd)
 						//FIXME: should probably use the new mouse coords for this drag, meaning softReset() this variant too and let it start anew(like the below new window one)
 						//start = false
 						return 1 //swallow LMB
@@ -1794,9 +1821,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						//a new window
 						// it's a drag of a new window but we were moving the old window before that and didn't stop (for winkey+L reason for example!)
 						logf("Avoided moving the old window HWND=0x%X ie. you were moving a window while winkey+L happened, now you unlocked session and you're newly holding winkey "+
-							"but you LMB-ed on ANOTHER window(ie. trying to move another window), so we're not gonna move the old window anymore but the new one!", targetWnd)
+							"but you LMB-ed on ANOTHER window(ie. trying to move another window), so we're not gonna move the old window anymore but the new one!", session.targetWnd)
 
-						logf("drag-moving new window HWND=0x%X instead of the old one HWND=0x%X", wantTargetWnd, targetWnd)
+						logf("drag-moving new window HWND=0x%X instead of the old one HWND=0x%X", wantTargetWnd, session.targetWnd)
 						softReset(true)
 						//start = true
 					}
@@ -1804,47 +1831,30 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				//start = true
 				// } else {
 				// 	start = true
+			} // was ModeMove
+
+			//session.targetWnd = wantTargetWnd // never 0 if we're here!
+			if session != nil {
+				panic("bad coding: non-nil session before startDrag")
 			}
-
-			targetWnd = wantTargetWnd // never 0 if we're here!
-
-			// //check prev. dragged window, is it same as current?
-			// if targetWnd != wantTargetWnd {
-			// 	//we're here because either this is first drag ever or it's a drag of a different/new window!
-			// 	if capturing && targetWnd != 0 {
-			// 		// it's a drag of a new window but we were moving the old window before that and didn't stop (for winkey+L reason for example!)
-			// 		logf("Avoided moving the old window HWND=0x%X ie. you were moving a window while winkey+L happened, now you unlocked session and you're newly holding winkey "+
-			// 			"but you LMB-ed on ANOTHER window(ie. trying to move another window), so we're not gonna move the old window anymore but the new one!", targetWnd)
-			// 		softReset()
-			// 		start = true
-			// 	} else {
-			// 		// you were not capturing already and
-			// 		if targetWnd == 0 {
-			// 			//start = false
-			// 			panic("impossible state, logic error: you were 'capturing' but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window! even softReset does capturing=0 then targetWnd=0 first!")
-			// 		}
-			// 		// so you're here because you're not capturing already and you had a target before but now's a new one! so need to start dragging!
-			// 		start = true
-			// 	}
-			// 	targetWnd = wantTargetWnd
-			// 	logf("drag-moving new window HWND=0x%X", targetWnd)
-			// } else {
-			// 	logf("continuing to drag-move same old window HWND=0x%X", targetWnd)
-			// }
-
 			//if start {
 			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
-			startDrag(targetWnd, info.Pt)
-
-			//FIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
-			capturing.Store(true) //FIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
-			if focusOnDrag.Load() && !isWindowForeground(targetWnd) {
-				procPostMessage.Call(
-					uintptr(trayIcon.HWnd),
-					WM_FOCUS_TARGET_WINDOW_SOMEHOW,
-					0,                                // wParam
-					makeLParam(info.Pt.X, info.Pt.Y), // lParam contains X and Y
-				)
+			if startDrag(wantTargetWnd, info.Pt) {
+				session := activeSession.Load()
+				if session == nil {
+					panic("bad coding: nil session after startDrag returned true")
+				}
+				//doneFIXME: find out when to set this to true, vs when (above) checking it, might need to be atomic to avoid a theoretical race, at least in theory if say i do winkey+LMB which checks capturing then before setting it to true here somehow winkey+L and unlock and winkey+LMB happens again!
+				//capturing.Store(true) //doneFIXME: this probably needs to be atomic if we go multi-threaded later(it is m.t. now!) like if we make hooks go on their own thread!
+				if focusOnDrag.Load() && !isWindowForeground(session.targetWnd) { //TODO: should I move this in startDrag?
+					//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
+					procPostMessage.Call(
+						uintptr(trayIcon.HWnd),
+						WM_FOCUS_TARGET_WINDOW_SOMEHOW,
+						uintptr(session.targetWnd),       // wParam
+						makeLParam(info.Pt.X, info.Pt.Y), // lParam contains X and Y
+					)
+				}
 			}
 			//}
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
@@ -1855,7 +1865,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		}
 
 	case WM_MOUSEMOVE:
-		if capturing.Load() && currentDrag != nil {
+		session := activeSession.Load()
+		if session == nil {
+			break // No drag or resize is active, do nothing!
+		}
+		switch session.mode {
+		case ModeMove:
+			//if capturing.Load() && currentDrag != nil {
 			//var stopDrag bool = false
 			// //FIXME: LMB is swallowed during our gesture move, even tho it would be down physically! so can't use async state! and in case of Winkey+L the LMB UP event is never seen by us, thus we don't know if LMB is UP physically when session is unlocked!
 			// var isLMBstillDown bool = keyDown(VK_LBUTTON)
@@ -1893,9 +1909,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					//logf("%d", moveCounter) //FIXME: temp, remove
 				}
 
-				dx := info.Pt.X - currentDrag.startPt.X
-				dy := info.Pt.Y - currentDrag.startPt.Y
-				r := currentDrag.startRect
+				dx := info.Pt.X - session.state.startPt.X
+				dy := info.Pt.Y - session.state.startPt.Y
+				r := session.state.startRect
 				// windows.SetWindowPos(
 				// targetWnd, 0,
 				// r.Left+dx, r.Top+dy,
@@ -1957,7 +1973,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// Create a local copy of the data.
 					// This stays on the STACK, so it's lightning fast.
 					data := WindowMoveData{
-						Hwnd:        targetWnd,
+						Hwnd:        session.targetWnd,
 						X:           newX,
 						Y:           newY,
 						InsertAfter: 0, // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
@@ -2010,16 +2026,16 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					//XXX: let it fall thru so CallNextHookEx is also called!
 				} // willPostMessage
 			} //>=10ms
-		} //main 'if', for capturing aka moving/dragging window
-
-		if resizing.Load() && currentDrag != nil {
+			//} //main 'if', for capturing aka moving/dragging window
+		case ModeResize:
+			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(currentDrag, resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
+				nx, ny, nw, nh := calculateResize(session.state, session.resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
 
 				// Send to your mover channel
 				moveDataChan <- WindowMoveData{
-					Hwnd:  targetWnd,
+					Hwnd:  session.targetWnd,
 					X:     nx,
 					Y:     ny,
 					W:     nw,
@@ -2030,10 +2046,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
 			} //>=10ms
 			//XXX: let it fall thru so the move isn't eaten.
-		} //second 'if', for resizing
+			//} //second 'if', for resizing
+		} //switch
 
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
-		if capturing.Load() && currentDrag != nil {
+		session := activeSession.Load()
+		if session == nil {
+			break // No drag or resize is active, do nothing!
+		}
+		if session.mode == ModeMove {
+
+			//		if capturing.Load() && currentDrag != nil {
 			//logf("was manual-capturing, now resetting state and releasing mouse capture")
 			// capturing = false
 			// currentDrag = nil
@@ -2047,12 +2070,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
 			return 1 //eat it
 		} // else let it pass
-		if capturing.Load() || currentDrag != nil {
-			panic("race detected2, or at best improper cleanup")
-		}
+		// if capturing.Load() || currentDrag != nil {
+		// 	panic("race detected2, or at best improper cleanup")
+		// }
 
 	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
-		if resizing.Load() && currentDrag != nil {
+		session := activeSession.Load()
+		if session == nil {
+			break // No drag or resize is active, do nothing!
+		}
+		if session.mode == ModeResize {
+			//if resizing.Load() && currentDrag != nil {
 			softReset(true)
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // FIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
@@ -2060,9 +2088,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 			return 1 // Swallow
 		}
-		if resizing.Load() || currentDrag != nil {
-			panic("race detected1, or at best improper cleanup")
-		}
+		// if resizing.Load() || currentDrag != nil {
+		// 	panic("race detected1, or at best improper cleanup")
+		// }
 
 	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -2078,36 +2106,52 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			// 	logf("you're already using another gesture") //FIXME: this can happen for other reasons as well, winkey+L ?
 			// 	return 1                                     //eat key
 			// }
-			if resizing.Load() {
-				logf("already resizing") //FIXME: like for 'capturing'
+			session := activeSession.Load()
+			if session != nil {
+				if session.mode == ModeResize {
+					//if resizing.Load() {
+					logf("already resizing") //FIXME: like for 'capturing'
+				}
+				softReset(true) //temporary, fixme ^
+				//}
+				// if currentDrag != nil {
+				// 	//FIXME: what to do here.
+				// 	logf("didn't clean up last resize/drag gesture")
+				// 	return 1
+				// }
 			}
-			if currentDrag != nil {
-				//FIXME: what to do here.
-				logf("didn't clean up last resize/drag gesture")
-				return 1
+			if session != nil {
+				panic("bad coding: non-nil session before about to start a resizing session")
 			}
-			targetWnd = windowFromPoint(info.Pt)
+			targetWnd := windowFromPoint(info.Pt)
 			if targetWnd != 0 {
 
-				resizing.Store(true)
+				//resizing.Store(true)
 
 				var r RECT
 				procGetWindowRect.Call(uintptr(targetWnd), uintptr(unsafe.Pointer(&r)))
 
-				currentDrag = &dragState{startPt: info.Pt, startRect: r,
-					knownMinW: minimumW, // Start with your 300px default
-					knownMinH: minimumH}
-				resizeZone = getResizeZone(info.Pt, r)
+				activeSession.Store(&dragSession{
+					targetWnd: targetWnd,
+					mode:      ModeResize,
+					state: dragState{startPt: info.Pt, startRect: r,
+						knownMinW: minimumW, // Start with your 300px default
+						knownMinH: minimumH},
+					resizeZone: getResizeZone(info.Pt, r),
+				})
 
 				w := float64(r.Right - r.Left)
 				h := float64(r.Bottom - r.Top)
 				initialAspectRatio = w / h
 
 				procSetCapture.Call(uintptr(trayIcon.HWnd))
+
 				if nowDiff := time.Since(start); nowDiff > fiveMs {
 					logf("stutter6 %d ns", nowDiff.Nanoseconds())
 				}
 				return 1 // Swallow
+			} else {
+				logf("couldn't start resizing session due to target window handle is 0")
 			}
 		} //if
 
@@ -2542,8 +2586,13 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
 	} else if data.W != 0 || data.H != 0 {
-		if currentDrag != nil {
-			if !resizing.Load() {
+		// 1. Load the current master pointer
+		ptr := activeSession.Load()
+		if ptr != nil {
+			session := *ptr // TODO: use this on-stack thing for other session:=activeSession.Load() places
+			//if currentDrag != nil {
+			if session.mode != ModeResize {
+				//if !resizing.Load() {
 				logf("delayed resizing detected, while not 'resizing'.")
 			}
 			// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
@@ -2563,12 +2612,12 @@ func handleActualMoveOrResize(data WindowMoveData) {
 
 			clamped := false
 			// If actual width is larger than what we requested AND larger than our currently known minimum
-			if actualW > data.W && actualW > currentDrag.knownMinW {
-				currentDrag.knownMinW = actualW
+			if actualW > data.W && actualW > session.state.knownMinW {
+				session.state.knownMinW = actualW
 				clamped = true
 			}
-			if actualH > data.H && actualH > currentDrag.knownMinH {
-				currentDrag.knownMinH = actualH
+			if actualH > data.H && actualH > session.state.knownMinH {
+				session.state.knownMinH = actualH
 				clamped = true
 			}
 
@@ -2578,7 +2627,22 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				var pt POINT
 				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
 
-				nx, ny, nw, nh = calculateResize(currentDrag, resizeZone, pt)
+				nx, ny, nw, nh = calculateResize(session.state, session.resizeZone, pt)
+				// 4. ATOMICALLY PUBLISH IT BACK
+				// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
+				// If the user released the mouse and softReset(nil) ran in the meantime,
+				// or if a brand new drag started, this CAS will safely fail, preventing
+				// you from accidentally resurrecting a dead or obsolete session!
+
+				//_ = activeSession.CompareAndSwap(ptr, &session) // this makes 'session' be on heap!
+
+				// 2. ONLY allocate a heap value if a clamping threshold was crossed!
+				// We build a new heap-allocated wrapper and attempt the swap.
+				heapUpdate := session
+
+				// If it fails, we don't care! It means another thread mutated the session pointer,
+				// but our stack-local 'session' variables remain valid for finishing this frame.
+				_ = activeSession.CompareAndSwap(ptr, &heapUpdate)
 
 				// Snap the window back to the correct anchor point
 				procSetWindowPos.Call(
@@ -2593,9 +2657,9 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
 			//	//lacks SWP_NOSIZE so it's a resize!
 			// ---- OVERLAY UPDATE ----
-			//FIXME: crashes here due to nil pointer deref, likely due to currentDrag being nil race.
-			startW := currentDrag.startRect.Right - currentDrag.startRect.Left
-			startH := currentDrag.startRect.Bottom - currentDrag.startRect.Top
+			//doneFIXME: crashes here due to nil pointer deref, likely due to currentDrag being nil race.
+			startW := session.state.startRect.Right - session.state.startRect.Left
+			startH := session.state.startRect.Bottom - session.state.startRect.Top
 			updateOverlay(nx, ny, nw, nh, startW, startH)
 			//}
 			// ------------------------
@@ -2658,11 +2722,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		injectShiftTapThenWinUp(which) // it's correct casting, as per AI.
 		return 0
 	case WM_FOCUS_TARGET_WINDOW_SOMEHOW:
-
+		targetWindow := windows.Handle(wParam)
 		// 2. Perform your focus logic...
 
 		//this is here because avoids focusing window or injecting LMB from the hook
-		if !forceForeground(targetWnd) {
+		if !forceForeground(targetWindow) {
 			// 3. If fallback click is needed, use absolute coordinates:
 
 			var extra string
@@ -4645,6 +4709,13 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			//}
 			//hardResetIfDesynced() // your recovery function, TODO:
 			// Or force suppression if Win held, etc.
+			// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+			// if winDown && !winGestureUsed.Load() {
+			// 	//pretend this focus event was due to pressign LMB which would've be detected due to higher integrity window, thus this will cause hardReset() below to prevent winkeyUp from popping up start menu
+			// 	//doesn't seem to work because winDown is likely not detected here
+			// 	winGestureUsed.Store(true)
+			// }
+			//hardReset(true)
 			softReset(true)
 		} else {
 			if shouldLogFocusChanges {
