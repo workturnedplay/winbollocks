@@ -1,7 +1,7 @@
 todo:
-* move hideOverlay in wndProc
 * in ModeResize do the same 'if'-block that ModeMove has if already drag-moving
 * maybe WindowMoveData should contain the knownMinW and knownMinH and resizeZone and startPt and startRect, so a dragState copy basically!
+*	trayIcon.HWnd = hwnd //FIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
 * fix this: i press/hold shift then winkey (in this order) them MMB click, then release shift (still holding winkey) and it pops up the start menu! it shouldn't (note that i'm already using Rshift as the workaround for not opening Start menu)
@@ -14,9 +14,10 @@ todo:
 * shall we allow winkey+LMB+RMB to both work, currently panicking on MB UP, see if currentDrag should be different var for each, not same.
 * unclear if I should touch GOMAXPROCS at all though, maybe only if numCPU is less than 3 ?
 * add focus window while the resize is happening/started
-* move hideOverlay to wndProc away from hooks, hits stutter7 occasionally
 
 done:
+//* move hideOverlay to wndProc away from hooks, hits stutter7 occasionally
+//* move hideOverlay in wndProc
 //they can be moved * see if child windows or dialogs like the LAN adapter config. can be moved and how.
 //* FIXME: winkey+L will make prog think winkey is held after unlock!
 //fixed printing was blocking thus our hooks weren't running //* ensure when runasadmin.bat and LMB-dragging scrollbar of that cmd.exe (admin) the mouse movements aren't 500ms delayed - probably need to use separate thread for hooks(+ their own msg.loop). This only happened in devbuild.bat not in build.bat btw.

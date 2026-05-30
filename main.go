@@ -390,6 +390,7 @@ const (
 	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
 	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
+	WM_HIDE_OVERLAY                = WM_USER + 205
 )
 const (
 	MENU_EXIT                         = 1
@@ -1293,7 +1294,14 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		procReleaseCapture.Call()
 	}
 
-	hideOverlay() //FIXME: move this to wndProc ! else u hit stutter7 occasionally!
+	//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
+	// Instead of calling hideOverlay() synchronously on the hook thread,
+	// post it asynchronously to your main thread's message window loop.
+	if trayIcon.HWnd != 0 {
+		procPostMessage.Call(uintptr(trayIcon.HWnd), WM_HIDE_OVERLAY, 0, 0)
+	} else {
+		logf("unexpected: failed to hideOverlay due to trayIcon.HWnd being 0")
+	}
 }
 
 func hardReset(releaseCapture bool) {
@@ -2699,10 +2707,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		drainMoveChannel() // Pull everything from the channel
 		return 0           // Handled
 
+	case WM_HIDE_OVERLAY:
+		hideOverlay()
+		return 0
+
 	case WM_QUERYENDSESSION:
 		// system is asking permission to end session
 		logf("system is asking permission to end session")
 		return 1 // allow
+
 	case WM_ENDSESSION:
 		if wParam != 0 {
 			logf("WM_ENDSESSION with wParam!=0 aka system shutdown or restart detected")
@@ -2723,6 +2736,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		which := uint16(wParam)        // ie. uint16(vk))
 		injectShiftTapThenWinUp(which) // it's correct casting, as per AI.
 		return 0
+
 	case WM_FOCUS_TARGET_WINDOW_SOMEHOW:
 		targetWindow := windows.Handle(wParam)
 		// 2. Perform your focus logic...
@@ -2756,6 +2770,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// logf("Post WM_LBUTTONUP for focus ret=%d err=%v", ret, err)
 		}
 		return 0
+
 	case WM_MYSYSTRAY:
 
 		// Strip high word to get the low 16-bit message code
@@ -2887,9 +2902,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		//WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage() -> getmessage() -> break loop -> outside of loop continuation...
 		procDestroyWindow.Call(uintptr(hwnd))
 		return 0
+
 	case WM_DESTROY:
 		procPostQuitMessage.Call(0)
 		return 0
+
 	case WM_EXIT_VIA_CTRL_C:
 		var ctrlType uint32 = uint32(wParam)
 		switch ctrlType {
