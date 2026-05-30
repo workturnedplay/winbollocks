@@ -626,6 +626,17 @@ var (
 
 type DragMode int
 
+func (m DragMode) String() string {
+	switch m {
+	case ModeMove:
+		return "drag-move"
+	case ModeResize:
+		return "resize"
+	default:
+		return "unknown"
+	}
+}
+
 const (
 	ModeMove   DragMode = iota // aka drag-move
 	ModeResize                 // resizing window
@@ -1838,7 +1849,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//session.targetWnd = wantTargetWnd // never 0 if we're here!
 			session = activeSession.Load()
 			if session != nil {
-				panic("bad coding: non-nil session before startDrag")
+				logf("Warning: Ignoring new gesture because %v mode is already running on HWND=0x%X", session.mode, session.targetWnd)
+				return 1 // Swallow the click so it doesn't pass through to the OS
 			}
 			//if start {
 			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
@@ -2145,7 +2157,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 			session = activeSession.Load()
 			if session != nil {
-				panic("bad coding: non-nil session before about to start a resizing session")
+				logf("Warning: Ignoring new gesture because %v mode is already running on HWND=0x%X", session.mode, session.targetWnd)
+				return 1 // Swallow the click so it doesn't pass through to the OS
 			}
 
 			var r RECT
