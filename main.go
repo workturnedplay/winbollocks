@@ -1813,8 +1813,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 				if session.targetWnd == 0 {
 					//start = false
-					panic("impossible state(while single-threaded win32 app in 20feb2026), logic error: you were 'capturing' " +
-						"but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window! even softReset does capturing=0 then targetWnd=0 first!")
+					panic("impossible state(while single-threaded win32 app in 20feb2026), logic error: you were drag-moving " +
+						"but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window!")
 				} else { // non zero targetWnd
 					//capturing means you already were dragging a prev. window, reflected by targetWnd not being 0!
 
@@ -1826,7 +1826,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						//same old window
 						//logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", session.targetWnd)
 						logf("Resetting drag coordinates for same window HWND=0x%X to prevent cursor snap-back", session.targetWnd)
-						//FIXME: should probably use the new mouse coords for this drag, meaning softReset() this variant too and let it start anew(like the below new window one)
+						//doneFIXME: should probably use the new mouse coords for this drag, meaning softReset() this variant too and let it start anew(like the below new window one)
 						//start = false
 						softReset(true)
 						return 1 //swallow LMB
