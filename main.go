@@ -1834,6 +1834,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			} // was ModeMove
 
 			//session.targetWnd = wantTargetWnd // never 0 if we're here!
+			session = activeSession.Load()
 			if session != nil {
 				panic("bad coding: non-nil session before startDrag")
 			}
@@ -2120,6 +2121,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				// 	return 1
 				// }
 			}
+			session = activeSession.Load()
 			if session != nil {
 				panic("bad coding: non-nil session before about to start a resizing session")
 			}
