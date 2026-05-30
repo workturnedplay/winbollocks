@@ -620,7 +620,8 @@ var (
 	//	//Because currentDrag is a composite struct being read and mutated across threads, simple atomics aren't enough to prevent (state)tearing.
 	//	currentDrag *dragState
 
-	trayIcon NOTIFYICONDATA
+	trayIcon    NOTIFYICONDATA
+	mainMsgHwnd windows.Handle
 )
 
 type DragMode int
@@ -1126,13 +1127,11 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 /* ---------------- Tray ---------------- */
 
 func initTray() error {
-	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
-	if err != nil {
-		//exitf(1, "Failed to create message window: %v", err)
-		return fmt.Errorf("failed to create message window: %w", err)
+	if mainMsgHwnd == 0 {
+		return fmt.Errorf("main message window is not initialized")
 	}
 
-	trayIcon.HWnd = hwnd //FIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
+	trayIcon.HWnd = mainMsgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
 	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
@@ -1180,7 +1179,6 @@ func cleanupTray() {
 		return
 	}
 
-	savedHwnd := trayIcon.HWnd
 	// Use the same trayIcon struct from initTray
 	trayIcon.UFlags = 0 // NIM_DELETE ignores most fields, but set to be safe
 	ret, _, err := procShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&trayIcon)))
@@ -1190,12 +1188,6 @@ func cleanupTray() {
 	} else {
 		// Zero out the struct to avoid reuse confusion
 		trayIcon = NOTIFYICONDATA{}
-	}
-
-	//yeah this has to be after NIM_DELETE, according to Gemini 3 Thinking
-	ret, _, err = procDestroyWindow.Call(uintptr(savedHwnd))
-	if ret == 0 {
-		logf("DestroyWindow failed of HWND=0x%X: %v (probably already destroyed or invalid)", savedHwnd, err)
 	}
 }
 
@@ -1223,7 +1215,7 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 	)
 
 	//	procSetCapture.Call(0) // capture to current thread
-	procSetCapture.Call(uintptr(trayIcon.HWnd)) // Capture to your hidden window:
+	procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window:
 	// This ensures:
 	//mouse capture is owned by your thread
 	//capture is released cleanly
@@ -1297,10 +1289,10 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
 	// Instead of calling hideOverlay() synchronously on the hook thread,
 	// post it asynchronously to your main thread's message window loop.
-	if trayIcon.HWnd != 0 {
-		procPostMessage.Call(uintptr(trayIcon.HWnd), WM_HIDE_OVERLAY, 0, 0)
+	if mainMsgHwnd != 0 {
+		procPostMessage.Call(uintptr(mainMsgHwnd), WM_HIDE_OVERLAY, 0, 0)
 	} else {
-		logf("unexpected: failed to hideOverlay due to trayIcon.HWnd being 0")
+		logf("unexpected: failed to hideOverlay due to mainMsgHwnd being 0")
 	}
 }
 
@@ -1821,9 +1813,11 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 					if session.targetWnd == wantTargetWnd {
 						//same old window
-						logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", session.targetWnd)
+						//logf("continuing to drag-move same old window HWND=0x%X from the same old initial coords(ie. you'll see a snap-move first!)", session.targetWnd)
+						logf("Resetting drag coordinates for same window HWND=0x%X to prevent cursor snap-back", session.targetWnd)
 						//FIXME: should probably use the new mouse coords for this drag, meaning softReset() this variant too and let it start anew(like the below new window one)
 						//start = false
+						softReset(true)
 						return 1 //swallow LMB
 					} else {
 						//a new window
@@ -1858,7 +1852,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				if focusOnDrag.Load() && !isWindowForeground(session.targetWnd) { //TODO: should I move this in startDrag?
 					//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
 					procPostMessage.Call(
-						uintptr(trayIcon.HWnd),
+						uintptr(mainMsgHwnd),
 						WM_FOCUS_TARGET_WINDOW_SOMEHOW,
 						uintptr(session.targetWnd),       // wParam
 						makeLParam(info.Pt.X, info.Pt.Y), // lParam contains X and Y
@@ -1997,7 +1991,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 					//// Post the move request instead of doing the windows move/drag motion here
 					// procPostMessage.Call(
-					// 	uintptr(trayIcon.HWnd),
+					// 	uintptr(mainMsgHwnd),
 					// 	WM_DO_SETWINDOWPOS,
 					// 	0,                             // unused, target is in the struct!
 					// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct
@@ -2013,7 +2007,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						// PostThreadMessage is an asynchronous "fire and forget" call.
 						//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
 						//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
-						r, _, err := procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+						r, _, err := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
 						if r == 0 {
 							logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", err)
 						}
@@ -2052,7 +2046,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					Flags: SWP_NOZORDER | SWP_NOACTIVATE, //| SWP_ASYNCWINDOWPOS, // no good atm because shrink doesn't work only grow
 				}
 				// Trigger the move window
-				procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+				procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
 			} //>=10ms
 			//XXX: let it fall thru so the move isn't eaten.
 			//} //second 'if', for resizing
@@ -2115,54 +2109,68 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			// 	logf("you're already using another gesture") //FIXME: this can happen for other reasons as well, winkey+L ?
 			// 	return 1                                     //eat key
 			// }
+			wantTargetWnd := windowFromPoint(info.Pt)
+			if wantTargetWnd == 0 {
+				logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)")
+				return 1 // swallow LMB
+			}
+
 			session := activeSession.Load()
-			if session != nil {
-				if session.mode == ModeResize {
-					//if resizing.Load() {
-					logf("already resizing") //FIXME: like for 'capturing'
+			if session != nil && session.mode == ModeResize {
+				logf("already resizing a window, likely due to a Win+L lock interruption or rapid click overlay.")
+
+				if session.targetWnd == 0 {
+					panic("impossible state: logic error: session is ModeResize but targetWnd is 0!")
 				}
-				softReset(true) //temporary, fixme ^
-				//}
-				// if currentDrag != nil {
-				// 	//FIXME: what to do here.
-				// 	logf("didn't clean up last resize/drag gesture")
-				// 	return 1
-				// }
+
+				// now, check if it's a new window or the same old one we were resizing
+				if session.targetWnd == wantTargetWnd {
+					// Same window case
+					logf("Resetting resize coordinates for same window HWND=0x%X to prevent cursor snap-back", session.targetWnd)
+
+					// FIXME FIXED: Instead of allowing a snap-move from stale coordinates,
+					// we softReset(true) so the logic falls through (or restarts) using
+					// the current cursor position as the brand new origin.
+					softReset(true)
+
+					// If your surrounding code uses a control variable like 'start = true'
+					// to initiate a fresh capture downstream, set it here.
+				} else {
+					// New window case
+					logf("Avoided resizing stale window HWND=0x%X. Switching to new window HWND=0x%X.", session.targetWnd, wantTargetWnd)
+
+					softReset(true)
+					// Let it fall through to initialize a brand new resize session for 'wantTargetWnd'
+				}
 			}
 			session = activeSession.Load()
 			if session != nil {
 				panic("bad coding: non-nil session before about to start a resizing session")
 			}
-			targetWnd := windowFromPoint(info.Pt)
-			if targetWnd != 0 {
 
-				//resizing.Store(true)
+			var r RECT
+			procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r)))
 
-				var r RECT
-				procGetWindowRect.Call(uintptr(targetWnd), uintptr(unsafe.Pointer(&r)))
+			activeSession.Store(&dragSession{
+				targetWnd: wantTargetWnd,
+				mode:      ModeResize,
+				state: dragState{startPt: info.Pt, startRect: r,
+					knownMinW: minimumW, // Start with your 300px default
+					knownMinH: minimumH},
+				resizeZone: getResizeZone(info.Pt, r),
+			})
 
-				activeSession.Store(&dragSession{
-					targetWnd: targetWnd,
-					mode:      ModeResize,
-					state: dragState{startPt: info.Pt, startRect: r,
-						knownMinW: minimumW, // Start with your 300px default
-						knownMinH: minimumH},
-					resizeZone: getResizeZone(info.Pt, r),
-				})
+			w := float64(r.Right - r.Left)
+			h := float64(r.Bottom - r.Top)
+			initialAspectRatio = w / h
 
-				w := float64(r.Right - r.Left)
-				h := float64(r.Bottom - r.Top)
-				initialAspectRatio = w / h
+			procSetCapture.Call(uintptr(mainMsgHwnd))
 
-				procSetCapture.Call(uintptr(trayIcon.HWnd))
-
-				if nowDiff := time.Since(start); nowDiff > fiveMs {
-					logf("stutter6 %d ns", nowDiff.Nanoseconds())
-				}
-				return 1 // Swallow
-			} else {
-				logf("couldn't start resizing session due to target window handle is 0")
+			if nowDiff := time.Since(start); nowDiff > fiveMs {
+				logf("stutter6 %d ns", nowDiff.Nanoseconds())
 			}
+			return 1 // Swallow
+
 		} //if
 
 	case WM_MBUTTONDOWN: //MMB pressed
@@ -2223,7 +2231,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 					// Post the move request instead of doing the windows move/drag motion here
 					// procPostMessage.Call(
-					// 	uintptr(trayIcon.HWnd),
+					// 	uintptr(mainMsgHwnd),
 					// 	WM_DO_SETWINDOWPOS,
 					// 	0,                             // unused, target is in the struct!
 					// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct, XXX: this was bad, it would get GC-ed, Grok figured it out after i was mid-refactoring via Gemini(which didn't)
@@ -2234,7 +2242,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						// Now we ring the "Doorbell" to wake up the Main Thread.
 						// PostThreadMessage is an asynchronous "fire and forget" call.
 						//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
-						r, _, err := procPostMessage.Call(uintptr(trayIcon.HWnd), WM_DO_SETWINDOWPOS, 0, 0)
+						r, _, err := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
 						if r == 0 {
 							logf("PostMessage of WM_DO_SETWINDOWPOS for MMB failed: %v", err)
 						}
@@ -2358,10 +2366,10 @@ func hookWorker() {
 			procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0)
 			//doneFIXME: what if main is dead too, and would ignore the signal or what, then we exit here? sure after X seconds
 
-			if trayIcon.HWnd != 0 {
+			if mainMsgHwnd != 0 {
 				// Post to the Window Handle, NOT the Thread ID.
 				// This cuts through modal menus like the systray popup menu!
-				procPostMessage.Call(uintptr(trayIcon.HWnd), WM_CLOSE, 0, 0)
+				procPostMessage.Call(uintptr(mainMsgHwnd), WM_CLOSE, 0, 0)
 			}
 			/* When you right-click your tray icon and the menu appears, the code is stuck inside the TrackPopupMenu Win32 call.
 				That function runs its own private message loop.
@@ -2958,6 +2966,9 @@ func deinit() {
 
 	cleanupTray()
 
+	//yeah this has to be after NIM_DELETE aka cleanupTray(), according to Gemini 3 Thinking
+	deinitMainMsgHwnd()
+
 	if overlayHwnd != 0 {
 		// Destroy the overlay window
 		procDestroyWindow.Call(uintptr(overlayHwnd))
@@ -2991,6 +3002,16 @@ func deinit() {
 		logf("cleaned winEventHook from deinit()")
 		procUnhookWinEvent.Call(uintptr(winEventHook))
 		winEventHook = 0
+	}
+}
+
+func deinitMainMsgHwnd() {
+	if mainMsgHwnd != 0 {
+		ret, _, err := procDestroyWindow.Call(uintptr(mainMsgHwnd))
+		if ret == 0 {
+			logf("DestroyWindow failed of HWND=0x%X: %v (probably already destroyed or invalid)", mainMsgHwnd, err)
+		}
+		mainMsgHwnd = 0
 	}
 }
 
@@ -3035,7 +3056,7 @@ var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
 		so we don't exit from here, we tell message window to exit for us.
 	*/
 	procPostMessage.Call(
-		uintptr(trayIcon.HWnd),
+		uintptr(mainMsgHwnd),
 		WM_EXIT_VIA_CTRL_C,
 		uintptr(ctrlType),
 		0,
@@ -3440,7 +3461,7 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 					chatgpt5.2
 				*/
 				procPostMessage.Call(
-					uintptr(trayIcon.HWnd),
+					uintptr(mainMsgHwnd),
 					WM_INJECT_SEQUENCE,
 					uintptr(vk), // VK_LWIN or VK_RWIN,
 					0,
@@ -4071,8 +4092,15 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	mainThreadID = windows.GetCurrentThreadId()
 	logf("main loop thread started. ThreadID: %d", mainThreadID)
 
+	hwnd, err := createMessageWindow() //TODO: how to undo this via defer or something?!
+	if err != nil {
+		//exitf(1, "Failed to create message window: %v", err)
+		return fmt.Errorf("failed to create message window: %w", err)
+	}
+	mainMsgHwnd = hwnd
+
 	if err := initTray(); err != nil {
-		exitf(1, "Failed to init tray: %v", err)
+		return fmt.Errorf("Failed to init tray: %v", err)
 	}
 
 	go hookWorker()
