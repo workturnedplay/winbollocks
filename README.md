@@ -3,13 +3,14 @@
 Originally located here: [https://github.com/workturnedplay/winbollocks](https://github.com/workturnedplay/winbollocks)
 (unless you got it from a fork, try `git remote -v` to check)
 
-`winbollocks` is a small Windows utility that I use on win11, it adds a couple of **Win-key mouse gestures for window movement, resizing, and z-order control**, independent of where the mouse cursor is inside the window.
+`winbollocks` is a small Windows utility that I used to use on win11(before I switched to Linux), it adds a couple of **Win-key mouse gestures for window movement, resizing, and z-order control**, independent of where the mouse cursor is inside the window.
 
 It is designed to replicate common X11 / Wayland window-manager behaviors on Windows such as:
 winkey+LMB drag to move a window, winkey+RMB drag to resize, and winkey+MMB to send a window to back behind all others.
 
-It was built with the help of AI (chatgpt 5.2 and 5.1Mini, Grok 4 and 4.1, Gemini 3 and 3.1 Pro), non-agentic via website/chat only.
-It works right now as stated below, but the code is a mess(for now) on purpose.
+It was built with the help of AI (chatgpt 5.2 and 5.1Mini, Grok 4 and 4.1, Gemini 3 and 3.1 Pro), non-agentic via website/chat only.  
+It works right now as stated below, but the code is a mess(for now) on purpose.  
+It's not actively developed anymore (I'm switching to Linux which already has these).  
 
 ---
 

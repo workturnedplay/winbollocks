@@ -24,4 +24,4 @@ Submitting a contribution is sufficient to indicate agreement with the above.
 ## Disclaimer
 
 This is a personal project, provided as-is, without warranty of any kind.  
-Contributions are welcome, but may be accepted, modified, or declined at the maintainer’s discretion.
+Contributions are NOT welcome anymore(I'm switching to Linux and won't be maintaining or using this anymore), and may be accepted, modified, or declined at the maintainer’s discretion.  
