@@ -466,7 +466,6 @@ const (
 
 /* ---------------- Types ---------------- */
 var (
-	initialAspectRatio float64
 	respectAspectRatio bool = true // Default value for your toggle
 )
 
@@ -644,10 +643,11 @@ const (
 
 type dragSession struct {
 	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
-	targetWnd  windows.Handle
-	state      dragState
-	resizeZone int
-	mode       DragMode
+	targetWnd          windows.Handle
+	state              dragState
+	resizeZone         int
+	mode               DragMode
+	initialAspectRatio float64
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -690,7 +690,7 @@ func getResizeZone(pt POINT, r RECT) int {
 const minimumW = 300
 const minimumH = 300
 
-func calculateResize(drag dragState, zone int, currentPt POINT) (x, y, w, h int32) {
+func calculateResize(drag dragState, zone int, currentPt POINT, initialAspectRatio float64) (x, y, w, h int32) {
 	dx := currentPt.X - drag.startPt.X
 	dy := currentPt.Y - drag.startPt.Y
 
@@ -2050,7 +2050,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(session.state, session.resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
+				nx, ny, nw, nh := calculateResize(session.state, session.resizeZone, info.Pt, session.initialAspectRatio) //TODO: move this into wndProc aka into handleActualMove() ?!
 
 				data := WindowMoveData{
 					Hwnd:  session.targetWnd,
@@ -2196,10 +2196,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				state: dragState{startPt: info.Pt, startRect: r,
 					knownMinW: minimumW, // Start with your 300px default
 					knownMinH: minimumH},
-				resizeZone: getResizeZone(info.Pt, r),
+				resizeZone:         getResizeZone(info.Pt, r),
+				initialAspectRatio: float64(w) / float64(h),
 			})
-
-			initialAspectRatio = float64(w) / float64(h)
 
 			procSetCapture.Call(uintptr(mainMsgHwnd))
 
@@ -2682,7 +2681,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				var pt POINT
 				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
 
-				nx, ny, nw, nh = calculateResize(session.state, session.resizeZone, pt)
+				nx, ny, nw, nh = calculateResize(session.state, session.resizeZone, pt, session.initialAspectRatio)
 				// 4. ATOMICALLY PUBLISH IT BACK
 				// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
 				// If the user released the mouse and softReset(nil) ran in the meantime,
