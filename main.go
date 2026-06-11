@@ -931,59 +931,174 @@ const (
 	MOUSEEVENTF_ABSOLUTE    = 0x8000
 	MOUSEEVENTF_VIRTUALDESK = 0x4000
 	MOUSEEVENTF_MOVE        = 0x0001
-	SM_CXVIRTUALSCREEN      = 78
-	SM_CYVIRTUALSCREEN      = 79
 )
 
 var procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 var procSetCursorPos = user32.NewProc("SetCursorPos")
 
+const (
+	SM_XVIRTUALSCREEN  = 76
+	SM_YVIRTUALSCREEN  = 77
+	SM_CXVIRTUALSCREEN = 78
+	SM_CYVIRTUALSCREEN = 79
+)
+
 func injectLMBClickAtCoords(x, y int32) {
-	// Win32 absolute coords use a 0-65535 scale across the virtual screen
+	// SendInput absolute mouse coordinates use the entire virtual desktop,
+	// not the primary monitor.
+	//
+	// Example:
+	//
+	//   [-1920,0] [0,0]
+	//    Monitor2 Monitor1
+	//
+	// In that layout:
+	//
+	//   virtualLeft  = -1920
+	//   virtualTop   = 0
+	//   virtualWidth = 3840
+	//   virtualHeight= 1080
+	//
+	// Therefore we must normalize relative to the virtual desktop origin,
+	// not relative to (0,0).
 
-	w, _, _ := procGetSystemMetrics.Call(SM_CXVIRTUALSCREEN)
-	h, _, _ := procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
+	virtualLeft, _, _ := procGetSystemMetrics.Call(SM_XVIRTUALSCREEN)
+	virtualTop, _, _ := procGetSystemMetrics.Call(SM_YVIRTUALSCREEN)
+	virtualWidth, _, _ := procGetSystemMetrics.Call(SM_CXVIRTUALSCREEN)
+	virtualHeight, _, _ := procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
 
-	// Normalize to 0..65535
-	// We use 65536 because Windows maps pixels to "mickeys"
-	normalizedX := (int32(x) * 65536) / int32(w)
-	normalizedY := (int32(y) * 65536) / int32(h)
+	// Prevent divide-by-zero and nonsensical coordinate transforms.
+	//
+	// Width/height of 1 would make the rightmost/bottommost pixel also
+	// be the leftmost/topmost pixel, so the normalization formula below
+	// would divide by zero.
+	if virtualWidth <= 1 || virtualHeight <= 1 {
+		logf(
+			"injectLMBClickAtCoords: invalid virtual desktop size %dx%d",
+			virtualWidth,
+			virtualHeight,
+		)
+		return
+	}
 
-	// 3. Prepare the Input array (Move + Down + Up)
-	// You can combine MOVE | ABSOLUTE | LEFTDOWN in one event,
-	// but separate events are sometimes more reliable for focus.
+	// Convert desktop coordinates into coordinates relative to the
+	// virtual desktop origin.
+	//
+	// Example:
+	//
+	//   virtualLeft = -1920
+	//   x           = -100
+	//
+	// becomes:
+	//
+	//   relX = 1820
+	//
+	// which can then be normalized correctly.
+	relX := x - int32(virtualLeft)
+	relY := y - int32(virtualTop)
+
+	// Defensive clamping.
+	//
+	// Today x/y originate from MSLLHOOKSTRUCT.Pt and should already be
+	// inside the virtual desktop bounds.
+	//
+	// However, this function may eventually get reused from another
+	// caller, so clamp coordinates before normalization.
+	if relX < 0 {
+		relX = 0
+	} else if relX >= int32(virtualWidth) {
+		relX = int32(virtualWidth) - 1
+	}
+
+	if relY < 0 {
+		relY = 0
+	} else if relY >= int32(virtualHeight) {
+		relY = int32(virtualHeight) - 1
+	}
+
+	//Windows maps pixels to "mickeys"
+	// Win32 absolute coordinates span 0..65535 inclusive.
+	//
+	// Using:
+	//
+	//   relX * 65535 / (width - 1)
+	//
+	// guarantees:
+	//
+	//   leftmost pixel  -> 0
+	//   rightmost pixel -> 65535
+	//
+	// exactly.
+	normalizedX := (relX * 65535) / (int32(virtualWidth) - 1)
+	normalizedY := (relY * 65535) / (int32(virtualHeight) - 1)
+
 	inputs := []INPUT{
 		{
 			Type: INPUT_MOUSE,
-			Ki:   KEYBDINPUT{}, // placeholder for union
 		},
 		{
 			Type: INPUT_MOUSE,
-			Ki:   KEYBDINPUT{},
 		},
 	}
 
-	// Move + Down
+	// Move to target location and press LMB.
 	m0 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki))
 	m0.Dx = normalizedX
 	m0.Dy = normalizedY
-	m0.DwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN
+	m0.DwFlags =
+		MOUSEEVENTF_ABSOLUTE |
+			MOUSEEVENTF_VIRTUALDESK |
+			MOUSEEVENTF_MOVE |
+			MOUSEEVENTF_LEFTDOWN
 
-	// Up
+	// Release LMB at the same location.
 	m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
 	m1.Dx = normalizedX
 	m1.Dy = normalizedY
-	m1.DwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP
+	m1.DwFlags =
+		MOUSEEVENTF_ABSOLUTE |
+			MOUSEEVENTF_VIRTUALDESK |
+			MOUSEEVENTF_MOVE |
+			MOUSEEVENTF_LEFTUP
 
 	//you can "save and restore" the cursor position. Since GetCursorPos and SetCursorPos are extremely fast
 	// and don't involve the message queue, this will happen so quickly (sub-millisecond) that the user won't perceive the jump.
-	// 1. Capture current physical mouse position to restore it later
+
+	// Save the user's current cursor position.
+	//
+	// SendInput with MOUSEEVENTF_ABSOLUTE physically moves the cursor.
+	// We restore it immediately afterwards so the click appears to happen
+	// remotely without visibly teleporting the user's mouse.
 	var currentPt POINT
+	// 1. Capture current physical mouse position to restore it later
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&currentPt)))
 	// 2. Inject the click at the original gesture location
-	procSendInput.Call(uintptr(len(inputs)), uintptr(unsafe.Pointer(&inputs[0])), unsafe.Sizeof(inputs[0]))
+	ret, _, err := procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+
+	if ret != uintptr(len(inputs)) {
+		logf(
+			"injectLMBClickAtCoords: SendInput injected %d/%d events: %v",
+			ret,
+			len(inputs),
+			err,
+		)
+	}
 	// 3. Teleport the mouse back to where the user had it a millisecond ago
-	procSetCursorPos.Call(uintptr(currentPt.X), uintptr(currentPt.Y))
+	restoreRet, _, restoreErr := procSetCursorPos.Call(
+		uintptr(currentPt.X),
+		uintptr(currentPt.Y),
+	)
+
+	if restoreRet == 0 {
+		logf(
+			"injectLMBClickAtCoords: SetCursorPos failed: %v",
+			restoreErr,
+		)
+	}
 }
 
 func injectLMBDown() {
