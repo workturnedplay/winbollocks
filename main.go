@@ -2726,6 +2726,29 @@ func makeLParam(x, y int32) uintptr { // grok again
 	return uintptr((uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF))
 }
 
+// UnpackLParam extracts the signed X and Y coordinates from a window message lParam.
+// This correctly handles negative coordinates on multi-monitor setups.
+func UnpackLParam(lParam uintptr) (x, y int32) {
+	/* in this:
+	// x := int32(lParam & 0xFFFF)
+	// y := int32((lParam >> 16) & 0xFFFF)
+	// lParam & 0xFFFF extracts the lower 16 bits. Go sees this result as an unsigned 32-bit or 64-bit number (depending on your architecture) because lParam is a uintptr.
+	//The bits look like this in memory: 0x0000FF9C.
+	//You then cast it directly to int32. Because the highest bit of 0x0000FF9C is 0, Go says: "This is a positive number!" 4. 0x0000FF9C in decimal is 65436. You lost the negative sign.
+	*/
+	/*Why you don't even need & 0xFFFF here:
+	  In Go, casting a larger integer to an int16 automatically discards the upper bits (truncation).
+		int16(lParam) takes only the lower 16 bits. If it's 0xFF9C, it becomes -100 as an int16. Then int32(...) turns it into -100 as an int32.
+		int16(lParam >> 16) shifts the high word into the lower positions and does the exact same thing for the Y coordinate.
+	  If you prefer to keep the mask explicitly visible for code readability, you can keep it, but it must be wrapped inside the int16:
+	*/
+	// x = int32(int16(lParam))
+	// y = int32(int16(lParam >> 16))
+	x = int32(int16(lParam & 0xFFFF))
+	y = int32(int16((lParam >> 16) & 0xFFFF))
+	return x, y
+}
+
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_DO_SETWINDOWPOS:
@@ -2780,8 +2803,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			if doLMBClick2FocusAsFallback.Load() {
 				// 1. Extract coordinates from lParam
-				x := int32(lParam & 0xFFFF)
-				y := int32((lParam >> 16) & 0xFFFF)
+				x, y := UnpackLParam(lParam)
 				//logf("injecting LMB click")
 				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
