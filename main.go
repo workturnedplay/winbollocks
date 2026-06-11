@@ -118,7 +118,7 @@ var (
 	moveDataChan = make(chan WindowMoveData, 2048)
 
 	// Modern Atomic tracking
-	droppedMoveEvents           atomic.Uint64
+	droppedMoveOrResizeEvents   atomic.Uint64
 	droppedLogEvents            atomic.Uint64
 	maxChannelFillForMoveEvents atomic.Uint64 // To track how "full" it got
 	maxChannelFillForLogEvents  atomic.Uint64 // To track how "full" it got
@@ -1654,8 +1654,8 @@ func forceForeground(target windows.Handle) bool {
 				//focusThisHwnd(target)
 			} else {
 				//reason = "is own window on diff. thread which might have own msg. loop"
-				logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB click to focus it workaround next) without actually focusing it tho.")
-				return true
+				logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB-click-to-focus-it workaround next) without actually focusing it tho.")
+				return true //FIXME: we pretend it's focused, but it may be more correct to do this outside of this function? however this case would need to be signalled/returned to know outside what to do, meh!
 			}
 			//unreachable()
 		}
@@ -2033,7 +2033,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						// This happens if the Main Thread is frozen (e.g., Admin console lag).
 						// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 						// We just increment our "shame counter" and move on.
-						droppedMoveEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+						droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
 					}
 
 					if ratelimitOnMove.Load() {
@@ -2052,8 +2052,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			if !ShouldThrottle() {
 				nx, ny, nw, nh := calculateResize(session.state, session.resizeZone, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
 
-				// Send to your mover channel
-				moveDataChan <- WindowMoveData{
+				data := WindowMoveData{
 					Hwnd:  session.targetWnd,
 					X:     nx,
 					Y:     ny,
@@ -2061,8 +2060,22 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					H:     nh,
 					Flags: SWP_NOZORDER | SWP_NOACTIVATE, //| SWP_ASYNCWINDOWPOS, // no good atm because shrink doesn't work only grow
 				}
-				// Trigger the move window
-				procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
+
+				// Send to your mover channel
+				select {
+				case moveDataChan <- data:
+					// Trigger the move window
+					r, _, err := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
+					if r == 0 {
+						logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", err)
+					}
+				default:
+					// FAIL: The channel (2048 slots) is completely full.
+					// This happens if the Main Thread is frozen (e.g., Admin console lag).
+					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+					// We just increment our "shame counter" and move on.
+					droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+				}
 			} //>=10ms
 			//XXX: let it fall thru so the move isn't eaten.
 			//} //second 'if', for resizing
@@ -2269,7 +2282,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						// This happens if the Main Thread is frozen (e.g., Admin console lag).
 						// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 						// We just increment our "shame counter" and move on.
-						droppedMoveEvents.Add(1)
+						droppedMoveOrResizeEvents.Add(1)
 					}
 				}
 			} // if every 10ms or more
@@ -2575,7 +2588,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	//if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 	if ShouldThrottle() {
 		//logf("ignored move/resize")
-		droppedMoveEvents.Add(1)
+		droppedMoveOrResizeEvents.Add(1)
 		return
 	}
 
@@ -3853,7 +3866,7 @@ func logWorker() {
 	maxMoveEvents := maxChannelFillForMoveEvents.Load()
 	if maxMoveEvents > 1 {
 		directLoggerf("Most move/resize events queued: %s (Dropped: %s which were <%dms apart, to prevent mouse stuttering)",
-			withCommas(maxMoveEvents), withCommas(droppedMoveEvents.Load()), forceMoveOrResizeActionsToBeThisManyMSApart)
+			withCommas(maxMoveEvents), withCommas(droppedMoveOrResizeEvents.Load()), forceMoveOrResizeActionsToBeThisManyMSApart)
 		//logf("for testing when a panic in logWorker happens after main's keypress, right before main's os.Exit!")
 	}
 } //logWorker
@@ -4573,8 +4586,8 @@ func drainMoveChannel() {
 		if currentFill > maxChannelFillForMoveEvents.Load() {
 			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
 			maxChannelFillForMoveEvents.Store(currentFill)
-			logf("New MoveChannel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
-				withCommas(currentFill), withCommas(droppedMoveEvents.Load()))
+			logf("New MoveOrResize Channel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
+				withCommas(currentFill), withCommas(droppedMoveOrResizeEvents.Load()))
 		}
 
 		select {
