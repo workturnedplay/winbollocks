@@ -2179,8 +2179,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 
 			var r RECT
-			procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r)))
-
+			ret, _, err := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r)))
+			if ret == 0 {
+				logf("GetWindowRect on target HWND=0x%X failed(ret is 0) for resize startup, err:%v", wantTargetWnd, err)
+				return 1
+			}
+			w := r.Right - r.Left
+			h := r.Bottom - r.Top
+			if w <= 0 || h <= 0 {
+				logf("Refusing resize start: invalid window size %dx%d gotten for target HWND=0x%X", w, h, wantTargetWnd)
+				return 1
+			}
 			activeSession.Store(&dragSession{
 				targetWnd: wantTargetWnd,
 				mode:      ModeResize,
@@ -2190,9 +2199,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				resizeZone: getResizeZone(info.Pt, r),
 			})
 
-			w := float64(r.Right - r.Left)
-			h := float64(r.Bottom - r.Top)
-			initialAspectRatio = w / h
+			initialAspectRatio = float64(w) / float64(h)
 
 			procSetCapture.Call(uintptr(mainMsgHwnd))
 
