@@ -690,7 +690,12 @@ func getResizeZone(pt POINT, r RECT) int {
 const minimumW = 300
 const minimumH = 300
 
-func calculateResize(drag dragState, zone int, currentPt POINT, initialAspectRatio float64) (x, y, w, h int32) {
+func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
+	drag := session.state
+	zone := session.resizeZone
+	//Since session.initialAspectRatio is a primitive float64 only utilized within one localized aspect-ratio conditional block, leaving it as a direct property read is both perfectly idiomatic and prevents an unnecessary stack allocation!
+	//var initialAspectRatio float64 = session.initialAspectRatio
+
 	dx := currentPt.X - drag.startPt.X
 	dy := currentPt.Y - drag.startPt.Y
 
@@ -710,12 +715,12 @@ func calculateResize(drag dragState, zone int, currentPt POINT, initialAspectRat
 		var dw, dh int32
 
 		if respectAspectRatio {
-			if initialAspectRatio >= 1.0 {
+			if session.initialAspectRatio >= 1.0 {
 				dw = dx * 2
-				dh = int32(float64(dw) / initialAspectRatio)
+				dh = int32(float64(dw) / session.initialAspectRatio)
 			} else {
 				dh = dy * 2
-				dw = int32(float64(dh) * initialAspectRatio)
+				dw = int32(float64(dh) * session.initialAspectRatio)
 			}
 		} else {
 			dw = dx * 2
@@ -728,14 +733,14 @@ func calculateResize(drag dragState, zone int, currentPt POINT, initialAspectRat
 		// Apply safety minimums, maintaining aspect ratio if we hit the floor
 		if w < minW {
 			w = minW
-			if respectAspectRatio && initialAspectRatio > 0 {
-				h = int32(float64(w) / initialAspectRatio)
+			if respectAspectRatio && session.initialAspectRatio > 0 {
+				h = int32(float64(w) / session.initialAspectRatio)
 			}
 		}
 		if h < minH {
 			h = minH
-			if respectAspectRatio && initialAspectRatio > 0 {
-				w = int32(float64(h) * initialAspectRatio)
+			if respectAspectRatio && session.initialAspectRatio > 0 {
+				w = int32(float64(h) * session.initialAspectRatio)
 			}
 		}
 		// Second pass for absolute safety
@@ -2050,7 +2055,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(session.state, session.resizeZone, info.Pt, session.initialAspectRatio) //TODO: move this into wndProc aka into handleActualMove() ?!
+				nx, ny, nw, nh := calculateResize(session, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
 
 				data := WindowMoveData{
 					Hwnd:  session.targetWnd,
@@ -2681,7 +2686,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				var pt POINT
 				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
 
-				nx, ny, nw, nh = calculateResize(session.state, session.resizeZone, pt, session.initialAspectRatio)
+				nx, ny, nw, nh = calculateResize(&session, pt)
 				// 4. ATOMICALLY PUBLISH IT BACK
 				// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
 				// If the user released the mouse and softReset(nil) ran in the meantime,
