@@ -1615,7 +1615,7 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 
 // aka focus(activate) the window, works by attaching to target window's thread, so Windows won't do its focus stealing prevention thing!
 // also, this way I don't have to inject LMB down then LMB up aka a LMB click event to focus it, risking pressing Exit button on total commander for example.
-// however, TODO: now i do have to make sure hooks are running on a separate thread (than main msg. loop) because this is potentially blocking and can deadlock, depending on target app.
+// however, doneTODO: now i do have to make sure hooks are running on a separate thread (than main msg. loop) because this is potentially blocking and can deadlock, depending on target app.
 func forceForeground(target windows.Handle) bool {
 	if target == 0 {
 		logf("!! attempted to focus a windows with handle 0")
