@@ -1317,8 +1317,12 @@ func hardReset(releaseCapture bool) {
 	softReset(releaseCapture)
 }
 
+// Define the overlay window class name as a constant
+const winbollocksResizingOverlayClassName = "winbollocksResizingOverlayClass" //TODO: see if underscores work in this!
+
 func initOverlay() {
-	className := mustUTF16("winbollocksResizingOverlay") //TODO: see if underscores work in this!
+	className := mustUTF16(winbollocksResizingOverlayClassName)
+	//Both Windows APIs just read the null-terminated UTF-16 string from that memory address during the call; they don't seize ownership or modify it.
 
 	var wc WNDCLASSEX
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
@@ -2982,24 +2986,7 @@ func deinit() {
 	//yeah this has to be after NIM_DELETE aka cleanupTray(), according to Gemini 3 Thinking
 	deinitMainMsgHwnd()
 
-	if overlayHwnd != 0 {
-		// Destroy the overlay window
-		procDestroyWindow.Call(uintptr(overlayHwnd))
-		overlayHwnd = 0
-	}
-
-	if magentaBrush != 0 {
-		procGdiDeleteObject.Call(uintptr(magentaBrush))
-		magentaBrush = 0
-	}
-	if blackBrush != 0 {
-		procGdiDeleteObject.Call(uintptr(blackBrush))
-		blackBrush = 0
-	}
-
-	instance, _, _ := procGetModuleHandle.Call(0)
-	classNamePtr := mustUTF16("OverlayClass")
-	procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance)
+	deinitOverlayClass()
 
 	//This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
 	procPostQuitMessage.Call(0)
@@ -3016,6 +3003,28 @@ func deinit() {
 		procUnhookWinEvent.Call(uintptr(winEventHook))
 		winEventHook = 0
 	}
+}
+
+func deinitOverlayClass() {
+	if overlayHwnd != 0 {
+		// Destroy the overlay window
+		procDestroyWindow.Call(uintptr(overlayHwnd))
+		overlayHwnd = 0
+	}
+
+	if magentaBrush != 0 {
+		procGdiDeleteObject.Call(uintptr(magentaBrush))
+		magentaBrush = 0
+	}
+	if blackBrush != 0 {
+		procGdiDeleteObject.Call(uintptr(blackBrush))
+		blackBrush = 0
+	}
+
+	instance, _, _ := procGetModuleHandle.Call(0)
+	classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
+	procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance)
+
 }
 
 func deinitMainMsgHwnd() {
