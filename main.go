@@ -2181,7 +2181,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					Y:     ny,
 					W:     nw,
 					H:     nh,
-					Flags: SWP_NOZORDER | SWP_NOACTIVATE, // | SWP_ASYNCWINDOWPOS, // FIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
+					Flags: SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS, // doneFIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
 				}
 
 				// Send to your mover channel
@@ -2750,18 +2750,26 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	// 	//flags |= SWP_NOSIZE
 	// 	panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
 	// }
-	start := time.Now()
+
+	//is procSetWindowPos async ?
+	var async bool = (data.Flags & SWP_ASYNCWINDOWPOS) != 0
+	var start time.Time
+	if !async {
+		start = time.Now()
+	}
 	ret, _, _ := procSetWindowPos.Call( //XXX: this is blocking, depends on target window's responsiveness! which is why this happens on wndProc not inside mouseProc btw.
 		uintptr(target),
 		uintptr(data.InsertAfter),
 		uintptr(data.X), uintptr(data.Y),
 		uintptr(data.W), uintptr(data.H),
-		uintptr(data.Flags), // FIXME: cannot use SWP_ASYNCWINDOWPOS here for ModeResize because windows won't shrink, they only grow
+		uintptr(data.Flags), // doneFIXME: cannot use SWP_ASYNCWINDOWPOS here for ModeResize because windows won't shrink, they only grow; it's due to my anti-slide logic
 	)
-	duration := time.Since(start)
-	if duration > 25*time.Millisecond {
-		//if you try to resize the Find window in regedit (first u must run as admin because regedit runs as admin) while it's searching for some random text! then this triggers!
-		logf("SetWindowPos took %d ms", duration.Milliseconds())
+	if !async {
+		duration := time.Since(start)
+		if duration > 25*time.Millisecond {
+			//only in ModeResize and when SWP_ASYNCWINDOWPOS isn't used(but now it is), then if you try to resize the Find window in regedit (first u must run as admin because regedit runs as admin) while it's searching for some random text! then this triggers!
+			logf("SetWindowPos took %d ms", duration.Milliseconds())
+		}
 	}
 	if ret == 0 {
 		errCode, _, _ := procGetLastError.Call()
@@ -2773,7 +2781,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		// pt := POINT{X: x, Y: y}
 		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
-	} else if data.W != 0 || data.H != 0 {
+	} else if data.W != 0 || data.H != 0 { //is a resize not move event
 		// 1. Load the current master pointer
 		ptr := activeSession.Load()
 		if ptr != nil {
@@ -2783,64 +2791,67 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				//if !resizing.Load() {
 				logf("delayed resizing detected, while not 'resizing'.")
 			}
-			// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
-			// We asked the OS to resize it to data.W x data.H. Did it listen?
-			var r RECT
-			ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
-			if ret == 0 {
-				// Optional: Get the specific system error
-				errCode, _, _ := procGetLastError.Call()
-				logf("GetWindowRect during resize failed: hwnd=0x%x, errCode=%d, err:%v", target, errCode, err)
-				// Safety: If we can't get the Rect, we can't do Anti-Slide or Overlay updates safely.
-				return
-			}
-			actualW := r.Right - r.Left
-			actualH := r.Bottom - r.Top
 			nx, ny, nw, nh := data.X, data.Y, data.W, data.H
+			if !async { //XXX: this 'if' is currently a noop because ModeResize uses SWP_ASYNCWINDOWPOS now!
+				//XXX:this anti-slide logic works only when synchronous, so when SWP_ASYNCWINDOWPOS isn't present! else, if present you can't shrink (can grow tho), however, when async FIXME: sliding happens
+				// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
+				// We asked the OS to resize it to data.W x data.H. Did it listen?
+				var r RECT
+				ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
+				if ret == 0 {
+					// Optional: Get the specific system error
+					errCode, _, _ := procGetLastError.Call()
+					logf("GetWindowRect during resize failed: hwnd=0x%x, errCode=%d, err:%v", target, errCode, err)
+					// Safety: If we can't get the Rect, we can't do Anti-Slide or Overlay updates safely.
+					return
+				}
+				actualW := r.Right - r.Left
+				actualH := r.Bottom - r.Top
 
-			clamped := false
-			// If actual width is larger than what we requested AND larger than our currently known minimum
-			if actualW > data.W && actualW > session.state.knownMinW {
-				session.state.knownMinW = actualW
-				clamped = true
-			}
-			if actualH > data.H && actualH > session.state.knownMinH {
-				session.state.knownMinH = actualH
-				clamped = true
-			}
+				clamped := false
+				// If actual width is larger than what we requested AND larger than our currently known minimum
+				if actualW > data.W && actualW > session.state.knownMinW {
+					session.state.knownMinW = actualW
+					clamped = true
+				}
+				if actualH > data.H && actualH > session.state.knownMinH {
+					session.state.knownMinH = actualH
+					clamped = true
+				}
 
-			// If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
-			// We must immediately correct the window position to restore the anchor.
-			if clamped {
-				var pt POINT
-				procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
+				// If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
+				// We must immediately correct the window position to restore the anchor.
+				if clamped {
+					var pt POINT
+					procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
 
-				nx, ny, nw, nh = calculateResize(&session, pt)
-				// 4. ATOMICALLY PUBLISH IT BACK
-				// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
-				// If the user released the mouse and softReset(nil) ran in the meantime,
-				// or if a brand new drag started, this CAS will safely fail, preventing
-				// you from accidentally resurrecting a dead or obsolete session!
+					nx, ny, nw, nh = calculateResize(&session, pt)
+					// 4. ATOMICALLY PUBLISH IT BACK
+					// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
+					// If the user released the mouse and softReset(nil) ran in the meantime,
+					// or if a brand new drag started, this CAS will safely fail, preventing
+					// you from accidentally resurrecting a dead or obsolete session!
 
-				//_ = activeSession.CompareAndSwap(ptr, &session) // this makes 'session' be on heap!
+					//_ = activeSession.CompareAndSwap(ptr, &session) // this makes 'session' be on heap!
 
-				// 2. ONLY allocate a heap value if a clamping threshold was crossed!
-				// We build a new heap-allocated wrapper and attempt the swap.
-				heapUpdate := session
+					// 2. ONLY allocate a heap value if a clamping threshold was crossed!
+					// We build a new heap-allocated wrapper and attempt the swap.
+					heapUpdate := session
 
-				// If it fails, we don't care! It means another thread mutated the session pointer,
-				// but our stack-local 'session' variables remain valid for finishing this frame.
-				_ = activeSession.CompareAndSwap(ptr, &heapUpdate)
+					// If it fails, we don't care! It means another thread mutated the session pointer,
+					// but our stack-local 'session' variables remain valid for finishing this frame.
+					_ = activeSession.CompareAndSwap(ptr, &heapUpdate)
 
-				// Snap the window back to the correct anchor point
-				procSetWindowPos.Call(
-					uintptr(target),
-					uintptr(data.InsertAfter),
-					uintptr(nx), uintptr(ny),
-					uintptr(nw), uintptr(nh),
-					uintptr(data.Flags),
-				)
-			}
+					// Snap the window back to the correct anchor point
+					procSetWindowPos.Call(
+						uintptr(target),
+						uintptr(data.InsertAfter),
+						uintptr(nx), uintptr(ny),
+						uintptr(nw), uintptr(nh),
+						uintptr(data.Flags),
+					)
+				}
+			} //endif didn't have SWP_ASYNCWINDOWPOS
 
 			//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
 			//	//lacks SWP_NOSIZE so it's a resize!
