@@ -2181,7 +2181,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					Y:     ny,
 					W:     nw,
 					H:     nh,
-					Flags: SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS, // doneFIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
+					Flags: SWP_NOZORDER | SWP_NOACTIVATE, // | SWP_ASYNCWINDOWPOS, // doneFIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
 				}
 
 				// Send to your mover channel
@@ -2716,6 +2716,7 @@ func MarkAsResized() {
 }
 
 const forceMoveOrResizeActionsToBeThisManyMSApart = 10
+const WS_THICKFRAME = 0x00040000 // or WS_SIZEBOX which has same value (as per chatgpt 5.5)
 
 func handleActualMoveOrResize(data WindowMoveData) {
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
@@ -2751,6 +2752,19 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	// 	panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
 	// }
 
+	isResizeEvent := data.W != 0 || data.H != 0 //is a resize not move event
+
+	// //disabled, some windows are resizeable yet still hit this
+	// if false && isResizeEvent {
+	// 	//Check if the window is actually resizable
+	// 	//FIXME: this is wrong because Find dialog during in-progress search is resizeable yet hits this, but Find dialog that says it found nothing hits this too but that's trully unresizeable.
+	// 	style, err := getWindowLongPtr(target, GWL_STYLE)
+	// 	if err == nil && (uint32(style)&WS_THICKFRAME == 0) {
+	// 		logf("Refusing to resize unresizeable window HWND=0x%X", target)
+	// 		return
+	// 	}
+	// }
+
 	//is procSetWindowPos async ?
 	var async bool = (data.Flags & SWP_ASYNCWINDOWPOS) != 0
 	var start time.Time
@@ -2771,7 +2785,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			logf("SetWindowPos took %d ms", duration.Milliseconds())
 		}
 	}
-	if ret == 0 {
+	if ret == 0 { //failed
 		errCode, _, _ := procGetLastError.Call()
 		logf("SetWindowPos failed(from within main message loop): hwnd=0x%x error=%d", target, errCode)
 		if errCode == 5 { // Access denied (UIPI likely)
@@ -2781,7 +2795,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		// pt := POINT{X: x, Y: y}
 		// lParamNative := uintptr(pt.Y)<<16 | uintptr(pt.X)
 		// procPostMessage.Call(uintptr(target), WM_NCLBUTTONDOWN, HTCAPTION, lParamNative)
-	} else if data.W != 0 || data.H != 0 { //is a resize not move event
+	} else if isResizeEvent {
 		// 1. Load the current master pointer
 		ptr := activeSession.Load()
 		if ptr != nil {
