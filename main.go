@@ -557,6 +557,8 @@ type dragState struct {
 	startRect RECT
 	knownMinW int32
 	knownMinH int32
+	knownMaxW int32 // NEW
+	knownMaxH int32 // NEW
 }
 
 type NOTIFYICONDATA struct {
@@ -709,6 +711,8 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 	// Use the dynamically discovered minimums!
 	minW := drag.knownMinW
 	minH := drag.knownMinH
+	maxW := drag.knownMaxW // NEW
+	maxH := drag.knownMaxH // NEW
 
 	if zone == ZONE_CENTER {
 		// UNIFORM CENTER RESIZE
@@ -743,12 +747,32 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 				w = int32(float64(h) * session.initialAspectRatio)
 			}
 		}
+		// Max constraints (NEW)
+		if maxW > 0 && w > maxW {
+			w = maxW
+			if respectAspectRatio && session.initialAspectRatio > 0 {
+				h = int32(float64(w) / session.initialAspectRatio)
+			}
+		}
+		if maxH > 0 && h > maxH {
+			h = maxH
+			if respectAspectRatio && session.initialAspectRatio > 0 {
+				w = int32(float64(h) * session.initialAspectRatio)
+			}
+		}
 		// Second pass for absolute safety
+		// Final safety clamp
 		if w < minW {
 			w = minW
 		}
+		if maxW > 0 && w > maxW {
+			w = maxW
+		}
 		if h < minH {
 			h = minH
+		}
+		if maxH > 0 && h > maxH {
+			h = maxH
 		}
 
 		x = origL + (origW-w)/2
@@ -785,21 +809,33 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 			if newR-newL < minW {
 				newL = newR - minW
 			}
+			if maxW > 0 && newR-newL > maxW {
+				newL = newR - maxW
+			} // NEW
 		}
 		if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
 			if newR-newL < minW {
 				newR = newL + minW
 			}
+			if maxW > 0 && newR-newL > maxW {
+				newR = newL + maxW
+			} // NEW
 		}
 		if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
 			if newB-newT < minH {
 				newT = newB - minH
 			}
+			if maxH > 0 && newB-newT > maxH {
+				newT = newB - maxH
+			} // NEW
 		}
 		if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
 			if newB-newT < minH {
 				newB = newT + minH
 			}
+			if maxH > 0 && newB-newT > maxH {
+				newB = newT + maxH
+			} // NEW
 		}
 
 		x, y = newL, newT
@@ -2823,14 +2859,43 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				actualH := r.Bottom - r.Top
 
 				clamped := false
-				// If actual width is larger than what we requested AND larger than our currently known minimum
-				if actualW > data.W && actualW > session.state.knownMinW {
-					session.state.knownMinW = actualW
-					clamped = true
+				// // If actual width is larger than what we requested AND larger than our currently known minimum
+				// if actualW > data.W && actualW > session.state.knownMinW {
+				// 	session.state.knownMinW = actualW
+				// 	clamped = true
+				// }
+				// if actualH > data.H && actualH > session.state.knownMinH {
+				// 	session.state.knownMinH = actualH
+				// 	clamped = true
+				// }
+				// Check W constraints
+				if actualW != data.W {
+					if data.W < actualW && actualW > session.state.knownMinW {
+						// Tried to shrink below OS allowed size
+						session.state.knownMinW = actualW
+						clamped = true
+					} else if data.W > actualW {
+						// Tried to expand above OS allowed size (NEW)
+						if session.state.knownMaxW == 0 || actualW < session.state.knownMaxW {
+							session.state.knownMaxW = actualW
+							clamped = true
+						}
+					}
 				}
-				if actualH > data.H && actualH > session.state.knownMinH {
-					session.state.knownMinH = actualH
-					clamped = true
+
+				// Check H constraints
+				if actualH != data.H {
+					if data.H < actualH && actualH > session.state.knownMinH {
+						// Tried to shrink below OS allowed size
+						session.state.knownMinH = actualH
+						clamped = true
+					} else if data.H > actualH {
+						// Tried to expand above OS allowed size (NEW)
+						if session.state.knownMaxH == 0 || actualH < session.state.knownMaxH {
+							session.state.knownMaxH = actualH
+							clamped = true
+						}
+					}
 				}
 
 				// If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
