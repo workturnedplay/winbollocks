@@ -2164,7 +2164,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					//return 0 //0 = let it thru
 					//XXX: let it fall thru so CallNextHookEx is also called!
 				} // willPostMessage
-			} //>=10ms
+			} else // endif >=10ms, else drop:
+			{
+				droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			}
 			//} //main 'if', for capturing aka moving/dragging window
 		case ModeResize:
 			//if resizing.Load() && currentDrag != nil {
@@ -2196,7 +2199,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// We just increment our "shame counter" and move on.
 					droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
 				}
-			} //>=10ms
+			} else //endif >=10ms, else drop it:
+			{
+				droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			}
 			//XXX: let it fall thru so the move isn't eaten.
 			//} //second 'if', for resizing
 		} //switch
@@ -2408,10 +2414,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 						// This happens if the Main Thread is frozen (e.g., Admin console lag).
 						// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 						// We just increment our "shame counter" and move on.
-						droppedMoveOrResizeEvents.Add(1)
+						droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
 					}
 				}
-			} // if every 10ms or more
+			} else // endif every 10ms or more, else drop it
+			{
+				droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			}
 
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter5 %d ns", nowDiff.Nanoseconds())
@@ -2714,7 +2723,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	//if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 	if ShouldThrottle() {
 		//logf("ignored move/resize")
-		droppedMoveOrResizeEvents.Add(1)
+		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action
 		return
 	}
 
