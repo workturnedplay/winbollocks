@@ -2181,7 +2181,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					Y:     ny,
 					W:     nw,
 					H:     nh,
-					Flags: SWP_NOZORDER | SWP_NOACTIVATE, //| SWP_ASYNCWINDOWPOS, // no good atm because shrink doesn't work only grow
+					Flags: SWP_NOZORDER | SWP_NOACTIVATE, // | SWP_ASYNCWINDOWPOS, // FIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
 				}
 
 				// Send to your mover channel
@@ -2750,14 +2750,19 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	// 	//flags |= SWP_NOSIZE
 	// 	panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
 	// }
-	ret, _, _ := procSetWindowPos.Call(
+	start := time.Now()
+	ret, _, _ := procSetWindowPos.Call( //XXX: this is blocking, depends on target window's responsiveness! which is why this happens on wndProc not inside mouseProc btw.
 		uintptr(target),
 		uintptr(data.InsertAfter),
 		uintptr(data.X), uintptr(data.Y),
 		uintptr(data.W), uintptr(data.H),
-		uintptr(data.Flags),
+		uintptr(data.Flags), // FIXME: cannot use SWP_ASYNCWINDOWPOS here for ModeResize because windows won't shrink, they only grow
 	)
-
+	duration := time.Since(start)
+	if duration > 25*time.Millisecond {
+		//if you try to resize the Find window in regedit (first u must run as admin because regedit runs as admin) while it's searching for some random text! then this triggers!
+		logf("SetWindowPos took %d ms", duration.Milliseconds())
+	}
 	if ret == 0 {
 		errCode, _, _ := procGetLastError.Call()
 		logf("SetWindowPos failed(from within main message loop): hwnd=0x%x error=%d", target, errCode)
