@@ -1,5 +1,5 @@
 todo:
-* current bug is: during resize releasing RMB won't run the corrected move-back because session is nil so a fixed-size unresizable window remains at the position it woulda been at if it resized!
+* current bug is: during resize releasing RMB won't run the corrected move-back because session is nil so a fixed-size unresizable window remains at the position it woulda been at if it resized! also if it doesn't hit this bug, you can still see it jump during resizing attempts!
 
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
 * fix this: i press/hold shift then winkey (in this order) them MMB click, then release shift (still holding winkey) and it pops up the start menu! it shouldn't (note that i'm already using Rshift as the workaround for not opening Start menu)
