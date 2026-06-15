@@ -2714,6 +2714,16 @@ func handleActualMoveOrResize(data WindowMoveData) {
 
 	//is procSetWindowPos async ?
 	var async bool = (data.Flags & SWP_ASYNCWINDOWPOS) != 0
+	var ptr *dragSession
+
+	if isResizeEvent {
+		// 1. Load the current master pointer
+		ptr = activeSession.Load()
+		if ptr == nil {
+			logf("skipped resizing event due to gesture is no longer in effect (bug, will get fixed soon)")
+			return
+		}
+	}
 	var start time.Time
 	if !async {
 		start = time.Now()
@@ -2738,118 +2748,118 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		if errCode == 5 { // Access denied (UIPI likely)
 			showTrayInfo("winbollocks", "Cannot move/resize elevated window (access denied), you'd have to run as admin.")
 		}
-	} else if isResizeEvent {
+	} else if isResizeEvent && ptr != nil {
 		// 1. Load the current master pointer
-		ptr := activeSession.Load()
-		if ptr != nil {
-			session := *ptr // TODO: use this on-stack thing for other session:=activeSession.Load() places
-			//if currentDrag != nil {
-			if session.mode != ModeResize {
-				//if !resizing.Load() {
-				logf("delayed resizing detected, while not 'resizing'.")
-			}
-			nx, ny, nw, nh := data.X, data.Y, data.W, data.H
-			if !async { //XXX: this 'if' is currently a noop because ModeResize uses SWP_ASYNCWINDOWPOS now!
-				//XXX:this anti-slide logic works only when synchronous, so when SWP_ASYNCWINDOWPOS isn't present! else, if present you can't shrink (can grow tho), however, when async FIXME: sliding happens
-				// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
-				// We asked the OS to resize it to data.W x data.H. Did it listen?
-				var r RECT
-				ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
-				/*
-									1. Why GetWindowRect Seems Out of Sync
-
-					When you call SetWindowPos without SWP_ASYNCWINDOWPOS (sync mode), it does indeed block until the target window processes the WM_WINDOWPOSCHANGING and WM_WINDOWPOSCHANGED messages.
-
-					However, Windows applications are highly asynchronous internally. When a modern app (especially one using a custom UI framework, WPF, or complex drawing like Defraggler) receives the resize message, it often just updates its internal state and posts a paint message to itself to redraw later. Furthermore, during WM_WINDOWPOSCHANGING, an application can modify the WINDOWPOS structure to enforce its own minimum size.
-
-					If it does this, SetWindowPos returns, but GetWindowRect might briefly return an intermediate state, or the window manager might not have fully reconciled the visual bounds yet.
-				*/
-				if ret == 0 {
-					// Optional: Get the specific system error
-					errCode, _, _ := procGetLastError.Call()
-					logf("GetWindowRect during resize failed: hwnd=0x%x, errCode=%d, err:%v", target, errCode, err)
-					// Safety: If we can't get the Rect, we can't do Anti-Slide or Overlay updates safely.
-					return
-				}
-				actualW := r.Right - r.Left
-				actualH := r.Bottom - r.Top
-
-				// If the window failed to reach our target size (likely hit a min/max limit or lagging),
-				// we calculate how much it missed the target by.
-				deltaW := actualW - data.W
-				deltaH := actualH - data.H
-
-				// Correct the position based on WHICH edge is being dragged.
-				// We look at the session.modeZone to determine if we are pulling an edge that affects X or Y.
-				if deltaW != 0 || deltaH != 0 {
-					correctedX := data.X
-					correctedY := data.Y
-					needsCorrection := false
-
-					// Grab the original coordinates to calculate center-offsets if needed
-					origL := session.state.startRect.Left
-					origT := session.state.startRect.Top
-					origR := session.state.startRect.Right
-					origB := session.state.startRect.Bottom
-					origW := origR - origL
-					origH := origB - origT
-
-					// --- 1. Handle X / Width Corrections ---
-					switch session.resizeZone {
-					case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
-						// Left edge pull was blocked; push X back by the mismatch delta
-						correctedX = data.X - deltaW
-						needsCorrection = true
-					case ZONE_CENTER:
-						// Center expansion was blocked; reset X relative to its actual size
-						correctedX = origL + (origW-actualW)/2
-						needsCorrection = true
-					}
-
-					// --- 2. Handle Y / Height Corrections ---
-					switch session.resizeZone {
-					case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
-						// Top edge pull was blocked; push Y back by the mismatch delta
-						correctedY = data.Y - deltaH
-						needsCorrection = true
-					case ZONE_CENTER:
-						// Center expansion was blocked; reset Y relative to its actual size
-						correctedY = origT + (origH-actualH)/2
-						needsCorrection = true
-					}
-
-					if needsCorrection {
-						// Instantly apply the corrected position keeping the actual size it fell back to
-						procSetWindowPos.Call(
-							uintptr(target),
-							0,
-							uintptr(correctedX),
-							uintptr(correctedY),
-							uintptr(actualW),
-							uintptr(actualH),
-							uintptr(data.Flags),
-						)
-
-					}
-					// CRITICAL FIX: Always override the overlay dimensions with the window's
-					// real bounds whenever there is a mismatch, even if X/Y didn't need correction!
-					nx = correctedX
-					ny = correctedY
-					nw = actualW
-					nh = actualH
-				}
-			} //endif didn't have SWP_ASYNCWINDOWPOS
-
-			//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
-			//	//lacks SWP_NOSIZE so it's a resize!
-			// ---- OVERLAY UPDATE ----
-			//doneFIXME: crashes here due to nil pointer deref, likely due to currentDrag being nil race.
-			startW := session.state.startRect.Right - session.state.startRect.Left
-			startH := session.state.startRect.Bottom - session.state.startRect.Top
-			updateOverlay(nx, ny, nw, nh, startW, startH)
-			//}
-			// ------------------------
+		//ptr := activeSession.Load()
+		//if ptr != nil {
+		session := *ptr // TODO: use this on-stack thing for other session:=activeSession.Load() places
+		//if currentDrag != nil {
+		if session.mode != ModeResize {
+			//if !resizing.Load() {
+			logf("delayed resizing detected, while not 'resizing'.")
 		}
+		nx, ny, nw, nh := data.X, data.Y, data.W, data.H
+		if !async { //XXX: this 'if' is currently a noop because ModeResize uses SWP_ASYNCWINDOWPOS now!
+			//XXX:this anti-slide logic works only when synchronous, so when SWP_ASYNCWINDOWPOS isn't present! else, if present you can't shrink (can grow tho), however, when async FIXME: sliding happens
+			// --- THE ANTI-SLIDE REALITY CHECK --- (gemini 3.1 pro)
+			// We asked the OS to resize it to data.W x data.H. Did it listen?
+			var r RECT
+			ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
+			/*
+								1. Why GetWindowRect Seems Out of Sync
+
+				When you call SetWindowPos without SWP_ASYNCWINDOWPOS (sync mode), it does indeed block until the target window processes the WM_WINDOWPOSCHANGING and WM_WINDOWPOSCHANGED messages.
+
+				However, Windows applications are highly asynchronous internally. When a modern app (especially one using a custom UI framework, WPF, or complex drawing like Defraggler) receives the resize message, it often just updates its internal state and posts a paint message to itself to redraw later. Furthermore, during WM_WINDOWPOSCHANGING, an application can modify the WINDOWPOS structure to enforce its own minimum size.
+
+				If it does this, SetWindowPos returns, but GetWindowRect might briefly return an intermediate state, or the window manager might not have fully reconciled the visual bounds yet.
+			*/
+			if ret == 0 {
+				// Optional: Get the specific system error
+				errCode, _, _ := procGetLastError.Call()
+				logf("GetWindowRect during resize failed: hwnd=0x%x, errCode=%d, err:%v", target, errCode, err)
+				// Safety: If we can't get the Rect, we can't do Anti-Slide or Overlay updates safely.
+				return
+			}
+			actualW := r.Right - r.Left
+			actualH := r.Bottom - r.Top
+
+			// If the window failed to reach our target size (likely hit a min/max limit or lagging),
+			// we calculate how much it missed the target by.
+			deltaW := actualW - data.W
+			deltaH := actualH - data.H
+
+			// Correct the position based on WHICH edge is being dragged.
+			// We look at the session.modeZone to determine if we are pulling an edge that affects X or Y.
+			if deltaW != 0 || deltaH != 0 {
+				correctedX := data.X
+				correctedY := data.Y
+				needsCorrection := false
+
+				// Grab the original coordinates to calculate center-offsets if needed
+				origL := session.state.startRect.Left
+				origT := session.state.startRect.Top
+				origR := session.state.startRect.Right
+				origB := session.state.startRect.Bottom
+				origW := origR - origL
+				origH := origB - origT
+
+				// --- 1. Handle X / Width Corrections ---
+				switch session.resizeZone {
+				case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
+					// Left edge pull was blocked; push X back by the mismatch delta
+					correctedX = data.X - deltaW
+					needsCorrection = true
+				case ZONE_CENTER:
+					// Center expansion was blocked; reset X relative to its actual size
+					correctedX = origL + (origW-actualW)/2
+					needsCorrection = true
+				}
+
+				// --- 2. Handle Y / Height Corrections ---
+				switch session.resizeZone {
+				case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
+					// Top edge pull was blocked; push Y back by the mismatch delta
+					correctedY = data.Y - deltaH
+					needsCorrection = true
+				case ZONE_CENTER:
+					// Center expansion was blocked; reset Y relative to its actual size
+					correctedY = origT + (origH-actualH)/2
+					needsCorrection = true
+				}
+
+				if needsCorrection {
+					// Instantly apply the corrected position keeping the actual size it fell back to
+					procSetWindowPos.Call(
+						uintptr(target),
+						0,
+						uintptr(correctedX),
+						uintptr(correctedY),
+						uintptr(actualW),
+						uintptr(actualH),
+						uintptr(data.Flags),
+					)
+
+				}
+				// CRITICAL FIX: Always override the overlay dimensions with the window's
+				// real bounds whenever there is a mismatch, even if X/Y didn't need correction!
+				nx = correctedX
+				ny = correctedY
+				nw = actualW
+				nh = actualH
+			}
+		} //endif didn't have SWP_ASYNCWINDOWPOS
+
+		//if data.Flags&SWP_NOSIZE == 0 { // actually in this 'else if' block we know we're in resize mode
+		//	//lacks SWP_NOSIZE so it's a resize!
+		// ---- OVERLAY UPDATE ----
+		//doneFIXME: crashes here due to nil pointer deref, likely due to currentDrag being nil race.
+		startW := session.state.startRect.Right - session.state.startRect.Left
+		startH := session.state.startRect.Bottom - session.state.startRect.Top
+		updateOverlay(nx, ny, nw, nh, startW, startH)
+		//}
+		// ------------------------
+		//}
 	} //else
 }
 
