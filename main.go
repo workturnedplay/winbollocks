@@ -398,6 +398,7 @@ const (
 	MENU_ACTIVATE_MOVE                = 3
 	MENU_RATELIMIT_MOVES              = 4
 	MENU_LOG_RATE_OF_MOVES            = 5
+	MENU_TOGGLE_ASYNC_RESIZE          = 6
 
 	MF_STRING = 0x0000
 
@@ -665,6 +666,7 @@ var focusOnDrag atomic.Bool                // whether or not to (also)focus drag
 var doLMBClick2FocusAsFallback atomic.Bool // if normal(thread attach) focus fails, then do the LMB click on the window to focus it(caveat: can click inside it eg. on its buttons!)
 var ratelimitOnMove atomic.Bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
 var shouldLogDragRate atomic.Bool          // but only when ratelimitOnMove is true
+var asyncResize atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -2210,14 +2212,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
 				nx, ny, nw, nh := calculateResize(session, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
-
+				flags := uint32(SWP_NOZORDER | SWP_NOACTIVATE)
+				if asyncResize.Load() {
+					flags |= SWP_ASYNCWINDOWPOS
+				}
 				data := WindowMoveData{
 					Hwnd:  session.targetWnd,
 					X:     nx,
 					Y:     ny,
 					W:     nw,
 					H:     nh,
-					Flags: SWP_NOZORDER | SWP_NOACTIVATE, // | SWP_ASYNCWINDOWPOS, // doneFIXME: SWP_ASYNCWINDOWPOS is no good atm because shrink doesn't work only grow
+					Flags: flags,
 				}
 
 				// Send to your mover channel
@@ -3097,6 +3102,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
+			asyncText := mustUTF16("Use Async Window Positioning for Resizing")
 
 			exitText := mustUTF16("Exit")
 
@@ -3136,6 +3142,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			procAppendMenu.Call(hMenu, sldrFlags, MENU_LOG_RATE_OF_MOVES,
 				uintptr(unsafe.Pointer(sldrText)))
+
+			var asyncFlags uintptr = MF_STRING
+			if asyncResize.Load() {
+				asyncFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, asyncFlags, MENU_TOGGLE_ASYNC_RESIZE,
+				uintptr(unsafe.Pointer(asyncText)))
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
@@ -3188,6 +3201,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 					lastPostedX.Store(-1)
 					lastPostedY.Store(-1)
 				}
+
+			case MENU_TOGGLE_ASYNC_RESIZE:
+				asyncResize.Store(!asyncResize.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -3870,6 +3886,7 @@ func init() {
 
 	ratelimitOnMove.Store(false)
 	shouldLogDragRate.Store(false)
+	asyncResize.Store(false) // default to sync
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
