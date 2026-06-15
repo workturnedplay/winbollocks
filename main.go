@@ -556,10 +556,10 @@ type MSLLHOOKSTRUCT struct {
 type dragState struct {
 	startPt   POINT
 	startRect RECT
-	knownMinW int32
-	knownMinH int32
-	knownMaxW int32 // NEW
-	knownMaxH int32 // NEW
+	// knownMinW int32
+	// knownMinH int32
+	// knownMaxW int32 // NEW
+	// knownMaxH int32 // NEW
 }
 
 type NOTIFYICONDATA struct {
@@ -691,8 +691,8 @@ func getResizeZone(pt POINT, r RECT) int {
 	return row*3 + col
 }
 
-const minimumW = 300
-const minimumH = 300
+// const minimumW = 300
+// const minimumH = 300
 
 func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 	drag := session.state
@@ -710,11 +710,11 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 	origW := origR - origL
 	origH := origB - origT
 
-	// Use the dynamically discovered minimums!
-	minW := drag.knownMinW
-	minH := drag.knownMinH
-	maxW := drag.knownMaxW // NEW
-	maxH := drag.knownMaxH // NEW
+	// // Use the dynamically discovered minimums!
+	// minW := drag.knownMinW
+	// minH := drag.knownMinH
+	// maxW := drag.knownMaxW // NEW
+	// maxH := drag.knownMaxH // NEW
 
 	if zone == ZONE_CENTER {
 		// UNIFORM CENTER RESIZE
@@ -736,46 +736,46 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 		w = origW + dw
 		h = origH + dh
 
-		// Apply safety minimums, maintaining aspect ratio if we hit the floor
-		if w < minW {
-			w = minW
-			if respectAspectRatio && session.initialAspectRatio > 0 {
-				h = int32(float64(w) / session.initialAspectRatio)
-			}
-		}
-		if h < minH {
-			h = minH
-			if respectAspectRatio && session.initialAspectRatio > 0 {
-				w = int32(float64(h) * session.initialAspectRatio)
-			}
-		}
-		// Max constraints (NEW)
-		if maxW > 0 && w > maxW {
-			w = maxW
-			if respectAspectRatio && session.initialAspectRatio > 0 {
-				h = int32(float64(w) / session.initialAspectRatio)
-			}
-		}
-		if maxH > 0 && h > maxH {
-			h = maxH
-			if respectAspectRatio && session.initialAspectRatio > 0 {
-				w = int32(float64(h) * session.initialAspectRatio)
-			}
-		}
-		// Second pass for absolute safety
-		// Final safety clamp
-		if w < minW {
-			w = minW
-		}
-		if maxW > 0 && w > maxW {
-			w = maxW
-		}
-		if h < minH {
-			h = minH
-		}
-		if maxH > 0 && h > maxH {
-			h = maxH
-		}
+		// // Apply safety minimums, maintaining aspect ratio if we hit the floor
+		// if w < minW {
+		// 	w = minW
+		// 	if respectAspectRatio && session.initialAspectRatio > 0 {
+		// 		h = int32(float64(w) / session.initialAspectRatio)
+		// 	}
+		// }
+		// if h < minH {
+		// 	h = minH
+		// 	if respectAspectRatio && session.initialAspectRatio > 0 {
+		// 		w = int32(float64(h) * session.initialAspectRatio)
+		// 	}
+		// }
+		// // Max constraints (NEW)
+		// if maxW > 0 && w > maxW {
+		// 	w = maxW
+		// 	if respectAspectRatio && session.initialAspectRatio > 0 {
+		// 		h = int32(float64(w) / session.initialAspectRatio)
+		// 	}
+		// }
+		// if maxH > 0 && h > maxH {
+		// 	h = maxH
+		// 	if respectAspectRatio && session.initialAspectRatio > 0 {
+		// 		w = int32(float64(h) * session.initialAspectRatio)
+		// 	}
+		// }
+		// // Second pass for absolute safety
+		// // Final safety clamp
+		// if w < minW {
+		// 	w = minW
+		// }
+		// if maxW > 0 && w > maxW {
+		// 	w = maxW
+		// }
+		// if h < minH {
+		// 	h = minH
+		// }
+		// if maxH > 0 && h > maxH {
+		// 	h = maxH
+		// }
 
 		x = origL + (origW-w)/2
 		y = origT + (origH-h)/2
@@ -806,39 +806,39 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 			newB += dy
 		}
 
-		// Strictly enforce dynamic minimums
-		if zone == ZONE_TOP_LEFT || zone == ZONE_MID_LEFT || zone == ZONE_BOT_LEFT {
-			if newR-newL < minW {
-				newL = newR - minW
-			}
-			if maxW > 0 && newR-newL > maxW {
-				newL = newR - maxW
-			} // NEW
-		}
-		if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
-			if newR-newL < minW {
-				newR = newL + minW
-			}
-			if maxW > 0 && newR-newL > maxW {
-				newR = newL + maxW
-			} // NEW
-		}
-		if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
-			if newB-newT < minH {
-				newT = newB - minH
-			}
-			if maxH > 0 && newB-newT > maxH {
-				newT = newB - maxH
-			} // NEW
-		}
-		if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
-			if newB-newT < minH {
-				newB = newT + minH
-			}
-			if maxH > 0 && newB-newT > maxH {
-				newB = newT + maxH
-			} // NEW
-		}
+		// // Strictly enforce dynamic minimums
+		// if zone == ZONE_TOP_LEFT || zone == ZONE_MID_LEFT || zone == ZONE_BOT_LEFT {
+		// 	if newR-newL < minW {
+		// 		newL = newR - minW
+		// 	}
+		// 	if maxW > 0 && newR-newL > maxW {
+		// 		newL = newR - maxW
+		// 	} // NEW
+		// }
+		// if zone == ZONE_TOP_RIGHT || zone == ZONE_MID_RIGHT || zone == ZONE_BOT_RIGHT {
+		// 	if newR-newL < minW {
+		// 		newR = newL + minW
+		// 	}
+		// 	if maxW > 0 && newR-newL > maxW {
+		// 		newR = newL + maxW
+		// 	} // NEW
+		// }
+		// if zone == ZONE_TOP_LEFT || zone == ZONE_TOP_CENTER || zone == ZONE_TOP_RIGHT {
+		// 	if newB-newT < minH {
+		// 		newT = newB - minH
+		// 	}
+		// 	if maxH > 0 && newB-newT > maxH {
+		// 		newT = newB - maxH
+		// 	} // NEW
+		// }
+		// if zone == ZONE_BOT_LEFT || zone == ZONE_BOT_CENTER || zone == ZONE_BOT_RIGHT {
+		// 	if newB-newT < minH {
+		// 		newB = newT + minH
+		// 	}
+		// 	if maxH > 0 && newB-newT > maxH {
+		// 		newB = newT + maxH
+		// 	} // NEW
+		// }
 
 		x, y = newL, newT
 		w, h = newR-newL, newB-newT
@@ -2360,9 +2360,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			activeSession.Store(&dragSession{
 				targetWnd: wantTargetWnd,
 				mode:      ModeResize,
-				state: dragState{startPt: info.Pt, startRect: r,
-					knownMinW: minimumW, // Start with your 300px default
-					knownMinH: minimumH},
+				state:     dragState{startPt: info.Pt, startRect: r},
+				// knownMinW: minimumW, // Start with your 300px default
+				// knownMinH: minimumH
+
 				resizeZone:         getResizeZone(info.Pt, r),
 				initialAspectRatio: float64(w) / float64(h),
 			})
@@ -2872,81 +2873,131 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				actualW := r.Right - r.Left
 				actualH := r.Bottom - r.Top
 
-				clamped := false
-				// // If actual width is larger than what we requested AND larger than our currently known minimum
-				// if actualW > data.W && actualW > session.state.knownMinW {
-				// 	session.state.knownMinW = actualW
-				// 	clamped = true
+				// clamped := false
+				// // // If actual width is larger than what we requested AND larger than our currently known minimum
+				// // if actualW > data.W && actualW > session.state.knownMinW {
+				// // 	session.state.knownMinW = actualW
+				// // 	clamped = true
+				// // }
+				// // if actualH > data.H && actualH > session.state.knownMinH {
+				// // 	session.state.knownMinH = actualH
+				// // 	clamped = true
+				// // }
+				// // Check W constraints
+				// if actualW != data.W {
+				// 	if data.W < actualW && actualW > session.state.knownMinW {
+				// 		// Tried to shrink below OS allowed size
+				// 		// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
+				// 		logf("Clamping W from %d to %d", session.state.knownMinW, actualW)
+				// 		session.state.knownMinW = actualW
+				// 		clamped = true
+				// 	} else if data.W > actualW {
+				// 		// Tried to expand above OS allowed size (NEW)
+				// 		if session.state.knownMaxW == 0 || actualW < session.state.knownMaxW {
+				// 			session.state.knownMaxW = actualW
+				// 			clamped = true
+				// 		}
+				// 	}
 				// }
-				// if actualH > data.H && actualH > session.state.knownMinH {
-				// 	session.state.knownMinH = actualH
-				// 	clamped = true
+
+				// // Check H constraints
+				// if actualH != data.H {
+				// 	if data.H < actualH && actualH > session.state.knownMinH {
+				// 		// Tried to shrink below OS allowed size
+				// 		// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
+				// 		logf("Clamping H from %d to %d", session.state.knownMinH, actualH)
+				// 		session.state.knownMinH = actualH
+				// 		clamped = true
+				// 	} else if data.H > actualH {
+				// 		// Tried to expand above OS allowed size (NEW)
+				// 		if session.state.knownMaxH == 0 || actualH < session.state.knownMaxH {
+				// 			session.state.knownMaxH = actualH
+				// 			clamped = true
+				// 		}
+				// 	}
 				// }
-				// Check W constraints
-				if actualW != data.W {
-					if data.W < actualW && actualW > session.state.knownMinW {
-						// Tried to shrink below OS allowed size
-						// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
-						logf("Clamping W from %d to %d", session.state.knownMinW, actualW)
-						session.state.knownMinW = actualW
-						clamped = true
-					} else if data.W > actualW {
-						// Tried to expand above OS allowed size (NEW)
-						if session.state.knownMaxW == 0 || actualW < session.state.knownMaxW {
-							session.state.knownMaxW = actualW
-							clamped = true
-						}
+
+				// // If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
+				// // We must immediately correct the window position to restore the anchor.
+				// if clamped {
+				// 	var pt POINT
+				// 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
+
+				// 	nx, ny, nw, nh = calculateResize(&session, pt)
+				// 	// 4. ATOMICALLY PUBLISH IT BACK
+				// 	// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
+				// 	// If the user released the mouse and softReset(nil) ran in the meantime,
+				// 	// or if a brand new drag started, this CAS will safely fail, preventing
+				// 	// you from accidentally resurrecting a dead or obsolete session!
+
+				// 	//_ = activeSession.CompareAndSwap(ptr, &session) // this makes 'session' be on heap!
+
+				// 	// 2. ONLY allocate a heap value if a clamping threshold was crossed!
+				// 	// We build a new heap-allocated wrapper and attempt the swap.
+				// 	heapUpdate := session
+
+				// 	// If it fails, we don't care! It means another thread mutated the session pointer,
+				// 	// but our stack-local 'session' variables remain valid for finishing this frame.
+				// 	_ = activeSession.CompareAndSwap(ptr, &heapUpdate)
+
+				// 	// Snap the window back to the correct anchor point
+				// 	procSetWindowPos.Call(
+				// 		uintptr(target),
+				// 		uintptr(data.InsertAfter),
+				// 		uintptr(nx), uintptr(ny),
+				// 		uintptr(nw), uintptr(nh),
+				// 		uintptr(data.Flags),
+				// 	)
+				// }
+
+				// If the window failed to reach our target size (likely hit a min/max limit or lagging),
+				// we calculate how much it missed the target by.
+				deltaW := actualW - data.W
+				deltaH := actualH - data.H
+
+				// Correct the position based on WHICH edge is being dragged.
+				// We look at the session.modeZone to determine if we are pulling an edge that affects X or Y.
+				if deltaW != 0 || deltaH != 0 {
+					correctedX := data.X
+					correctedY := data.Y
+					needsCorrection := false
+
+					// Check zones that modify the Left (X) side of the window
+					// (Top-Left, Mid-Left, Bottom-Left)
+					if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_MID_LEFT || session.resizeZone == ZONE_BOT_LEFT {
+						// If it didn't shrink as much as we wanted, deltaW is positive.
+						// We need to move X back to the left to counteract the slide.
+						correctedX = data.X - deltaW
+						needsCorrection = true
 					}
-				}
 
-				// Check H constraints
-				if actualH != data.H {
-					if data.H < actualH && actualH > session.state.knownMinH {
-						// Tried to shrink below OS allowed size
-						// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
-						logf("Clamping H from %d to %d", session.state.knownMinH, actualH)
-						session.state.knownMinH = actualH
-						clamped = true
-					} else if data.H > actualH {
-						// Tried to expand above OS allowed size (NEW)
-						if session.state.knownMaxH == 0 || actualH < session.state.knownMaxH {
-							session.state.knownMaxH = actualH
-							clamped = true
-						}
+					// Check zones that modify the Top (Y) side of the window
+					// (Top-Left, Top-Mid, Top-Right)
+					if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_TOP_CENTER || session.resizeZone == ZONE_TOP_RIGHT {
+						// If it didn't shrink as much as we wanted, deltaH is positive.
+						// We need to move Y back up to counteract the slide.
+						correctedY = data.Y - deltaH
+						needsCorrection = true
 					}
-				}
 
-				// If the OS clamped the size, the X/Y we sent caused the opposite edge to slide!
-				// We must immediately correct the window position to restore the anchor.
-				if clamped {
-					var pt POINT
-					procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))) // Get latest mouse position
+					if needsCorrection {
+						// Instantly apply the corrected position keeping the actual size it fell back to
+						procSetWindowPos.Call(
+							uintptr(target),
+							0,
+							uintptr(correctedX),
+							uintptr(correctedY),
+							uintptr(actualW),
+							uintptr(actualH),
+							uintptr(data.Flags),
+						)
 
-					nx, ny, nw, nh = calculateResize(&session, pt)
-					// 4. ATOMICALLY PUBLISH IT BACK
-					// This will succeed ONLY if the global pointer is still pointing to 'ptr'.
-					// If the user released the mouse and softReset(nil) ran in the meantime,
-					// or if a brand new drag started, this CAS will safely fail, preventing
-					// you from accidentally resurrecting a dead or obsolete session!
-
-					//_ = activeSession.CompareAndSwap(ptr, &session) // this makes 'session' be on heap!
-
-					// 2. ONLY allocate a heap value if a clamping threshold was crossed!
-					// We build a new heap-allocated wrapper and attempt the swap.
-					heapUpdate := session
-
-					// If it fails, we don't care! It means another thread mutated the session pointer,
-					// but our stack-local 'session' variables remain valid for finishing this frame.
-					_ = activeSession.CompareAndSwap(ptr, &heapUpdate)
-
-					// Snap the window back to the correct anchor point
-					procSetWindowPos.Call(
-						uintptr(target),
-						uintptr(data.InsertAfter),
-						uintptr(nx), uintptr(ny),
-						uintptr(nw), uintptr(nh),
-						uintptr(data.Flags),
-					)
+						// Update our local variables so the overlay accurately reflects where the window ended up
+						nx = correctedX
+						ny = correctedY
+						nw = actualW
+						nh = actualH
+					}
 				}
 			} //endif didn't have SWP_ASYNCWINDOWPOS
 
