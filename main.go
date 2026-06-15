@@ -2886,6 +2886,8 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				if actualW != data.W {
 					if data.W < actualW && actualW > session.state.knownMinW {
 						// Tried to shrink below OS allowed size
+						// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
+						logf("Clamping W from %d to %d", session.state.knownMinW, actualW)
 						session.state.knownMinW = actualW
 						clamped = true
 					} else if data.W > actualW {
@@ -2901,6 +2903,8 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				if actualH != data.H {
 					if data.H < actualH && actualH > session.state.knownMinH {
 						// Tried to shrink below OS allowed size
+						// FIXME: The Ratchet: Defraggler won't shrink past this, unless u do it within the first 100ms of the gesture trigger, or sometimes if u shrink during expand.
+						logf("Clamping H from %d to %d", session.state.knownMinH, actualH)
 						session.state.knownMinH = actualH
 						clamped = true
 					} else if data.H > actualH {
