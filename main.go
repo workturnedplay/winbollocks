@@ -752,6 +752,45 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 		w, h = newR-newL, newB-newT
 	}
 
+	// --- ANCHOR-AWARE HARD SAFETY FLOOR ---
+	// Enforce a safe minimum size (e.g., 32x32) while locking down the correct coordinates
+	// so the window never slides when it hits this boundary floor.
+	const safeMin = 32
+
+	if zone == ZONE_CENTER {
+		if w < safeMin {
+			w = safeMin
+			x = origL + (origW-safeMin)/2
+		}
+		if h < safeMin {
+			h = safeMin
+			y = origT + (origH-safeMin)/2
+		}
+	} else {
+		if w < safeMin {
+			w = safeMin
+			switch zone {
+			case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
+				// Left side is dragging inward -> Freeze the Right Edge (origR)
+				x = origR - safeMin
+			case ZONE_TOP_RIGHT, ZONE_MID_RIGHT, ZONE_BOT_RIGHT:
+				// Right side is dragging inward -> Freeze the Left Edge (origL)
+				x = origL
+			}
+		}
+		if h < safeMin {
+			h = safeMin
+			switch zone {
+			case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
+				// Top side is dragging inward -> Freeze the Bottom Edge (origB)
+				y = origB - safeMin
+			case ZONE_BOT_LEFT, ZONE_BOT_CENTER, ZONE_BOT_RIGHT:
+				// Bottom side is dragging inward -> Freeze the Top Edge (origT)
+				y = origT
+			}
+		}
+	}
+
 	return x, y, w, h
 }
 
