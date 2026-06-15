@@ -1,5 +1,4 @@
 todo:
-//workaroundfix//* current bug is: during resize releasing RMB won't run the corrected move-back because session is nil so a fixed-size unresizable window remains at the position it woulda been at if it resized! also if it doesn't hit this bug, you can still see it jump(currently still not fixed) during resizing attempts!
 
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
 * fix this: i press/hold shift then winkey (in this order) them MMB click, then release shift (still holding winkey) and it pops up the start menu! it shouldn't (note that i'm already using Rshift as the workaround for not opening Start menu)
@@ -12,6 +11,7 @@ todo:
 * add option whether to focus window while the resize is happening/started
 
 done:
+//fixedproperly//* current bug is: during resize releasing RMB won't run the corrected move-back because session is nil so a fixed-size unresizable window remains at the position it woulda been at if it resized! also if it doesn't hit this bug, you can still see it jump(now fixed too) during resizing attempts!
 //* The Ratchet bug affecting Defraggler's main window ie. it would prevent shrinking after like the first 100ms due to W/H minimums being set due to procGetWindowRect getting the old size even tho the synchronous procSetWindowPos (that set the new size) did so.
 //nolongerapplies//* maybe WindowMoveData should contain the knownMinW and knownMinH and resizeZone and startPt and startRect, so a dragState copy basically!
 //yeah not setting it //* unclear if I should touch GOMAXPROCS at all though, maybe only if numCPU is less than 3 ?
