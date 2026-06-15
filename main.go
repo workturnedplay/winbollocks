@@ -2962,21 +2962,53 @@ func handleActualMoveOrResize(data WindowMoveData) {
 					correctedY := data.Y
 					needsCorrection := false
 
-					// Check zones that modify the Left (X) side of the window
-					// (Top-Left, Mid-Left, Bottom-Left)
-					if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_MID_LEFT || session.resizeZone == ZONE_BOT_LEFT {
-						// If it didn't shrink as much as we wanted, deltaW is positive.
-						// We need to move X back to the left to counteract the slide.
+					// // Check zones that modify the Left (X) side of the window
+					// // (Top-Left, Mid-Left, Bottom-Left)
+					// if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_MID_LEFT || session.resizeZone == ZONE_BOT_LEFT {
+					// 	// If it didn't shrink as much as we wanted, deltaW is positive.
+					// 	// We need to move X back to the left to counteract the slide.
+					// 	correctedX = data.X - deltaW
+					// 	needsCorrection = true
+					// }
+
+					// // Check zones that modify the Top (Y) side of the window
+					// // (Top-Left, Top-Mid, Top-Right)
+					// if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_TOP_CENTER || session.resizeZone == ZONE_TOP_RIGHT {
+					// 	// If it didn't shrink as much as we wanted, deltaH is positive.
+					// 	// We need to move Y back up to counteract the slide.
+					// 	correctedY = data.Y - deltaH
+					// 	needsCorrection = true
+					// }
+
+					// Grab the original coordinates to calculate center-offsets if needed
+					origL := session.state.startRect.Left
+					origT := session.state.startRect.Top
+					origR := session.state.startRect.Right
+					origB := session.state.startRect.Bottom
+					origW := origR - origL
+					origH := origB - origT
+
+					// --- 1. Handle X / Width Corrections ---
+					switch session.resizeZone {
+					case ZONE_TOP_LEFT, ZONE_MID_LEFT, ZONE_BOT_LEFT:
+						// Left edge pull was blocked; push X back by the mismatch delta
 						correctedX = data.X - deltaW
+						needsCorrection = true
+					case ZONE_CENTER:
+						// Center expansion was blocked; reset X relative to its actual size
+						correctedX = origL + (origW-actualW)/2
 						needsCorrection = true
 					}
 
-					// Check zones that modify the Top (Y) side of the window
-					// (Top-Left, Top-Mid, Top-Right)
-					if session.resizeZone == ZONE_TOP_LEFT || session.resizeZone == ZONE_TOP_CENTER || session.resizeZone == ZONE_TOP_RIGHT {
-						// If it didn't shrink as much as we wanted, deltaH is positive.
-						// We need to move Y back up to counteract the slide.
+					// --- 2. Handle Y / Height Corrections ---
+					switch session.resizeZone {
+					case ZONE_TOP_LEFT, ZONE_TOP_CENTER, ZONE_TOP_RIGHT:
+						// Top edge pull was blocked; push Y back by the mismatch delta
 						correctedY = data.Y - deltaH
+						needsCorrection = true
+					case ZONE_CENTER:
+						// Center expansion was blocked; reset Y relative to its actual size
+						correctedY = origT + (origH-actualH)/2
 						needsCorrection = true
 					}
 
@@ -2992,12 +3024,18 @@ func handleActualMoveOrResize(data WindowMoveData) {
 							uintptr(data.Flags),
 						)
 
-						// Update our local variables so the overlay accurately reflects where the window ended up
-						nx = correctedX
-						ny = correctedY
-						nw = actualW
-						nh = actualH
+						// // Update our local variables so the overlay accurately reflects where the window ended up
+						// nx = correctedX
+						// ny = correctedY
+						// nw = actualW
+						// nh = actualH
 					}
+					// CRITICAL FIX: Always override the overlay dimensions with the window's
+					// real bounds whenever there is a mismatch, even if X/Y didn't need correction!
+					nx = correctedX
+					ny = correctedY
+					nw = actualW
+					nh = actualH
 				}
 			} //endif didn't have SWP_ASYNCWINDOWPOS
 
