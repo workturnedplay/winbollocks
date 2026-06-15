@@ -2848,6 +2848,15 @@ func handleActualMoveOrResize(data WindowMoveData) {
 				// We asked the OS to resize it to data.W x data.H. Did it listen?
 				var r RECT
 				ret, _, err := procGetWindowRect.Call(uintptr(target), uintptr(unsafe.Pointer(&r)))
+				/*
+									1. Why GetWindowRect Seems Out of Sync
+
+					When you call SetWindowPos without SWP_ASYNCWINDOWPOS (sync mode), it does indeed block until the target window processes the WM_WINDOWPOSCHANGING and WM_WINDOWPOSCHANGED messages.
+
+					However, Windows applications are highly asynchronous internally. When a modern app (especially one using a custom UI framework, WPF, or complex drawing like Defraggler) receives the resize message, it often just updates its internal state and posts a paint message to itself to redraw later. Furthermore, during WM_WINDOWPOSCHANGING, an application can modify the WINDOWPOS structure to enforce its own minimum size.
+
+					If it does this, SetWindowPos returns, but GetWindowRect might briefly return an intermediate state, or the window manager might not have fully reconciled the visual bounds yet.
+				*/
 				if ret == 0 {
 					// Optional: Get the specific system error
 					errCode, _, _ := procGetLastError.Call()
