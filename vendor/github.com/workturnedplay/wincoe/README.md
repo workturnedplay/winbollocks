@@ -5,8 +5,8 @@ Originally located here: https://github.com/workturnedplay/wincoe
 (unless you got it from a fork, try `git remote -v` to check)  
 
 `wincoe` is a small lib that I use in some of my projects on win11.  
-The name comes from `wincore` but lack the `r`.  
-Made with AI assistance.  
+The name comes from `wincore` but lacks the `r`.  
+Made with AI assistance(chat not agents).  
 
 ---
 

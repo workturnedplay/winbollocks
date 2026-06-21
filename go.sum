@@ -1,6 +1,6 @@
-github.com/workturnedplay/wincoe v0.0.15 h1:Z1DFaW//Gw3QoHdj7mz3adskYmH7M+jqMo+mHMeT/h4=
-github.com/workturnedplay/wincoe v0.0.15/go.mod h1:w2Ez8oPxbinPg8SekSF1EOQ7lliI7rCEy2URIhnOydg=
-golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
-golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
-golang.org/x/term v0.42.0 h1:UiKe+zDFmJobeJ5ggPwOshJIVt6/Ft0rcfrXZDLWAWY=
-golang.org/x/term v0.42.0/go.mod h1:Dq/D+snpsbazcBG5+F9Q1n2rXV8Ma+71xEjTRufARgY=
+github.com/workturnedplay/wincoe v0.0.18 h1:muQCjzeHZHwf99yVCVttqGTVDVDoDQwxtnBVsCIsl2M=
+github.com/workturnedplay/wincoe v0.0.18/go.mod h1:GtV9bp/Mz8WC5Bf3JwlQM7CH5KvZV+tgWW4lWSdUyyM=
+golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=
+golang.org/x/sys v0.46.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/term v0.44.0 h1:0rLvDRCtNj0gZkyIXhCyOb2OAzEhLVqc4B+hrsBhrmc=
+golang.org/x/term v0.44.0/go.mod h1:7ze4MdzUzLXpSAoFP1H0bOI9aXDqveSvatT5vKcFh2Y=

@@ -134,6 +134,26 @@ const (
 // Ensure MaxExtendedPath is at least as large as the legacy MAX_PATH (260).
 var _ = [MaxExtendedPath - 260]byte{}
 
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING uint32 = 0x0004
+
+func EnableVirtualTerminalProcessing() error {
+	hStdout, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
+	if err != nil {
+		return fmt.Errorf("GetStdHandle failed: %w", err)
+	}
+	if hStdout == windows.InvalidHandle {
+		return errors.New("invalid stdout handle")
+	}
+
+	var mode uint32
+	if err := windows.GetConsoleMode(hStdout, &mode); err != nil {
+		return fmt.Errorf("GetConsoleMode failed: %w", err)
+	}
+
+	mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
+	return windows.SetConsoleMode(hStdout, mode)
+}
+
 // WithConsoleColor temporarily changes text attribute, runs fn, then restores original
 func WithConsoleColor(outputHandle windows.Handle, color uint16, fn func()) (errRet error) {
 	originalColor, err := GetConsoleScreenBufferAttributes(outputHandle)
@@ -229,6 +249,7 @@ var (
 
 const (
 	KEY_EVENT = 0x0001
+	VK_RETURN = 0x0D // Virtual Key Code for Enter/Carriage Return
 )
 
 // ClearStdin inspects and consumes all pending console input events.
@@ -464,14 +485,21 @@ func CheckWinResult(
 	if callErr == nil {
 		// Many Win32 APIs (e.g. GetExtendedUdpTable) return the error in r1.
 		// Only treat r1 as an errno if it's non-zero.
-		if r1 != 0 {
-			errno := windows.Errno(r1) //TODO: see how we can match against this, I doubt errors.Is still works for this! actually, it seems to based on the below!
+		if r1 != 0 { // 0 here is exactly windows.ERROR_SUCCESS
+			errno := windows.Errno(r1) //doneTODO: see how we can match against this, I doubt errors.Is still works for this! actually, it seems to, based on the below!
 
-			// Defensive: avoid ever wrapping ERROR_SUCCESS
-			if !errors.Is(errno, windows.ERROR_SUCCESS) {
-				// since r1 != 0 already, this is bound to never be ERROR_SUCCESS here, unless r1 != 0 can ever be ERROR_SUCCESS, unsure.
-				return fmt.Errorf("%q windows call failed with error: %w", operationNameToIncludeInErrorMessages, errno)
-			}
+			// Local compile-time assertion trap(to avoid that inner 'if'):
+			type _ [0 - int(windows.ERROR_SUCCESS)]byte
+
+			// Compile-time assertion that ERROR_SUCCESS is 0.
+			// If it is NOT 0, this evaluates to [-1]int, which causes a compiler error.
+			var _ [0 - int(windows.ERROR_SUCCESS)]int
+
+			//// Defensive: avoid ever wrapping ERROR_SUCCESS
+			//if !errors.Is(errno, windows.ERROR_SUCCESS) {
+			// since r1 != 0 already, this is bound to never be ERROR_SUCCESS here, unless r1 != 0 can ever be ERROR_SUCCESS, unsure.
+			return fmt.Errorf("%q windows call failed with error: %w", operationNameToIncludeInErrorMessages, errno)
+			//}
 		}
 
 		//fmt.Printf("[GoR:%d] !ending   CheckWinResult for %s with truly unknown failure: ret=%d\n", GoRoutineId(), operationNameToIncludeInErrorMessages, r1)
@@ -654,6 +682,7 @@ var (
 	procGetExtendedUdpTable = NewBoundProc(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
 	procGetExtendedTcpTable = NewBoundProc(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
 
+	// Secure: restricts DLL search path strictly to %SystemRoot%\System32
 	Kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	// Note: QueryFullProcessNameW expects 'size' to include the null terminator
 	// on input, and returns the length WITHOUT the null terminator on success.
@@ -661,6 +690,9 @@ var (
 	procCreateToolhelp32Snapshot = NewBoundProc(Kernel32, "CreateToolhelp32Snapshot", CheckHandle)
 	procProcess32First           = NewBoundProc(Kernel32, "Process32FirstW", CheckBool)
 	procProcess32Next            = NewBoundProc(Kernel32, "Process32NextW", CheckBool)
+
+	//procWriteConsoleInputW = Kernel32.NewProc("WriteConsoleInputW")
+	procWriteConsoleInputW = NewBoundProc(Kernel32, "WriteConsoleInputW", CheckBool)
 )
 
 // auto runs before main(), loads the DLLs non-lazily.
@@ -1323,4 +1355,46 @@ func GoRoutineId() int64 {
 	var id int64 = -1
 	fmt.Sscanf(string(buf[:n]), "goroutine %d", &id)
 	return id
+}
+
+// InjectConsoleEnter synthesizes a dummy Carriage Return (Enter) key event
+// and writes it directly into the system's console input buffer.
+// This safely unblocks threads stuck on synchronous reads like term.ReadPassword.
+// InjectConsoleEnter sends a synthetic Carriage Return (Enter) to the console stream
+func InjectConsoleEnter() error {
+	return InjectConsoleKey(VK_RETURN, 0x1C, '\r')
+}
+
+// InjectConsoleKey synthesizes a single virtual key down event
+// and writes it directly into the system's console input buffer.
+func InjectConsoleKey(vkCode uint16, scanCode uint16, char rune) error {
+	h := syscall.Handle(os.Stdin.Fd())
+
+	var rec inputRecord
+	rec.EventType = KEY_EVENT
+
+	ke := (*keyEventRecord)(unsafe.Pointer(&rec.Event[0]))
+	ke.BKeyDown = 1 // Key Down
+	ke.RepeatCount = 1
+	ke.VirtualKeyCode = vkCode
+	ke.VirtualScanCode = scanCode
+	ke.UnicodeChar = uint16(char)
+	ke.ControlKeyState = 0
+
+	var written uint32
+
+	// Execute via your custom BoundProc architecture wrapper
+	// WARNING: We must do the uintptr casting explicitly right here inside
+	// the arguments list to comply with //go:uintptrescapes memory pinning safety bounds.
+	_, _, err := procWriteConsoleInputW.Call(
+		uintptr(h),
+		uintptr(unsafe.Pointer(&rec)),
+		uintptr(1),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	if err != nil || written != 1 {
+		return fmt.Errorf("InjectConsoleKey failed, written %d, err: %w", written, err)
+	}
+
+	return nil
 }
