@@ -41,7 +41,7 @@
   "go.vetFlags": [
         "-vettool=C:\\Users\\user\\go\\bin\\shadow.exe"
   ],
-  "go.diagnostic.displayMessages": true
+  "go.diagnostic.displayMessages": true,
   "go.useLanguageServer": true,
   "telemetry.editStats.enabled": false,
   "telemetry.feedback.enabled": false,
