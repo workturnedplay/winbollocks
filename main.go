@@ -236,13 +236,14 @@ var (
 	// procGetCursorPos    = user32.NewProc("GetCursorPos")
 	procCreatePopupMenu = wincoe.NewBoundProc(user32, "CreatePopupMenu", wincoe.CheckNull)
 	procAppendMenu      = wincoe.NewBoundProc(user32, "AppendMenuW", wincoe.CheckBool)
-	procTrackPopupMenu  = wincoe.NewBoundProc(user32, "TrackPopupMenu", wincoe.CheckBool)
-	procGetCursorPos    = wincoe.NewBoundProc(user32, "GetCursorPos", wincoe.CheckBool)
+	//"This API returns BOOL only if TPM_RETURNCMD is specified. Otherwise it returns nonzero merely because the menu was displayed.If you don't always pass TPM_RETURNCMD, CheckBool is fine. If you do always pass TPM_RETURNCMD, then returning 0 may simply mean the user dismissed the menu without choosing anything." - chatgpt 5.5
+	procTrackPopupMenu = wincoe.NewBoundProc(user32, "TrackPopupMenu", wincoe.CheckNone)
+	procGetCursorPos   = wincoe.NewBoundProc(user32, "GetCursorPos", wincoe.CheckBool)
 
 	// procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	// procSetProcessDpiAwareness        = shcore.NewProc("SetProcessDpiAwareness")
 	//doneTODO: need to impl. Find() like Call() was, maybe!
-	procSetProcessDpiAwarenessContext = wincoe.NewBoundProc(user32, "SetProcessDpiAwarenessContext", wincoe.CheckHRESULT)
+	procSetProcessDpiAwarenessContext = wincoe.NewBoundProc(user32, "SetProcessDpiAwarenessContext", wincoe.CheckBool)
 	procSetProcessDpiAwareness        = wincoe.NewBoundProc(shcore, "SetProcessDpiAwareness", wincoe.CheckErrno)
 
 	// procAttachThreadInput = user32.NewProc("AttachThreadInput")
@@ -276,7 +277,7 @@ var (
 	procGetCurrentProcess = wincoe.NewBoundProc(kernel32, "GetCurrentProcess", wincoe.CheckNone)
 	procGetCurrentThread  = wincoe.NewBoundProc(kernel32, "GetCurrentThread", wincoe.CheckHandle)
 	procSetThreadPriority = wincoe.NewBoundProc(kernel32, "SetThreadPriority", wincoe.CheckBool)
-	procGetThreadPriority = wincoe.NewBoundProc(kernel32, "GetThreadPriority", wincoe.CheckNone)
+	procGetThreadPriority = wincoe.NewBoundProc(kernel32, "GetThreadPriority", wincoe.CheckThreadPriority)
 
 	// procSetProcessInformation    = kernel32.NewProc("SetProcessInformation")
 	// procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
@@ -299,7 +300,7 @@ var (
 	// procGdiSetBkMode        = gdi32.NewProc("SetBkMode")
 	// procGdiCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	// procGdiDeleteObject     = gdi32.NewProc("DeleteObject")
-	procGdiSetTextColor     = wincoe.NewBoundProc(gdi32, "SetTextColor", wincoe.CheckNone)
+	procGdiSetTextColor     = wincoe.NewBoundProc(gdi32, "SetTextColor", wincoe.CheckGDIError)
 	procGdiSetBkMode        = wincoe.NewBoundProc(gdi32, "SetBkMode", wincoe.CheckZero)
 	procGdiCreateSolidBrush = wincoe.NewBoundProc(gdi32, "CreateSolidBrush", wincoe.CheckNull)
 	procGdiDeleteObject     = wincoe.NewBoundProc(gdi32, "DeleteObject", wincoe.CheckBool)

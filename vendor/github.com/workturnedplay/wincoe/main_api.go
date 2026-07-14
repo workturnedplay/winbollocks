@@ -540,7 +540,23 @@ var (
 	*/
 	//XXX: not collapsing it to same impl. as CheckHRESULT on purpose!
 	CheckNTSTATUS WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) < 0 }
+
+	//for GetThreadPriority which returns r1 as int,
+	CheckThreadPriority WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return int32(r1) == THREAD_PRIORITY_ERROR_RETURN // aka 0x7fffffff // aka THREAD_PRIORITY_ERROR_RETURN
+	}
+
+	CheckCLRInvalid WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return uint32(r1) == CLR_INVALID // aka 0xffffffff
+	}
+
+	CheckGDIError WinCheckFunc = func(r1 uintptr, _ error) bool {
+		return uint32(r1) == GDIError // aka 0xffffffff
+	}
 )
+
+const CLR_INVALID uint32 = 0xffffffff
+const GDIError = uint32(0xffffffff)
 
 // CheckWinResult processes a Windows API result.
 //
@@ -609,6 +625,7 @@ func CheckWinResult(
 
 // UnspecifiedWinApi is the string used when empty op name is used
 const UnspecifiedWinApi string = "unspecified_winapi"
+const THREAD_PRIORITY_ERROR_RETURN int32 = 0x7fffffff
 
 // LazyProcish is the minimal interface that WinCall needs from a LazyProc-like object.
 //
