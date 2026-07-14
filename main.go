@@ -28,7 +28,6 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
-	//"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -399,6 +398,7 @@ const (
 	MENU_RATELIMIT_MOVES              = 4
 	MENU_LOG_RATE_OF_MOVES            = 5
 	MENU_TOGGLE_ASYNC_RESIZE          = 6
+	MENU_TOGGLE_REQUIRE_WINDOWN       = 7
 
 	MF_STRING = 0x0000
 
@@ -656,6 +656,7 @@ var doLMBClick2FocusAsFallback atomic.Bool // if normal(thread attach) focus fai
 var ratelimitOnMove atomic.Bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
 var shouldLogDragRate atomic.Bool          // but only when ratelimitOnMove is true
 var asyncResize atomic.Bool
+var requireWinDownHeldDuringGesture atomic.Bool // if true, the gesture(resize or move) stops when winkey is UP
 
 /* ---------------- Utilities ---------------- */
 
@@ -2003,14 +2004,16 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			// 	logf("LMB is no longer held down, stopping drag")
 			// 	stopDrag = true
 			// }
-			var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-			if !winDown {
-				logf("winkey is no longer down, stopping drag")
-				//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
-				//stopDrag = true
-				hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
+			if requireWinDownHeldDuringGesture.Load() {
+				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+				if !winDown {
+					logf("winkey is no longer down, stopping drag")
+					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
+					//stopDrag = true
+					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
 
-				break //exit case/switch!
+					break //exit case/switch!
+				}
 			}
 			// if stopDrag {
 			// 	logf("stopping drag due to above, resetting state.")
@@ -2156,6 +2159,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 			//} //main 'if', for capturing aka moving/dragging window
 		case ModeResize:
+			if requireWinDownHeldDuringGesture.Load() {
+				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+				if !winDown {
+					logf("winkey is no longer down, stopping resize")
+					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
+					//stopDrag = true
+					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
+
+					break //exit case/switch!
+				}
+			}
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
@@ -2699,8 +2713,8 @@ func ShouldThrottle() bool {
 	return (now - last) < thresholdNanos
 }
 
-// MarkAsResized records the completion of a move/resize event.
-func MarkAsResized() {
+// MarkAsResizedNow marks it as "just started processing" — so, called early.
+func MarkAsResizedNow() {
 	lastResizeUnixNano.Store(time.Now().UnixNano())
 }
 
@@ -2716,13 +2730,15 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action
 		return
 	}
+	// Mark EARLY — we've decided to process this one
+	MarkAsResizedNow()
 
-	defer func() {
-		//lastResize = time.Now() //doneFIXME: this is racey
-		// To set the value:
-		//lastResize.Store(time.Now())
-		MarkAsResized()
-	}()
+	// defer func() {
+	// 	//lastResize = time.Now() //doneFIXME: this is racey
+	// 	// To set the value:
+	// 	//lastResize.Store(time.Now())
+	// 	MarkAsResized()
+	// }()
 
 	target := data.Hwnd
 	// if resizing {
@@ -3053,6 +3069,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 			asyncText := mustUTF16("Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)")
+			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as: if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false)
 
 			exitText := mustUTF16("Exit")
 
@@ -3099,6 +3116,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			procAppendMenu.Call(hMenu, asyncFlags, MENU_TOGGLE_ASYNC_RESIZE,
 				uintptr(unsafe.Pointer(asyncText)))
+
+			var reqWinDownFlags uintptr = MF_STRING
+			if requireWinDownHeldDuringGesture.Load() {
+				reqWinDownFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, reqWinDownFlags, MENU_TOGGLE_REQUIRE_WINDOWN,
+				uintptr(unsafe.Pointer(reqWinDownText)))
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
@@ -3154,6 +3178,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_ASYNC_RESIZE:
 				asyncResize.Store(!asyncResize.Load())
+
+			case MENU_TOGGLE_REQUIRE_WINDOWN:
+				requireWinDownHeldDuringGesture.Store(!requireWinDownHeldDuringGesture.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -3836,7 +3863,8 @@ func init() {
 
 	ratelimitOnMove.Store(false)
 	shouldLogDragRate.Store(false)
-	asyncResize.Store(false) // default to sync
+	asyncResize.Store(false)                      // default to sync
+	requireWinDownHeldDuringGesture.Store((true)) // default to true
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -4363,7 +4391,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	mainMsgHwnd = hwnd
 
 	if err := initTray(); err != nil {
-		return fmt.Errorf("Failed to init tray: %v", err)
+		return fmt.Errorf("failed to init tray: %v", err)
 	}
 
 	go hookWorker()

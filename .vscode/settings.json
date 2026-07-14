@@ -22,6 +22,7 @@
       "unsafeptr": true,
       "printf": true,
       "shadow": false // DISABLE it in gopls, we count on golangci-lint (v2) to work! else this shows only as 3 dots aka hint not warning!
+      //"ST1003": false // no effect, don't forget the comma
     },
     "analysisProgressReporting": true,
     "diagnosticsTrigger": "Edit",
@@ -35,7 +36,7 @@
   //      "-vettool=C:\\Users\\user\\go\\bin\\shadow.exe"
   //],
   "go.lintFlags": [
-    
+    //"-explain=false", "-checks=-ST1003" // had no effect!
   ],
   "go.vetOnSave": "package",
   "go.vetFlags": [
