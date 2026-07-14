@@ -462,30 +462,84 @@ func Flush() {
 
 // WinCheckFunc defines a predicate used to determine if a Windows API call failed
 // based on its primary return value (r1).
-type WinCheckFunc func(r1 uintptr) bool
+type WinCheckFunc func(r1 uintptr, callErr error) bool
 
 var (
 	// CheckBool identifies a failure for functions returning a Windows BOOL in r1.
 	// In the Windows API, a 0 (FALSE) indicates that the function failed.
-	CheckBool WinCheckFunc = func(r1 uintptr) bool { return r1 == 0 }
+	CheckBool WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
 
 	// CheckHandle identifies a failure for functions returning a HANDLE in r1.
 	// Many Windows APIs return INVALID_HANDLE_VALUE (all bits set to 1) on failure.
 	// ^uintptr(0) is the Go-idiomatic way to represent -1 as an unsigned pointer.
-	CheckHandle WinCheckFunc = func(r1 uintptr) bool { return r1 == ^uintptr(0) }
+	CheckHandle WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
 
 	// CheckNull identifies a failure for functions returning a pointer or a handle in r1
 	// where a NULL value (0) indicates the operation could not be completed.
-	CheckNull WinCheckFunc = func(r1 uintptr) bool { return r1 == 0 }
+	CheckNull WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
 
 	// CheckHRESULT identifies a failure for functions that return an HRESULT in r1.
 	// An HRESULT is a 32-bit value where a negative number (high bit set)
 	// indicates an error, while 0 or positive values indicate success.
-	CheckHRESULT WinCheckFunc = func(r1 uintptr) bool { return int32(r1) < 0 }
+	/*
+			HRESULT (COM / User-mode Win32)
+
+		HRESULT is used by COM (Component Object Model) and high-level user-mode APIs. It only allocates 1 bit for Severity:
+
+		    0 (Success): S_OK (0x00000000) or S_FALSE (0x00000001)
+
+		    1 (Failure): E_FAIL (0x80004005)
+	*/
+	CheckHRESULT WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) < 0 }
 
 	// CheckErrno identifies a failure for Win32 APIs that return a DWORD error code in r1.
 	// In this convention, 0 (ERROR_SUCCESS) means success, any non-zero value is a failure.
-	CheckErrno WinCheckFunc = func(r1 uintptr) bool { return r1 != 0 }
+	CheckErrno WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 != 0 }
+
+	// CheckAdjustTokenPrivileges handles both FALSE returns and the partial-success
+	// state where some privileges could not be assigned (ERROR_NOT_ALL_ASSIGNED).
+	CheckAdjustTokenPrivileges WinCheckFunc = func(r1 uintptr, callErr error) bool {
+		// Layer 1: If the API returned FALSE (0), the entire call failed.
+		if r1 == 0 {
+			return true
+		}
+
+		// Layer 2: The API returned TRUE, but check if it partially failed.
+		// Go's syscall/windows wrappers always return a non-nil error tracking GetLastError().
+		if callErr != nil && errors.Is(callErr, windows.ERROR_NOT_ALL_ASSIGNED) {
+			return true // Treat partial assignment as a failure state
+		}
+
+		return false
+	}
+
+	// CheckZero indicates failure if the API returns 0 (useful for counts, lengths, IDs)
+	CheckZero WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
+
+	// CheckMinusOne indicates failure if the API returns -1 (specifically for GetMessage)
+	CheckMinusOne WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
+
+	// CheckNone never fails. Used for VOID returns or LRESULTs that require manual checking.
+	CheckNone WinCheckFunc = func(_ uintptr, _ error) bool { return false }
+
+	// CheckNTSTATUS indicates failure if the NTSTATUS code is negative
+	/*
+			NTSTATUS (Kernel / Native API)
+
+		NTSTATUS is used by the NT Kernel and native APIs (found in ntdll.dll). Its top 2 bits represent Severity:
+
+		    00 (Success): STATUS_SUCCESS (0x00000000)
+
+		    01 (Informational): STATUS_PENDING (0x00000103)
+
+		    10 (Warning): STATUS_BUFFER_OVERFLOW (0x80000005)
+
+		    11 (Error): STATUS_ACCESS_DENIED (0xC0000022)
+
+		Because Warnings (10...) and Errors (11...) both have the highest bit (bit 31) set, they both evaluate as negative integers (< 0).
+	*/
+	//XXX: not collapsing it to same impl. as CheckHRESULT on purpose!
+	CheckNTSTATUS WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) < 0 }
 )
 
 // CheckWinResult processes a Windows API result.
@@ -509,7 +563,7 @@ func CheckWinResult(
 	r1 uintptr,
 	callErr error,
 ) error {
-	if !isFailure(r1) {
+	if !isFailure(r1, callErr) {
 		// Success: return nil so 'if err != nil' behaves normally.
 		return nil
 	}

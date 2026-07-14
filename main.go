@@ -164,7 +164,7 @@ var (
 	ntdll    = windows.NewLazySystemDLL("ntdll.dll")
 
 	// procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
-	procNtSetInformationProcess = wincoe.NewBoundProc(ntdll, "NtSetInformationProcess", wincoe.CheckErrno) // NTSTATUS (0 == success)
+	procNtSetInformationProcess = wincoe.NewBoundProc(ntdll, "NtSetInformationProcess", wincoe.CheckNTSTATUS) // NTSTATUS (0 == success)
 
 	// procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	// procSetWindowsHookEx    = user32.NewProc("SetWindowsHookExW")
@@ -173,13 +173,14 @@ var (
 	// procGetMessage          = user32.NewProc("GetMessageW")
 	// procTranslateMessage    = user32.NewProc("TranslateMessage")
 	// procDispatchMessage     = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage     = wincoe.NewBoundProc(user32, "PostQuitMessage", wincoe.CheckErrno) // void-ish, but safe
-	procSetWindowsHookEx    = wincoe.NewBoundProc(user32, "SetWindowsHookExW", wincoe.CheckHandle)
-	procCallNextHookEx      = wincoe.NewBoundProc(user32, "CallNextHookEx", wincoe.CheckHandle) // returns next hook result
+	procPostQuitMessage     = wincoe.NewBoundProc(user32, "PostQuitMessage", wincoe.CheckNone) // void-ish, but safe
+	procSetWindowsHookEx    = wincoe.NewBoundProc(user32, "SetWindowsHookExW", wincoe.CheckNull)
+	procCallNextHookEx      = wincoe.NewBoundProc(user32, "CallNextHookEx", wincoe.CheckNone) // returns next hook result
 	procUnhookWindowsHookEx = wincoe.NewBoundProc(user32, "UnhookWindowsHookEx", wincoe.CheckBool)
-	procGetMessage          = wincoe.NewBoundProc(user32, "GetMessageW", wincoe.CheckBool) // -1 on error, 0 on WM_QUIT
-	procTranslateMessage    = wincoe.NewBoundProc(user32, "TranslateMessage", wincoe.CheckBool)
-	procDispatchMessage     = wincoe.NewBoundProc(user32, "DispatchMessageW", wincoe.CheckErrno) // returns value from window proc
+	procGetMessage          = wincoe.NewBoundProc(user32, "GetMessageW", wincoe.CheckMinusOne) // -1 on error, 0 on WM_QUIT
+	procSendMessage         = wincoe.NewBoundProc(user32, "SendMessageW", wincoe.CheckNone)    // LRESULT
+	procTranslateMessage    = wincoe.NewBoundProc(user32, "TranslateMessage", wincoe.CheckNone)
+	procDispatchMessage     = wincoe.NewBoundProc(user32, "DispatchMessageW", wincoe.CheckNone) // returns value from window proc
 
 	// procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	// procWindowFromPoint     = user32.NewProc("WindowFromPoint")
@@ -187,11 +188,10 @@ var (
 	// procReleaseCapture      = user32.NewProc("ReleaseCapture") // Releases mouse capture if any window has it
 	// procSendMessage         = user32.NewProc("SendMessageW")
 	// procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procGetAsyncKeyState    = wincoe.NewBoundProc(user32, "GetAsyncKeyState", wincoe.CheckErrno) // returns short
-	procWindowFromPoint     = wincoe.NewBoundProc(user32, "WindowFromPoint", wincoe.CheckHandle)
-	procGetAncestor         = wincoe.NewBoundProc(user32, "GetAncestor", wincoe.CheckHandle)
+	procGetAsyncKeyState    = wincoe.NewBoundProc(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
+	procWindowFromPoint     = wincoe.NewBoundProc(user32, "WindowFromPoint", wincoe.CheckNull)
+	procGetAncestor         = wincoe.NewBoundProc(user32, "GetAncestor", wincoe.CheckNull)
 	procReleaseCapture      = wincoe.NewBoundProc(user32, "ReleaseCapture", wincoe.CheckBool) // Releases mouse capture if any window has it
-	procSendMessage         = wincoe.NewBoundProc(user32, "SendMessageW", wincoe.CheckErrno)  // LRESULT
 	procSetForegroundWindow = wincoe.NewBoundProc(user32, "SetForegroundWindow", wincoe.CheckBool)
 
 	// procShellNotifyIcon = shell32.NewProc("Shell_NotifyIconW")
@@ -200,41 +200,41 @@ var (
 	procDestroyWindow   = wincoe.NewBoundProc(user32, "DestroyWindow", wincoe.CheckBool)
 
 	//procSendMessageTimeout = user32.NewProc("SendMessageTimeoutW")
-	procSendMessageTimeout = wincoe.NewBoundProc(user32, "SendMessageTimeoutW", wincoe.CheckHandle) // or CheckErrno depending on usage
+	procSendMessageTimeout = wincoe.NewBoundProc(user32, "SendMessageTimeoutW", wincoe.CheckZero) // or CheckErrno depending on usage
 
 	// procGetWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
 	// procGetWindowPlacement       = user32.NewProc("GetWindowPlacement")
 	// procGetWindowRect            = user32.NewProc("GetWindowRect")
 	// procShowWindow               = user32.NewProc("ShowWindow")
 	// procSetWindowPos             = user32.NewProc("SetWindowPos")
-	procGetWindowThreadProcessID = wincoe.NewBoundProc(user32, "GetWindowThreadProcessId", wincoe.CheckErrno)
+	procGetWindowThreadProcessID = wincoe.NewBoundProc(user32, "GetWindowThreadProcessId", wincoe.CheckZero)
 	procGetWindowPlacement       = wincoe.NewBoundProc(user32, "GetWindowPlacement", wincoe.CheckBool)
 	procGetWindowRect            = wincoe.NewBoundProc(user32, "GetWindowRect", wincoe.CheckBool)
-	procShowWindow               = wincoe.NewBoundProc(user32, "ShowWindow", wincoe.CheckBool)
+	procShowWindow               = wincoe.NewBoundProc(user32, "ShowWindow", wincoe.CheckNone)
 	procSetWindowPos             = wincoe.NewBoundProc(user32, "SetWindowPos", wincoe.CheckBool)
 
 	// procDefWindowProc   = user32.NewProc("DefWindowProcW")
 	// procRegisterClassEx = user32.NewProc("RegisterClassExW")
 	// procCreateWindowEx  = user32.NewProc("CreateWindowExW")
-	procDefWindowProc   = wincoe.NewBoundProc(user32, "DefWindowProcW", wincoe.CheckErrno)    // LRESULT
-	procRegisterClassEx = wincoe.NewBoundProc(user32, "RegisterClassExW", wincoe.CheckHandle) // atom / 0 on fail
-	procCreateWindowEx  = wincoe.NewBoundProc(user32, "CreateWindowExW", wincoe.CheckHandle)
+	procDefWindowProc   = wincoe.NewBoundProc(user32, "DefWindowProcW", wincoe.CheckNone)   // LRESULT
+	procRegisterClassEx = wincoe.NewBoundProc(user32, "RegisterClassExW", wincoe.CheckZero) // atom / 0 on fail
+	procCreateWindowEx  = wincoe.NewBoundProc(user32, "CreateWindowExW", wincoe.CheckNull)
 
 	// procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
-	procGetModuleHandle = wincoe.NewBoundProc(kernel32, "GetModuleHandleW", wincoe.CheckHandle)
+	procGetModuleHandle = wincoe.NewBoundProc(kernel32, "GetModuleHandleW", wincoe.CheckNull)
 
 	// procSetCapture = user32.NewProc("SetCapture")
 	// procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
 	// procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
-	procSetCapture            = wincoe.NewBoundProc(user32, "SetCapture", wincoe.CheckHandle)
+	procSetCapture            = wincoe.NewBoundProc(user32, "SetCapture", wincoe.CheckNone)
 	procSetConsoleCtrlHandler = wincoe.NewBoundProc(kernel32, "SetConsoleCtrlHandler", wincoe.CheckBool)
-	procGetForegroundWindow   = wincoe.NewBoundProc(user32, "GetForegroundWindow", wincoe.CheckHandle)
+	procGetForegroundWindow   = wincoe.NewBoundProc(user32, "GetForegroundWindow", wincoe.CheckNone)
 
 	// procCreatePopupMenu = user32.NewProc("CreatePopupMenu")
 	// procAppendMenu      = user32.NewProc("AppendMenuW")
 	// procTrackPopupMenu  = user32.NewProc("TrackPopupMenu")
 	// procGetCursorPos    = user32.NewProc("GetCursorPos")
-	procCreatePopupMenu = wincoe.NewBoundProc(user32, "CreatePopupMenu", wincoe.CheckHandle)
+	procCreatePopupMenu = wincoe.NewBoundProc(user32, "CreatePopupMenu", wincoe.CheckNull)
 	procAppendMenu      = wincoe.NewBoundProc(user32, "AppendMenuW", wincoe.CheckBool)
 	procTrackPopupMenu  = wincoe.NewBoundProc(user32, "TrackPopupMenu", wincoe.CheckBool)
 	procGetCursorPos    = wincoe.NewBoundProc(user32, "GetCursorPos", wincoe.CheckBool)
@@ -242,7 +242,7 @@ var (
 	// procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	// procSetProcessDpiAwareness        = shcore.NewProc("SetProcessDpiAwareness")
 	//doneTODO: need to impl. Find() like Call() was, maybe!
-	procSetProcessDpiAwarenessContext = wincoe.NewBoundProc(user32, "SetProcessDpiAwarenessContext", wincoe.CheckBool)
+	procSetProcessDpiAwarenessContext = wincoe.NewBoundProc(user32, "SetProcessDpiAwarenessContext", wincoe.CheckHRESULT)
 	procSetProcessDpiAwareness        = wincoe.NewBoundProc(shcore, "SetProcessDpiAwareness", wincoe.CheckErrno)
 
 	// procAttachThreadInput = user32.NewProc("AttachThreadInput")
@@ -254,12 +254,12 @@ var (
 	procPostThreadMessage = wincoe.NewBoundProc(user32, "PostThreadMessageW", wincoe.CheckBool)
 
 	// procGetLastError = kernel32.NewProc("GetLastError")
-	procGetLastError = wincoe.NewBoundProc(kernel32, "GetLastError", wincoe.CheckErrno) // rarely needed directly
+	procGetLastError = wincoe.NewBoundProc(kernel32, "GetLastError", wincoe.CheckNone) // rarely needed directly
 
 	// procSendInput = user32.NewProc("SendInput")
 	// procLoadIcon  = user32.NewProc("LoadIconW")
-	procSendInput = wincoe.NewBoundProc(user32, "SendInput", wincoe.CheckErrno) // UINT (count)
-	procLoadIcon  = wincoe.NewBoundProc(user32, "LoadIconW", wincoe.CheckHandle)
+	procSendInput = wincoe.NewBoundProc(user32, "SendInput", wincoe.CheckZero) // UINT (count)
+	procLoadIcon  = wincoe.NewBoundProc(user32, "LoadIconW", wincoe.CheckNull)
 
 	// procUnregisterClassW = user32.NewProc("UnregisterClassW")
 	procUnregisterClassW = wincoe.NewBoundProc(user32, "UnregisterClassW", wincoe.CheckBool)
@@ -272,15 +272,15 @@ var (
 	// procSetThreadPriority = kernel32.NewProc("SetThreadPriority")
 	// procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
 	procSetPriorityClass  = wincoe.NewBoundProc(kernel32, "SetPriorityClass", wincoe.CheckBool)
-	procGetPriorityClass  = wincoe.NewBoundProc(kernel32, "GetPriorityClass", wincoe.CheckErrno)
-	procGetCurrentProcess = wincoe.NewBoundProc(kernel32, "GetCurrentProcess", wincoe.CheckHandle)
+	procGetPriorityClass  = wincoe.NewBoundProc(kernel32, "GetPriorityClass", wincoe.CheckZero)
+	procGetCurrentProcess = wincoe.NewBoundProc(kernel32, "GetCurrentProcess", wincoe.CheckNone)
 	procGetCurrentThread  = wincoe.NewBoundProc(kernel32, "GetCurrentThread", wincoe.CheckHandle)
 	procSetThreadPriority = wincoe.NewBoundProc(kernel32, "SetThreadPriority", wincoe.CheckBool)
-	procGetThreadPriority = wincoe.NewBoundProc(kernel32, "GetThreadPriority", wincoe.CheckErrno)
+	procGetThreadPriority = wincoe.NewBoundProc(kernel32, "GetThreadPriority", wincoe.CheckNone)
 
 	// procSetProcessInformation    = kernel32.NewProc("SetProcessInformation")
 	// procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
-	procSetProcessInformation    = wincoe.NewBoundProc(kernel32, "SetProcessInformation", wincoe.CheckErrno)
+	procSetProcessInformation    = wincoe.NewBoundProc(kernel32, "SetProcessInformation", wincoe.CheckBool)
 	procSetProcessWorkingSetSize = wincoe.NewBoundProc(kernel32, "SetProcessWorkingSetSize", wincoe.CheckBool)
 
 	// GDI / layered
@@ -290,38 +290,38 @@ var (
 	// procDrawText                   = user32.NewProc("DrawTextW")
 	// procFillRect                   = user32.NewProc("FillRect")
 	procSetLayeredWindowAttributes = wincoe.NewBoundProc(user32, "SetLayeredWindowAttributes", wincoe.CheckBool)
-	procBeginPaint                 = wincoe.NewBoundProc(user32, "BeginPaint", wincoe.CheckHandle)
+	procBeginPaint                 = wincoe.NewBoundProc(user32, "BeginPaint", wincoe.CheckNull)
 	procEndPaint                   = wincoe.NewBoundProc(user32, "EndPaint", wincoe.CheckBool)
-	procDrawText                   = wincoe.NewBoundProc(user32, "DrawTextW", wincoe.CheckErrno)
-	procFillRect                   = wincoe.NewBoundProc(user32, "FillRect", wincoe.CheckErrno)
+	procDrawText                   = wincoe.NewBoundProc(user32, "DrawTextW", wincoe.CheckZero)
+	procFillRect                   = wincoe.NewBoundProc(user32, "FillRect", wincoe.CheckZero)
 
 	// procGdiSetTextColor     = gdi32.NewProc("SetTextColor")
 	// procGdiSetBkMode        = gdi32.NewProc("SetBkMode")
 	// procGdiCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
 	// procGdiDeleteObject     = gdi32.NewProc("DeleteObject")
-	procGdiSetTextColor     = wincoe.NewBoundProc(gdi32, "SetTextColor", wincoe.CheckErrno)
-	procGdiSetBkMode        = wincoe.NewBoundProc(gdi32, "SetBkMode", wincoe.CheckErrno)
-	procGdiCreateSolidBrush = wincoe.NewBoundProc(gdi32, "CreateSolidBrush", wincoe.CheckHandle)
+	procGdiSetTextColor     = wincoe.NewBoundProc(gdi32, "SetTextColor", wincoe.CheckNone)
+	procGdiSetBkMode        = wincoe.NewBoundProc(gdi32, "SetBkMode", wincoe.CheckZero)
+	procGdiCreateSolidBrush = wincoe.NewBoundProc(gdi32, "CreateSolidBrush", wincoe.CheckNull)
 	procGdiDeleteObject     = wincoe.NewBoundProc(gdi32, "DeleteObject", wincoe.CheckBool)
 
 	// procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	// procSetCursorPos     = user32.NewProc("SetCursorPos")
-	procGetSystemMetrics = wincoe.NewBoundProc(user32, "GetSystemMetrics", wincoe.CheckErrno) // returns int, 0 on failure for most indices
+	procGetSystemMetrics = wincoe.NewBoundProc(user32, "GetSystemMetrics", wincoe.CheckNone) // returns int, 0 on failure for most indices
 	procSetCursorPos     = wincoe.NewBoundProc(user32, "SetCursorPos", wincoe.CheckBool)
 
 	// procInvalidateRect = user32.NewProc("InvalidateRect")
 	procInvalidateRect = wincoe.NewBoundProc(user32, "InvalidateRect", wincoe.CheckBool)
 
 	// GetWindowLongPtrW returns LONG_PTR (can be 0 legitimately); we treat non-zero as "success" for most usages
-	procGetWindowLongPtrW = wincoe.NewBoundProc(user32, "GetWindowLongPtrW", wincoe.CheckErrno)
-	procSetLastError      = wincoe.NewBoundProc(kernel32, "SetLastError", wincoe.CheckErrno) // void-like
+	procGetWindowLongPtrW = wincoe.NewBoundProc(user32, "GetWindowLongPtrW", wincoe.CheckNone)
+	procSetLastError      = wincoe.NewBoundProc(kernel32, "SetLastError", wincoe.CheckNone) // void-like
 	// procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
 	// procSetLastError      = kernel32.NewProc("SetLastError")
 
 	// procCreateMutex  = kernel32.NewProc("CreateMutexW")
 	// procReleaseMutex = kernel32.NewProc("ReleaseMutex")
 	// procCloseHandle  = kernel32.NewProc("CloseHandle")
-	procCreateMutex  = wincoe.NewBoundProc(kernel32, "CreateMutexW", wincoe.CheckHandle)
+	procCreateMutex  = wincoe.NewBoundProc(kernel32, "CreateMutexW", wincoe.CheckNull)
 	procReleaseMutex = wincoe.NewBoundProc(kernel32, "ReleaseMutex", wincoe.CheckBool)
 	procCloseHandle  = wincoe.NewBoundProc(kernel32, "CloseHandle", wincoe.CheckBool)
 
@@ -337,17 +337,17 @@ var (
 	procAdjustTokenPrivileges = wincoe.NewBoundProc(advapi32, "AdjustTokenPrivileges", wincoe.CheckAdjustTokenPrivileges)
 
 	// procGetClassName = user32.NewProc("GetClassNameW")
-	procGetClassName = wincoe.NewBoundProc(user32, "GetClassNameW", wincoe.CheckErrno) // returns length
+	procGetClassName = wincoe.NewBoundProc(user32, "GetClassNameW", wincoe.CheckZero) // returns length
 
 	// procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
-	procInternalGetWindowText = wincoe.NewBoundProc(user32, "InternalGetWindowText", wincoe.CheckErrno) // returns length
+	procInternalGetWindowText = wincoe.NewBoundProc(user32, "InternalGetWindowText", wincoe.CheckZero) // returns length
 
 	// procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
-	procGetConsoleWindow = wincoe.NewBoundProc(kernel32, "GetConsoleWindow", wincoe.CheckHandle)
+	procGetConsoleWindow = wincoe.NewBoundProc(kernel32, "GetConsoleWindow", wincoe.CheckNone)
 
 	// procSetWinEventHook = user32.NewProc("SetWinEventHook")
 	// procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
-	procSetWinEventHook = wincoe.NewBoundProc(user32, "SetWinEventHook", wincoe.CheckHandle)
+	procSetWinEventHook = wincoe.NewBoundProc(user32, "SetWinEventHook", wincoe.CheckNull)
 	procUnhookWinEvent  = wincoe.NewBoundProc(user32, "UnhookWinEvent", wincoe.CheckBool)
 )
 
@@ -1230,10 +1230,10 @@ func injectLMBDown() {
 func initDPIAwareness() {
 	// Try modern API first (Win10 1607+)
 	if procSetProcessDpiAwarenessContext.Find() == nil {
-		r, _, _ := procSetProcessDpiAwarenessContext.Call(
+		_, _, err := procSetProcessDpiAwarenessContext.Call(
 			DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 		)
-		if r != 0 {
+		if err != nil {
 			return // success
 		}
 	}
@@ -1253,11 +1253,14 @@ func initDPIAwareness() {
 //}
 
 func windowFromPoint(pt POINT) windows.Handle {
-	ret, _, _ := procWindowFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt)))
-	if ret == 0 {
+	ret, _, err := procWindowFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt)))
+	if err != nil || ret == 0 {
 		return 0
 	}
-	root, _, _ := procGetAncestor.Call(ret, GA_ROOT)
+	root, _, err2 := procGetAncestor.Call(ret, GA_ROOT)
+	if err2 != nil {
+		return 0 //kinda redundant because root == 0 if err2 != nil
+	}
 	return windows.Handle(root)
 }
 
@@ -1575,34 +1578,6 @@ const WM_PAINT = 0x000F
 func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_PAINT:
-		// var ps PAINTSTRUCT
-		// hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-
-		// // 1. Fill background with Magenta (Transparent Key)
-		// hBrush, _, _ := procGdiCreateSolidBrush.Call(0x00FF00FF)
-		// var rect RECT
-		// procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
-		// rect.Right -= rect.Left
-		// rect.Left = 0
-		// rect.Bottom -= rect.Top
-		// rect.Top = 0
-		// procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), hBrush)
-		// procGdiDeleteObject.Call(hBrush)
-
-		// // 2. Draw black text box background for visibility
-		// bgBrush, _, _ := procGdiCreateSolidBrush.Call(0x00000000) // Black
-		// procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), bgBrush)
-		// procGdiDeleteObject.Call(bgBrush)
-
-		// // 3. Draw Text
-		// procGdiSetTextColor.Call(hdc, 0x0000FF00) // Green text
-		// procGdiSetBkMode.Call(hdc, 1)             // TRANSPARENT background for text
-
-		// textPtr := mustUTF16(overlayText)
-		// procDrawText.Call(hdc, uintptr(unsafe.Pointer(textPtr)), ^uintptr(0), uintptr(unsafe.Pointer(&rect)), 0x24) // DT_CENTER | DT_VCENTER | DT_SINGLELINE
-
-		// procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-		// return 0
 		var ps PAINTSTRUCT
 		hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 
@@ -1915,7 +1890,7 @@ func forceForeground(target windows.Handle) bool {
 	*/
 	// Use SendMessageTimeout to see if the window is alive
 	var result uintptr
-	ret, _, _ := procSendMessageTimeout.Call(
+	ret, _, err2 := procSendMessageTimeout.Call(
 		uintptr(target),
 		WM_NULL, // WM_NULL (harmless ping)
 		0,
@@ -1925,8 +1900,8 @@ func forceForeground(target windows.Handle) bool {
 		uintptr(unsafe.Pointer(&result)),
 	)
 
-	if ret == 0 {
-		logf("Target window HWND 0x%X is HUNG. Aborting AttachThreadInput to prevent deadlock.", target)
+	if err2 != nil || ret == 0 {
+		logf("Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", err2, target)
 		return false
 	}
 
@@ -2569,13 +2544,13 @@ func createMessageWindow() (windows.Handle, error) {
 
 	procSetLastError.Call(0)
 	// Register class — check return value
-	ret, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
-	if ret == 0 {
+
+	if ret, _, err2 := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); err2 != nil || ret == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("RegisterClassEx failed: %v (error code: %w)", err, lastErr) //XXX: multiple %w is illegal and will panic.
+		return 0, fmt.Errorf("RegisterClassEx failed: %w (error code: %w)", err2, lastErr) //XXX: multiple %w is legal in Go v1.20+ (Feb 2023)
 	}
 
-	hwndRaw, _, err := procCreateWindowEx.Call(
+	hwndRaw, _, err3 := procCreateWindowEx.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		0,
@@ -2586,9 +2561,9 @@ func createMessageWindow() (windows.Handle, error) {
 		uintptr(wc.HInstance),
 		0,
 	)
-	if hwndRaw == 0 {
+	if err3 != nil || hwndRaw == 0 {
 		lastErr := windows.GetLastError()
-		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %w)", err, lastErr)
+		return 0, fmt.Errorf("CreateWindowEx failed: %v (error code: %w)", err3, lastErr)
 	}
 
 	return windows.Handle(hwndRaw), nil
@@ -2682,7 +2657,7 @@ func hookWorker() {
 	// 3. INSTALL HOOKS HERE
 	mouseCallback = windows.NewCallback(mouseProc)
 	h, _, err := procSetWindowsHookEx.Call(WH_MOUSE_LL, mouseCallback, 0, 0)
-	if h == 0 {
+	if err != nil || h == 0 {
 		exitf(1, "Got error: %v", err)
 		unreachable()
 	} else {
@@ -2701,7 +2676,7 @@ func hookWorker() {
 		0, // hMod = 0 for low-level
 		0, // dwThreadId = 0 = global
 	)
-	if hk == 0 {
+	if err != nil || hk == 0 {
 		exitf(1, "Got error: %v", err)
 		unreachable()
 	} else {
