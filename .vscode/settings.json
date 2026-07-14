@@ -27,6 +27,9 @@
     "analysisProgressReporting": true,
     "diagnosticsTrigger": "Edit",
     "ui.diagnostic.staticcheck": true
+    //"ui.diagnostic.analyses": { // no effect, don't forget the comma before this, if uncommenting this
+    //    "ST1003": false
+    //}
   },
   //"go.alternateTools": {
   //      "customLint": "go" 
