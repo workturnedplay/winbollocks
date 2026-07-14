@@ -148,10 +148,12 @@ var actualPostCounter atomic.Uint64
 
 // Globals
 var (
+	//the timestamp when the message to Move a window was queued onto the move channel
 	lastMovePostedTime       atomic.Int64 // Monotonic nanoseconds from appStartTime
 	lastPostedX, lastPostedY atomic.Int32
 )
 
+// MIN_MOVE_INTERVAL the minimum amount of time between window moves, ie. throttle anything faster than this!
 // XXX: yes this works too, here: //revive:disable:var-naming
 const MIN_MOVE_INTERVAL = 33 * time.Millisecond // ~30 fps – very pleasant
 
@@ -374,7 +376,7 @@ const (
 	WM_CLOSE = 0x0010
 )
 
-// if target window doesn't respond in 150ms we consider it hung and don't attempt to attach our input thread to it in an attempt to succeed at focusing it because it would also hang us.
+// HungWindowTimeout if target window doesn't respond in 150ms we consider it hung and don't attempt to attach our input thread to it in an attempt to succeed at focusing it because it would also hang us.
 const HungWindowTimeout = 150 // ms
 const (
 	SMTO_NORMAL      = 0x0000
