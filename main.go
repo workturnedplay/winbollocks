@@ -334,7 +334,7 @@ var (
 	procOpenProcessToken     = wincoe.NewBoundProc(advapi32, "OpenProcessToken", wincoe.CheckBool)
 	procLookupPrivilegeValue = wincoe.NewBoundProc(advapi32, "LookupPrivilegeValueW", wincoe.CheckBool)
 	// AdjustTokenPrivileges is special: returns BOOL but sets LastError even on partial success (ERROR_NOT_ALL_ASSIGNED)
-	procAdjustTokenPrivileges = wincoe.NewBoundProc(advapi32, "AdjustTokenPrivileges", wincoe.CheckBool)
+	procAdjustTokenPrivileges = wincoe.NewBoundProc(advapi32, "AdjustTokenPrivileges", wincoe.CheckAdjustTokenPrivileges)
 
 	// procGetClassName = user32.NewProc("GetClassNameW")
 	procGetClassName = wincoe.NewBoundProc(user32, "GetClassNameW", wincoe.CheckErrno) // returns length
@@ -4663,26 +4663,33 @@ func lockRAM() {
 	// 1. Enable the Privilege
 	var token uintptr
 	ret, _, err := procOpenProcessToken.Call(hProc, TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, uintptr(unsafe.Pointer(&token)))
-	if ret != 0 {
+	if err == nil || ret != 0 {
 		var luid LUID
-		lpName, _ := windows.UTF16PtrFromString(SE_INC_WORKING_SET_NAME)
-		ret, _, err = procLookupPrivilegeValue.Call(0, uintptr(unsafe.Pointer(lpName)), uintptr(unsafe.Pointer(&luid)))
+		lpName, err4 := windows.UTF16PtrFromString(SE_INC_WORKING_SET_NAME)
+		if err4 != nil {
+			logf("failed UTF16PtrFromString on %q, err='%v', continuing tho.", SE_INC_WORKING_SET_NAME, err4)
+		} else {
+			ret2, _, err2 := procLookupPrivilegeValue.Call(0, uintptr(unsafe.Pointer(lpName)), uintptr(unsafe.Pointer(&luid)))
 
-		if ret != 0 {
-			tp := TOKEN_PRIVILEGES{
-				PrivilegeCount: 1,
-				Privileges: [1]LUID_AND_ATTRIBUTES{
-					{Luid: luid, Attributes: SE_PRIVILEGE_ENABLED},
-				},
-			}
-			// AdjustTokenPrivileges returns success even if it partially fails,
-			// so we must check GetLastError (err) specifically.
-			ret, _, err = procAdjustTokenPrivileges.Call(token, 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
-			if ret == 0 || err != windows.Errno(0) {
-				logf("Warning: Could not enable SeIncrementWorkingSetPrivilege, err: '%v', continuing tho.", err)
+			if err2 == nil || ret2 != 0 {
+				tp := TOKEN_PRIVILEGES{
+					PrivilegeCount: 1,
+					Privileges: [1]LUID_AND_ATTRIBUTES{
+						{Luid: luid, Attributes: SE_PRIVILEGE_ENABLED},
+					},
+				}
+				// AdjustTokenPrivileges returns success even if it partially fails,
+				// so we must check GetLastError (err) specifically.
+				ret3, _, err3 := procAdjustTokenPrivileges.Call(token, 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
+				if err3 != nil || ret3 == 0 || !errors.Is(err3, windows.Errno(0)) {
+					logf("Warning: Could not enable SeIncrementWorkingSetPrivilege, err: '%v', ret: '%d', continuing tho.", err3, ret)
+				}
 			}
 		}
-		windows.CloseHandle(windows.Handle(token))
+		err5 := windows.CloseHandle(windows.Handle(token))
+		if err5 != nil {
+			logf("CloseHandle(token) failed, err=%v", err5)
+		}
 	}
 
 	// 2. Set the Working Set Size
@@ -4693,9 +4700,9 @@ func lockRAM() {
 	var min2 uint64 = 20 * 1024 * 1024
 	var max2 uint64 = 50 * 1024 * 1024
 
-	ret, _, err = procSetProcessWorkingSetSize.Call(hProc, uintptr(min2), uintptr(max2))
-	if ret == 0 {
-		logf("Failed SetProcessWorkingSetSize to min:%s and max:%s, err: %v", humanBytes(min2), humanBytes(max2), err)
+	ret4, _, err4 := procSetProcessWorkingSetSize.Call(hProc, uintptr(min2), uintptr(max2))
+	if ret4 == 0 {
+		logf("Failed SetProcessWorkingSetSize to min:%s and max:%s, err: %v", humanBytes(min2), humanBytes(max2), err4)
 	} else {
 		logf("Working Set locked between %s and %s", humanBytes(min2), humanBytes(max2))
 	}
