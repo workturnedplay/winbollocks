@@ -109,7 +109,6 @@ func init() {
 }
 
 /* ---------------- DLLs & Procs ---------------- */
-var procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
 
 // var shellHook windows.Handle
 var (
@@ -129,9 +128,6 @@ func init() {
 }
 
 var (
-	procSetWinEventHook = user32.NewProc("SetWinEventHook")
-	procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
-
 	winEventHook     windows.Handle
 	winEventCallback = windows.NewCallback(winEventProc)
 )
@@ -162,6 +158,12 @@ var (
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
 	shcore   = windows.NewLazySystemDLL("shcore.dll")
+	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
+	psapi    = windows.NewLazySystemDLL("psapi.dll")
+	advapi32 = windows.NewLazySystemDLL("advapi32.dll")
+	ntdll    = windows.NewLazySystemDLL("ntdll.dll")
+
+	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
 
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procSetWindowsHookEx    = user32.NewProc("SetWindowsHookExW")
@@ -230,6 +232,44 @@ var (
 
 	procSetProcessInformation    = kernel32.NewProc("SetProcessInformation")
 	procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
+
+	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
+	procBeginPaint                 = user32.NewProc("BeginPaint")
+	procEndPaint                   = user32.NewProc("EndPaint")
+	procDrawText                   = user32.NewProc("DrawTextW")
+	procFillRect                   = user32.NewProc("FillRect")
+
+	procGdiSetTextColor     = gdi32.NewProc("SetTextColor")
+	procGdiSetBkMode        = gdi32.NewProc("SetBkMode")
+	procGdiCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
+	procGdiDeleteObject     = gdi32.NewProc("DeleteObject")
+
+	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	procSetCursorPos     = user32.NewProc("SetCursorPos")
+
+	procInvalidateRect = user32.NewProc("InvalidateRect")
+
+	procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
+	procSetLastError      = kernel32.NewProc("SetLastError")
+
+	procCreateMutex  = kernel32.NewProc("CreateMutexW")
+	procReleaseMutex = kernel32.NewProc("ReleaseMutex")
+	procCloseHandle  = kernel32.NewProc("CloseHandle")
+
+	procQueryWorkingSetEx = psapi.NewProc("QueryWorkingSetEx")
+
+	procOpenProcessToken      = advapi32.NewProc("OpenProcessToken")
+	procLookupPrivilegeValue  = advapi32.NewProc("LookupPrivilegeValueW")
+	procAdjustTokenPrivileges = advapi32.NewProc("AdjustTokenPrivileges")
+
+	procGetClassName = user32.NewProc("GetClassNameW")
+
+	procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
+
+	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+
+	procSetWinEventHook = user32.NewProc("SetWinEventHook")
+	procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
 )
 
 /* ---------------- Constants ---------------- */
@@ -242,18 +282,6 @@ const (
 )
 
 var (
-	procSetLayeredWindowAttributes = user32.NewProc("SetLayeredWindowAttributes")
-	procBeginPaint                 = user32.NewProc("BeginPaint")
-	procEndPaint                   = user32.NewProc("EndPaint")
-	procDrawText                   = user32.NewProc("DrawTextW")
-	procFillRect                   = user32.NewProc("FillRect")
-
-	gdi32                   = windows.NewLazySystemDLL("gdi32.dll")
-	procGdiSetTextColor     = gdi32.NewProc("SetTextColor")
-	procGdiSetBkMode        = gdi32.NewProc("SetBkMode")
-	procGdiCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procGdiDeleteObject     = gdi32.NewProc("DeleteObject")
-
 	overlayHwnd windows.Handle
 	overlayText string
 
@@ -921,9 +949,6 @@ const (
 	MOUSEEVENTF_MOVE        = 0x0001
 )
 
-var procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
-var procSetCursorPos = user32.NewProc("SetCursorPos")
-
 const (
 	SM_XVIRTUALSCREEN  = 76
 	SM_YVIRTUALSCREEN  = 77
@@ -1551,7 +1576,7 @@ func updateOverlay(x, y, w, h int32, startW, startH int32) {
 	)
 
 	// Force redraw
-	user32.NewProc("InvalidateRect").Call(uintptr(overlayHwnd), 0, 1)
+	procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
 }
 
 const SW_HIDE = 0
@@ -1631,9 +1656,6 @@ const (
 	GWL_STYLE   = -16
 	GWL_EXSTYLE = -20
 )
-
-var procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
-var procSetLastError = kernel32.NewProc("SetLastError")
 
 func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	if hwnd == 0 {
@@ -3919,12 +3941,6 @@ func init() {
 	}
 }
 
-var (
-	procCreateMutex  = kernel32.NewProc("CreateMutexW")
-	procReleaseMutex = kernel32.NewProc("ReleaseMutex")
-	procCloseHandle  = kernel32.NewProc("CloseHandle")
-)
-
 type MutexScope int
 
 const (
@@ -4482,11 +4498,6 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	return nil // no error
 }
 
-var (
-	psapi                 = windows.NewLazySystemDLL("psapi.dll")
-	procQueryWorkingSetEx = psapi.NewProc("QueryWorkingSetEx")
-)
-
 type PSAPI_WORKING_SET_EX_BLOCK struct {
 	Flags uintptr
 }
@@ -4535,13 +4546,6 @@ func verifyMemoryIsLocked() {
 		logf("Verification: Memory at 0x%X is currently PAGED OUT. This is unexpected!", info.VirtualAddress)
 	}
 }
-
-var (
-	advapi32                  = windows.NewLazySystemDLL("advapi32.dll") // Add this!
-	procOpenProcessToken      = advapi32.NewProc("OpenProcessToken")
-	procLookupPrivilegeValue  = advapi32.NewProc("LookupPrivilegeValueW")
-	procAdjustTokenPrivileges = advapi32.NewProc("AdjustTokenPrivileges")
-)
 
 const (
 	TOKEN_ADJUST_PRIVILEGES = 0x0020
@@ -4668,11 +4672,6 @@ const CURRENT_PROCESS_PSEUDO_HANDLE = ^uintptr(0) // All bits set to 1
 // In uintptr fashion (64-bit), -2 is: 0xFFFFFFFFFFFFFFFE aka ^uintptr(1)
 const CURRENT_THREAD_PSEUDO_HANDLE uintptr = ^uintptr(1)
 
-var (
-	ntdll                       = windows.NewLazySystemDLL("ntdll.dll")
-	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
-)
-
 const (
 	//PROCESS_IO_PRIORITY uint32 = 7
 	// NTDLL ProcessInfoClass Enum
@@ -4760,7 +4759,6 @@ func setAndVerifyPriority() {
 		logf("Failed to set thread priority, err: %v", tErr)
 	} else {
 		// Verify Thread Priority
-		// procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
 		tprio, _, err2 := procGetThreadPriority.Call(currThread)
 
 		// GetThreadPriority returns an int. 15 is TIME_CRITICAL.
@@ -4836,50 +4834,6 @@ func drainMoveChannel() {
 		}
 	}
 }
-
-// var (
-// 	// ... your existing procs ...
-// 	procGetWindowText       = user32.NewProc("GetWindowTextW")
-// 	procGetWindowTextLength = user32.NewProc("GetWindowTextLengthW")
-
-// 	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
-// 	procProcess32First           = kernel32.NewProc("Process32FirstW")
-// 	procProcess32Next            = kernel32.NewProc("Process32NextW")
-// )
-
-// func getWindowText(hwnd windows.Handle) string {
-// 	ret, _, _ := procGetWindowTextLength.Call(uintptr(hwnd))
-// 	if ret == 0 {
-// 		return ""
-// 	}
-// 	buf := make([]uint16, ret+1)
-// 	procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), ret+1) //so this sends a message and blocks until receives reply, apparently.
-// 	return windows.UTF16ToString(buf)
-// }
-
-// const TH32CS_SNAPPROCESS = 0x00000002
-
-// func getProcessName(pid uint32) string {
-// 	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(TH32CS_SNAPPROCESS, 0)
-// 	if snapshot == uintptr(windows.InvalidHandle) {
-// 		return "unknown"
-// 	}
-// 	defer windows.CloseHandle(windows.Handle(snapshot))
-
-// 	var entry windows.ProcessEntry32
-// 	entry.Size = uint32(unsafe.Sizeof(entry))
-
-// 	ret, _, _ := procProcess32First.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
-// 	for ret != 0 {
-// 		if entry.ProcessID == pid {
-// 			return windows.UTF16ToString(entry.ExeFile[:])
-// 		}
-// 		ret, _, _ = procProcess32Next.Call(snapshot, uintptr(unsafe.Pointer(&entry)))
-// 	}
-// 	return "not found"
-// }
-
-var procGetClassName = user32.NewProc("GetClassNameW")
 
 func getClassName(hwnd windows.Handle) string {
 	buf := make([]uint16, 256)
@@ -5094,9 +5048,6 @@ func getProcessNameFast(pid uint32) string {
 	fullPath := windows.UTF16ToString(buf[:size])
 	return filepath.Base(fullPath)
 }
-
-// Add this proc
-var procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
 
 // InternalGetWindowText is a "non-blocking" call. It reads from the Desktop Heap (kernel memory) rather than sending a WM_GETTEXT message.
 // This prevents your program from freezing when Regedit is too busy to respond to messages.
