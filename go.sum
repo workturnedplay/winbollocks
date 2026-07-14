@@ -1,5 +1,5 @@
-github.com/workturnedplay/wincoe v0.0.35 h1:ipvL4dfuFEGHLnrS2VUKt9hiiqOIdOhgeWXCdHh/0Zc=
-github.com/workturnedplay/wincoe v0.0.35/go.mod h1:xKAsLN9CjCr8X6dliv4oVUZuS9omWh4afgUokzRD7sY=
+github.com/workturnedplay/wincoe v0.0.36 h1:7i6L1q9THiR9PHgr1IP4ShljkTfel8F4FoNZEBSGO7I=
+github.com/workturnedplay/wincoe v0.0.36/go.mod h1:xKAsLN9CjCr8X6dliv4oVUZuS9omWh4afgUokzRD7sY=
 golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
 golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 golang.org/x/term v0.45.0 h1:NwWyBmoJCbfTHpxrWoZ9C6/VxOf7ic219I8xZZFdrf0=

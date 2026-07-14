@@ -567,6 +567,7 @@ type LazyProcish interface {
 	// Call invokes the Windows procedure with the given arguments.
 	// Signature must match windows.LazyProc.Call exactly.
 	Call(a ...uintptr) (r1, r2 uintptr, lastErr error)
+	Find() error
 }
 
 // realLazyProc wraps *windows.LazyProc to satisfy LazyProcish.
@@ -659,6 +660,12 @@ type BoundProc struct {
 //go:uintptrescapes
 func (b *BoundProc) Call(args ...uintptr) (uintptr, uintptr, error) {
 	return WinCall(b.Proc, b.Check, args...)
+}
+
+// Find attempts to locate the procedure in the DLL.
+// Returns nil if the procedure is successfully found, or an error if it is not.
+func (b *BoundProc) Find() error {
+	return b.Proc.Find()
 }
 
 // NewBoundProc initializes a BoundProc by resolving a procedure from the
