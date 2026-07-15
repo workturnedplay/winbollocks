@@ -1510,8 +1510,6 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 }
 
 func startDrag(hwnd windows.Handle, pt POINT) bool {
-	//logf("startDrag")
-
 	pid := getWindowPID(hwnd)
 	targetIL, e1 := processIntegrityLevel(pid)
 
@@ -4218,20 +4216,27 @@ func releaseSingleInstance() {
 	if mutexHandle != 0 {
 		//defer is tied to the function, not to inner scopes, so it happens only when this func. exits!
 		//defers do run when a panic happens
-		defer func() { mutexHandle = 0 }()
+		defer func() { mutexHandle = 0 }() //executes third
+
+		defer func() { //executes second
+			//If procReleaseMutex.Call somehow panics (unlikely, but possible with corrupted memory), this is in a defer
+
+			// Close handle so other instances can acquire
+			//procCloseHandle.Call(mutexHandle)
+			res2 := procCloseHandle.Call(mutexHandle)
+			// if r2 == 0 {
+			if res2.Failed() {
+				logf("CloseHandle failed: %v", res2.Err)
+			}
+		}()
+
+		//executes first
 		// Release ownership if we own it
 		//procReleaseMutex.Call(mutexHandle)
 		res1 := procReleaseMutex.Call(mutexHandle)
 		// if r1 == 0 {
 		if res1.Failed() {
 			logf("ReleaseMutex failed: %v", res1.Err)
-		}
-		// Close handle so other instances can acquire
-		//procCloseHandle.Call(mutexHandle)
-		res2 := procCloseHandle.Call(mutexHandle)
-		// if r2 == 0 {
-		if res2.Failed() {
-			logf("CloseHandle failed: %v", res2.Err)
 		}
 	}
 }
@@ -5259,7 +5264,6 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	}
 
 	if shouldLogFocusChanges {
-		//procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
 
 		// Get the top-level owner of this HWND to see if it belongs to CMD
 		// GA_ROOT (2) gets the "real" parent window
@@ -5270,8 +5274,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		}
 		rootHwnd := res1.R1
 
-		title := getWindowTextFast(windows.Handle(rootHwnd)) //getWindowText(windows.Handle(rootHwnd))
-		procName := getProcessNameFast(pid)                  //getProcessName(pid)
+		title := getWindowTextFast(windows.Handle(rootHwnd))
+		procName := getProcessNameFast(pid)
 		class := getClassName(hwnd)
 
 		logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
