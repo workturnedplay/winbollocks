@@ -1731,7 +1731,7 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 	ox := x + (w / 2) - 150
 	oy := y + (h / 2) - 25
 
-	procSetWindowPos.Call( //TODO: handle errors/returns here
+	res1 := procSetWindowPos.Call( //TODO: handle errors/returns here
 		uintptr(overlayHwnd),
 		HWND_TOPMOST,
 		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
@@ -1741,9 +1741,15 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 		300, 50,
 		SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
 	)
+	if res1.Failed() {
+		logf("in updateOverlay, failed to SetWindowPos of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res1.Err, res1.CallStatus)
+	}
 
 	// Force redraw
-	procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
+	res2 := procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
+	if res2.Failed() {
+		logf("in updateOverlay, failed to InvalidateRect of overlayHwnd:0x%X to cause a repaint, err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
+	}
 }
 
 const SW_HIDE = 0
