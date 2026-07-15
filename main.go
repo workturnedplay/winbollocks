@@ -1646,8 +1646,7 @@ func initOverlay() error {
 const WM_PAINT = 0x000F
 
 func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*aka LRESULT*/ {
-	switch msg {
-	case WM_PAINT:
+	if msg == WM_PAINT {
 		var ps PAINTSTRUCT
 		res1 := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		if res1.Failed() {
@@ -1705,7 +1704,8 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 			return 0 //handled; keep this dup line, in case I insert something between this and the last return in the block, and i forget to put one return here
 		}
 		return 0 //handled
-	}
+	} //if WM_PAINT
+
 	res8 := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam) //DefWindowProcW returns LRESULT.
 	if res8.Failed() {
 		logf("in overlayWndProc, DefWindowProc() failed, err: %v, continuing", res8.Err)
@@ -1844,7 +1844,7 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	// Clear last error so we can detect real failure
 	//windows.SetLastError(0)
 	// Clear last error so we can detect real failure
-	procSetLastError.Call(0)
+	_ = procSetLastError.Call(0)
 	//windows.SetLastError(0)
 
 	res1 := procGetWindowLongPtrW.Call(
@@ -2408,13 +2408,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			break // No drag or resize is active, do nothing!
 		}
 		if session.mode == ModeMove {
-
-			//		if capturing.Load() && currentDrag != nil {
-			//logf("was manual-capturing, now resetting state and releasing mouse capture")
-			// capturing = false
-			// currentDrag = nil
-			// targetWnd = 0
-			// procReleaseCapture.Call()
 			softReset(true) // this means that when winkey goes UP it will make sure from keyboardProc that start menu doesn't pop up!
 
 			//return 0 //0 is to let it thru (1 was to swallow)
@@ -2423,9 +2416,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
 			return 1 //eat it
 		} // else let it pass
-		// if capturing.Load() || currentDrag != nil {
-		// 	panic("race detected2, or at best improper cleanup")
-		// }
 
 	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
 		session := activeSession.Load()
@@ -2441,9 +2431,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 			return 1 // Swallow
 		}
-		// if resizing.Load() || currentDrag != nil {
-		// 	panic("race detected1, or at best improper cleanup")
-		// }
 
 	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
 		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -2478,7 +2465,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// Same window case
 					logf("Resetting resize coordinates for same window HWND=0x%X to prevent cursor snap-back", session.targetWnd)
 
-					// FIXME FIXED: Instead of allowing a snap-move from stale coordinates,
+					// doneFIXME FIXED: Instead of allowing a snap-move from stale coordinates,
 					// we softReset(true) so the logic falls through (or restarts) using
 					// the current cursor position as the brand new origin.
 					softReset(true)
@@ -3702,6 +3689,7 @@ func initLogFile() {
 	if logFile != nil {
 		return
 	}
+	// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
 	f, err := os.OpenFile(
 		"winbollocks_debug.log",
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
