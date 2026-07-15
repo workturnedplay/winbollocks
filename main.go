@@ -3141,7 +3141,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			startH := session.state.startRect.Bottom - session.state.startRect.Top
 			updateOverlay(nx, ny, nw, nh, startW, startH)
 		} else {
-			logf("did a resize but the overlay wasn't shown due to gesture wasn't in effect anymore (thus overlay wouldn't have been cleaned up)")
+			logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
 	} else {
 		//here for ModeMove, async resize
