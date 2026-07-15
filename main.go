@@ -516,13 +516,15 @@ const (
 	WM_DO_RELEASE_CAPTURE = WM_USER + 215
 )
 const (
-	MENU_EXIT                         = 1
-	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK = 2
-	MENU_ACTIVATE_MOVE                = 3
-	MENU_RATELIMIT_MOVES              = 4
-	MENU_LOG_RATE_OF_MOVES            = 5
-	MENU_TOGGLE_ASYNC_RESIZE          = 6
-	MENU_TOGGLE_REQUIRE_WINDOWN       = 7
+	MENU_EXIT                             = 1
+	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK     = 2
+	MENU_ACTIVATE_MOVE                    = 3
+	MENU_RATELIMIT_MOVES                  = 4
+	MENU_LOG_RATE_OF_MOVES                = 5
+	MENU_TOGGLE_ASYNC_RESIZE              = 6
+	MENU_TOGGLE_REQUIRE_WINDOWN           = 7
+	MENU_TOGGLE_COALESCE_EVENTS           = 8
+	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT = 9
 
 	MF_STRING = 0x0000
 
@@ -781,6 +783,8 @@ var ratelimitOnMove atomic.Bool            // use less CPU (see CPU time in task
 var shouldLogDragRate atomic.Bool          // but only when ratelimitOnMove is true
 var asyncResize atomic.Bool
 var requireWinDownHeldDuringGesture atomic.Bool // if true, the gesture(resize or move) stops when winkey is UP
+var coalesceMoveResizeEvents atomic.Bool
+var immediateOverlayRepaint atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -1745,12 +1749,52 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 		logf("in updateOverlay, failed to SetWindowPos of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res1.Err, res1.CallStatus)
 	}
 
-	// Force redraw
+	// Force redraw, well the redraw is queued, whenever Windows gets around to it.
 	res2 := procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
 	if res2.Failed() {
-		logf("in updateOverlay, failed to InvalidateRect of overlayHwnd:0x%X to cause a repaint, err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
+		logf("in updateOverlay, failed to InvalidateRect of overlayHwnd:0x%X (meant to eventually cause a repaint), err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
+	}
+	/*
+		(press alt+z to temporarily toggle wordwrap to read this)
+
+		if I drag-resize tcmd window at a certain rate, the paint for both tcmd window and for the overlay are stopped/frozen to their last painted, but the size of the tcmd window does keep responding in real-time, unclear why/how this happens!?
+		Gemini 3.1 Pro says:
+			You are experiencing Message Queue Starvation, specifically regarding the WM_PAINT message, combined with how the modern Windows Desktop Window Manager (DWM) handles window frames versus window contents.
+
+		Here is exactly why the sizing works in real-time, but the painting freezes.
+		1. The DWM vs. Client Area Disconnect
+
+		When you call SetWindowPos, the OS does two things:
+
+		    The Frame: The Desktop Window Manager (DWM) immediately updates the window's physical boundaries on the GPU. This is handled by Windows itself, which is why the window size keeps changing smoothly in real-time.
+
+		    The Contents: The OS sends WM_WINDOWPOSCHANGED and WM_SIZE messages to the target application (Total Commander) so it can recalculate its internal layout. Once the app finishes that, it is supposed to redraw its contents (the "client area").
+
+		2. WM_PAINT is the Lowest Priority Message in Windows
+
+		Windows is fundamentally message-driven. By design, WM_PAINT is always pushed to the back of the line. Windows will only synthesize and dispatch a WM_PAINT message when the application's message queue is completely empty of higher-priority messages (like mouse movements, keyboard input, or sizing commands).
+
+		Because your WH_MOUSE_LL hook is capturing mouse movements and bombarding the message queue with SetWindowPos calls every 10 milliseconds (100 times a second!), Total Commander's UI thread is choking. It is constantly processing your resize commands and never gets an "idle" moment to actually process the WM_PAINT message to redraw its files and panels.
+		3. Why Your Overlay Also Freezes
+
+		Your overlay suffers from the exact same starvation, and the smoking gun is in your updateOverlay function:
+		Go
+
+		// Force redraw
+		res2 := procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
+
+		InvalidateRect does not draw anything. It simply tells Windows: "Hey, mark this area as dirty. Next time you have absolutely nothing else to do and the queue is empty, please send me a WM_PAINT." Because your main thread is busy aggressively draining the moveDataChan and calling SetWindowPos for the target window, the queue is never empty. Your overlay's WM_PAINT is starved until you stop dragging the mouse.
+	*/
+	//doneTODO: do I want this to happen unconditionally? or should it be in a systray bool like others?!
+	if immediateOverlayRepaint.Load() {
+		res3 := procUpdateWindow.Call(uintptr(overlayHwnd)) // <--- Forces immediate synchronous repaint
+		if res3.Failed() {
+			logf("in updateOverlay, failed to UpdateWindow aka repaint of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res3.Err, res3.CallStatus)
+		}
 	}
 }
+
+var procUpdateWindow = wincoe.NewBoundProc(user32, "UpdateWindow", wincoe.CheckBool)
 
 const SW_HIDE = 0
 
@@ -2916,7 +2960,7 @@ const forceMoveOrResizeActionsToBeThisManyMSApart = 16 // 16ms is 60fps, 10ms is
 
 const WS_THICKFRAME = 0x00040000 // or WS_SIZEBOX which has same value (as per chatgpt 5.5)
 
-func handleActualMoveOrResize(data WindowMoveData) {
+func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	//Top of handleActualMoveOrResize, before the rate-limit check (capture should be set even if we throttle the actual SetWindowPos):
 	// Lazy once-per-session SetCapture.
 	// We are guaranteed to be on the main thread here (wndProc context).
@@ -2933,10 +2977,10 @@ func handleActualMoveOrResize(data WindowMoveData) {
 
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
 	// Most monitors are 60Hz-144Hz. Anything faster than 10ms is wasted CPU.
-	//if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
-	if ShouldThrottle() {
-		//logf("ignored move/resize")
-		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action
+	// If bypassed (e.g. from a coalesced batch), we MUST apply it so we don't drop the final state.
+	if !bypassThrottle && ShouldThrottle() {
+		// dropped because of execution speed limit
+		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action, maybe we need a diff. counter for each kind of dropped type/reason?
 		return
 	}
 	// Mark EARLY — we've decided to process this one
@@ -3213,9 +3257,12 @@ func UnpackLParam(lParam uintptr) (x, y int32) {
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_DO_SETWINDOWPOS:
-		//drainMoveChannel() // Pull everything from the channel, sequentially
-		drainMoveChannelCoalesced() // ← new coalescing version
-		return 0                    // Handled
+		if coalesceMoveResizeEvents.Load() {
+			drainMoveChannelCoalesced() // ← new coalescing version
+		} else {
+			drainMoveChannel() // Pull everything from the channel, sequentially
+		}
+		return 0 // Handled
 
 	case WM_HIDE_OVERLAY:
 		hideOverlay()
@@ -3339,6 +3386,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 			asyncText := mustUTF16("Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)")
 			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as: if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false)
+			coalesceEventsText := mustUTF16("Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps")
+			immediateOverlayRepaintText := mustUTF16("Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints")
 
 			exitText := mustUTF16("Exit")
 
@@ -3399,6 +3448,20 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			procAppendMenu.Call(hMenu, reqWinDownFlags, MENU_TOGGLE_REQUIRE_WINDOWN,
 				uintptr(unsafe.Pointer(reqWinDownText)))
+
+			var coalesceEventsFlags uintptr = MF_STRING
+			if coalesceMoveResizeEvents.Load() {
+				coalesceEventsFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, coalesceEventsFlags, MENU_TOGGLE_COALESCE_EVENTS,
+				uintptr(unsafe.Pointer(coalesceEventsText)))
+
+			var immediateOverlayRepaintFlags uintptr = MF_STRING
+			if immediateOverlayRepaint.Load() {
+				immediateOverlayRepaintFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, immediateOverlayRepaintFlags, MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT,
+				uintptr(unsafe.Pointer(immediateOverlayRepaintText)))
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
@@ -3466,6 +3529,12 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_REQUIRE_WINDOWN:
 				requireWinDownHeldDuringGesture.Store(!requireWinDownHeldDuringGesture.Load())
+
+			case MENU_TOGGLE_COALESCE_EVENTS:
+				coalesceMoveResizeEvents.Store(!coalesceMoveResizeEvents.Load())
+
+			case MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT:
+				immediateOverlayRepaint.Store(!immediateOverlayRepaint.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -4214,6 +4283,8 @@ func init() {
 	shouldLogDragRate.Store(false)
 	asyncResize.Store(false)                      // default to sync
 	requireWinDownHeldDuringGesture.Store((true)) // default to true
+	coalesceMoveResizeEvents.Store(true)          //default to true
+	immediateOverlayRepaint.Store(false)          // default to false
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -5225,14 +5296,15 @@ func drainMoveChannel() {
 		case data := <-moveDataChan:
 			// Use the data (the struct copy) to move the window.
 			// No heap pointers, no garbage collector stress!
-			handleActualMoveOrResize(data) // Move the window
+			// Keep the throttle active here because this loop processes every single event sequentially
+			handleActualMoveOrResize(data, false) // Move the window
 		default:
 			return // Channel empty, go back to GetMessage
 		}
 	}
 }
 
-// // drainMoveChannelCoalesced1 implements latest-wins per window.
+// // drainMoveChannelCoalesced1 implements latest-wins per window, loses any order (ie. for different windows/hwnd, it won't know which to do first)
 // // Replaces the old sequential drain.
 // func drainMoveChannelCoalesced1() {
 // 	latest := make(map[windows.Handle]WindowMoveData, 8) // small initial capacity; grows rarely
@@ -5300,16 +5372,19 @@ applyBatch:
 			continue
 		}
 
-		// IMPORTANT: Throttle handling for multi-window batches
-		// The global throttle (ShouldThrottle) is intentionally kept
-		// to protect the mouse hook from overload. However, in a coalesced
-		// batch we still want to apply the *latest* state even if some
-		// earlier windows in the batch triggered the throttle.
-		if ShouldThrottle() {
-			logf("Throttle active during coalesced batch for hwnd=0x%X (FIXME: must still be applying latest state)", hwnd)
-		}
+		// // IMPORTANT: Throttle handling for multi-window batches
+		// // The global throttle (ShouldThrottle) is intentionally kept
+		// // to protect the mouse hook from overload. However, in a coalesced
+		// // batch we still want to apply the *latest* state even if some
+		// // earlier windows in the batch triggered the throttle.
+		// if ShouldThrottle() {
+		// 	logf("Throttle active during coalesced batch for hwnd=0x%X (FIXME: must still be applying latest state)", hwnd)
+		// }
 
-		handleActualMoveOrResize(data)
+		// We bypass the execution throttle here. Coalescing guarantees we only
+		// apply once per window per batch, and we absolutely MUST NOT drop
+		// the user's final intended window coordinates.
+		handleActualMoveOrResize(data, true)
 	}
 }
 
