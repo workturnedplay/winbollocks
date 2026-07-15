@@ -2704,13 +2704,56 @@ var (
 var hookPanicPayload atomic.Value // We use atomic for thread-safety
 var mainAcknowledgedShutdown = make(chan struct{})
 
+// hookWorkerDone is closed by hookWorker's own teardown closure once it
+// reaches a genuine no-panic exit (WM_QUIT received normally, no recover()
+// payload at all). primary_defer() waits on this — after wincoe.WaitAnyKey()
+// — so hookWorker's OS thread has actually finished (both hooks unhooked,
+// goroutine returned) before logs get flushed and the process exits.
+// Mirrors the existing logWorkerDone/closeAndFlushLog() pattern.
+var hookWorkerDone = make(chan struct{})
+
+// hookWorkerSecondaryDefer is hookWorker's analogue of secondary_defer(): a
+// last-resort safety net that only does anything if hookWorker's own
+// cross-thread-panic-bridge closure (deferred after this one, so it runs
+// first — LIFO) panics again while handling the original panic.
+//
+// Unlike secondary_defer(), reaching this with recover() == nil is NOT a
+// bug here — it's the ordinary path once the panic-bridge closure's
+// clean-exit branch (see hookWorker's tail code) runs and returns normally
+// so this goroutine's OS thread can actually finish. Nothing to do then.
+//
+// Deliberately uses directLoggerf/os.Exit instead of logf/closeAndFlushLog:
+// this runs on a different goroutine than main's own shutdown sequence
+// (primary_defer/secondary_defer), so calling closeAndFlushLog() here could
+// race a concurrent close(logChan) there — closing an already-closed
+// channel panics. directLoggerf writes synchronously and bypasses logChan
+// entirely, so it's always safe to call from here no matter what main is
+// doing concurrently.
+//
+// XXX: this is a 3rd os.Exit call site, breaking the existing "oughtta be
+// the only os.Exit, 1of2/2of2" comments in primary_defer()/secondary_defer().
+// It's a deliberate, narrow exception: a panic inside the panic-bridge
+// closure itself means we can no longer trust any cross-thread signaling to
+// reach main reliably, so a direct exit here is the safer choice. Worth
+// renumbering those comments to 1of3/2of3/3of3 if you're OK with this.
+func hookWorkerSecondaryDefer() {
+	if r2 := recover(); r2 != nil {
+		directLoggerf("!hookWorker secondary defer here! [CRITICAL ERROR IN hookWorker's panic-bridge defer]: '%v'\n%s\n----snip----", r2, debug.Stack())
+		directLoggerf("!hookWorker secondary defer here! forcing process exit with code 120 (hookWorker's own exit code was: '%d')", currentExitCode.Load())
+		closeAndFlushLog() // still flush the old ones tho.
+		os.Exit(120)       // XXX: oughtta be the only os.Exit! well 3of3
+	}
+	// recover() == nil: expected — see doc comment above.
+}
+
 func hookWorker() {
 	// 1. Lock this goroutine to a single, dedicated OS thread. Crucial!
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	// Run this last to catch any secondary panics
-	defer secondary_defer() //this runs second but only if first doesn't os.exit ie. it fails/panics!
+	//defer secondary_defer() //this runs second but only if first doesn't os.exit ie. it fails/panics! replaced by hookWorkerSecondaryDefer below
+	defer hookWorkerSecondaryDefer() // safety net: only force-exits on a genuine secondary panic inside the closure below; a normal return there (clean-exit path) is expected and a no-op here.
 	//defer primary_defer() //this runs first, can't run this here due to needing to be on same thread as main to deinit other things!
 	// defer time.Sleep(2 * time.Second)
 	// defer procPostQuitMessage.Call(0) //FIXME: no effect even with 2 sec delay after it!
@@ -2765,11 +2808,23 @@ func hookWorker() {
 				//logf("Main thread UNRESPONSIVE after 2s. Emergency exit.")
 				logf("hookWorker done waiting for main to die, proceeding to secondary_defer which exits...")
 				// Main is frozen. If we don't exit now, the app hangs forever.
-				//we let it continue which means it calls secondary_defer() next!
+				//we let it continue/fallthru2below which means it calls secondary_defer() next!
 			}
+			// Panic path, main unresponsive: block forever, unchanged from
+			// before this change. hookWorkerDone is intentionally NOT closed
+			// here — primary_defer()'s wait on it will simply time out,
+			// which is the correct, already-bounded fallback for this case.
+			logf("hookWorker clean exit (but not quitting thread)")
+			select {} //infinite wait, or else secondary_defer() will trigger, doneFIXME: find a better way to not os.Exit and still exit this thread. like tell secondary_defer to not os.Exit via a global bool?!
 		} //if recover
-		logf("hookWorker clean exit (but not quitting thread)")
-		select {} //infinite wait, or else secondary_defer() will trigger, FIXME: find a better way to not os.Exit and still exit this thread. like tell secondary_defer to not os.Exit via a global bool?!
+
+		// True clean, no-panic exit: the message loop above returned because
+		// it received WM_QUIT (posted by deinit() on the main thread), with
+		// no panic anywhere. Signal main, then let this goroutine — and its
+		// locked OS thread — actually finish, instead of parking in select{}
+		// forever like the panic paths above.
+		logf("hookWorker clean exit, signaling main and finishing thread")
+		close(hookWorkerDone)
 	}() // defer
 
 	// 2. Save the OS Thread ID so our main thread can talk to it later
@@ -2820,6 +2875,7 @@ func hookWorker() {
 	// 4. The Thread's Private Message Loop
 	var msg MSG
 	for {
+		exitf(1, "temp. manual panic")
 		res3 := procGetMessage.Call( // GetMessage here calls the hook(s)
 			uintptr(unsafe.Pointer(&msg)),
 			0, 0, 0,
@@ -4490,7 +4546,7 @@ func secondary_defer() {
 	}
 	logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode.Load(), exitcode)
 	closeAndFlushLog()
-	os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of2
+	os.Exit(exitcode) // XXX: oughtta be the only os.Exit! well 2of3
 }
 
 // a placeholder for graceful exit
@@ -4544,10 +4600,27 @@ func primary_defer() { //primary defer
 		logf("Didn't wait for keypress due to not an interactive/terminal.")
 	}
 
+	// Wait for hookWorker's own clean-exit signal before flushing logs and
+	// exiting. deinit() already asked hookThreadID to WM_QUIT; this waits
+	// for that thread to actually get there, run its UnhookWindowsHookEx
+	// defers, and finish, so we don't tear down logging out from under it.
+	// Skipped if hookWorker was never started. Bounded by a timeout since a
+	// panicking hook thread never closes this channel (see its panic path
+	// above) — that's an already-handled, expected case, not a bug.
+	if hookThreadID != 0 {
+		const hookWorkerExitTimeout = 2 * time.Second
+		select {
+		case <-hookWorkerDone:
+			logf("main here, hookWorker signaled clean exit; proceeding.")
+		case <-time.After(hookWorkerExitTimeout):
+			logf("main here, timed out waiting for hookWorker's clean-exit signal (%v); proceeding anyway.", hookWorkerExitTimeout)
+		}
+	}
+
 	//XXX: these should be last:
 	closeAndFlushLog()
 	// 3. exit
-	os.Exit(int(currentExitCode.Load())) // XXX: oughtta be the only os.Exit! well 1of2
+	os.Exit(int(currentExitCode.Load())) // XXX: oughtta be the only os.Exit! well 1of3
 }
 
 func main() {
