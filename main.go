@@ -1468,6 +1468,8 @@ func cleanupTray() {
 }
 
 func showTrayInfo(title, msg string) {
+	//FIXME: this call should be rate-limited, or the callers of it should be.
+
 	logf("systray info: %s", msg)
 	//the tray notification shows differently than a tooltip on win11 (didn't test it on anything else tho)
 	//and I think you've to turn it on like(this only if you have Do Not Disturn 'on' already) System->Notifications->Set priority notifications, Add Apps(button) and pick winbollocks.exe
@@ -2095,8 +2097,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
 			}
 
-			//var start bool = true // do we start the drag on the window under mouse?
-
 			wantTargetWnd := windowFromPoint(info.Pt)
 			if wantTargetWnd == 0 {
 				logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)")
@@ -2105,7 +2105,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 			session := activeSession.Load()
 			if session != nil && session.mode == ModeMove {
-				//if capturing.Load() {
 				//XXX: happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
 				// if you now start to hold winkey(it will drag if you move mouse) and then press(or hold) LMB (you're here) and
 				// move mouse while LMB is held it continues to drag/move that same window.
@@ -2115,7 +2114,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				// This means it joins them together while building your binary, so there is zero performance penalty at runtime.
 
 				if session.targetWnd == 0 {
-					//start = false
 					panic("impossible state(while single-threaded win32 app in 20feb2026), logic error: you were drag-moving " +
 						"but targetWnd wasn't set to anything(ie. it's 0) but shoulda been set to prev. window!")
 				} else { // non zero targetWnd
@@ -2141,12 +2139,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 						logf("drag-moving new window HWND=0x%X instead of the old one HWND=0x%X", wantTargetWnd, session.targetWnd)
 						softReset(true)
-						//start = true
 					}
 				}
-				//start = true
-				// } else {
-				// 	start = true
 			} // was ModeMove
 
 			//session.targetWnd = wantTargetWnd // never 0 if we're here!
@@ -2155,7 +2149,6 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				logf("Warning: Ignoring new gesture because %v mode is already running on HWND=0x%X", session.mode, session.targetWnd)
 				return 1 // Swallow the click so it doesn't pass through to the OS
 			}
-			//if start {
 			//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
 			if startDrag(wantTargetWnd, info.Pt) {
 				session := activeSession.Load()
@@ -2174,7 +2167,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					)
 				}
 			}
-			//}
+
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter8 %d ns", nowDiff.Nanoseconds())
 			}
@@ -2189,32 +2182,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		}
 		switch session.mode {
 		case ModeMove:
-			//if capturing.Load() && currentDrag != nil {
-			//var stopDrag bool = false
-			// //FIXME: LMB is swallowed during our gesture move, even tho it would be down physically! so can't use async state! and in case of Winkey+L the LMB UP event is never seen by us, thus we don't know if LMB is UP physically when session is unlocked!
-			// var isLMBstillDown bool = keyDown(VK_LBUTTON)
-			// if !isLMBstillDown {
-			// 	logf("LMB is no longer held down, stopping drag")
-			// 	stopDrag = true
-			// }
 			if requireWinDownHeldDuringGesture.Load() {
 				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 				if !winDown {
 					logf("winkey is no longer down, stopping drag")
 					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
-					//stopDrag = true
 					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
 
 					break //exit case/switch!
 				}
 			}
-			// if stopDrag {
-			// 	logf("stopping drag due to above, resetting state.")
-			// 	hardReset()//resets gesture used which means doesn't prevent a winUP from popping start menu
-			// 	break
-			// }
 
-			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
 				// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
 				var now time.Time
@@ -3145,7 +3123,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			// 	logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
 	} else {
-		//here for ModeMove, async resize
+		//here for ModeMove OR async resize
 		//XXX: unfixable bug here with async resize, it will move the window even tho the window resisted resizing, during resize only!
 		// FALLBACK: Normal single-pass execution for asynchronous mode or simple moves
 		res4 := procSetWindowPos.Call(
@@ -5247,9 +5225,9 @@ func drainMoveChannel() {
 	}
 }
 
-// // drainMoveChannelCoalesced implements latest-wins per window.
+// // drainMoveChannelCoalesced1 implements latest-wins per window.
 // // Replaces the old sequential drain.
-// func drainMoveChannelCoalesced() {
+// func drainMoveChannelCoalesced1() {
 // 	latest := make(map[windows.Handle]WindowMoveData, 8) // small initial capacity; grows rarely
 
 // 	// 1. Non-blocking full drain
@@ -5321,7 +5299,6 @@ applyBatch:
 		// batch we still want to apply the *latest* state even if some
 		// earlier windows in the batch triggered the throttle.
 		if ShouldThrottle() {
-			// Optional: log only in debug mode
 			logf("Throttle active during coalesced batch for hwnd=0x%X (FIXME: must still be applying latest state)", hwnd)
 		}
 
