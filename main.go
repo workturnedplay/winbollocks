@@ -501,6 +501,8 @@ const (
 	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = WM_USER + 205
+	WM_DO_SET_CAPTURE              = WM_USER + 210
+	WM_DO_RELEASE_CAPTURE          = WM_USER + 215
 )
 const (
 	MENU_EXIT                         = 1
@@ -1449,13 +1451,18 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 		uintptr(unsafe.Pointer(&r)),
 	)
 
-	_ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: FIXME: window was made by another thread!
-	// Now verify on the SAME thread that should own it
-	res2 := procGetCapture.Call()
-	if windows.Handle(res2.R1) != mainMsgHwnd {
-		logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
-		// handle recovery (e.g. post message to main thread to retry)
+	if mainMsgHwnd != 0 {
+		procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0) // tell wndProc aka main thread to capture to your hidden window; it can only be done on same thread that made that hwnd
+	} else {
+		logf("mainMsgHwnd is 0 in startManualDrag!")
 	}
+	// _ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: doneFIXME: window was made by another thread!
+	// // Now verify on the SAME thread that should own it
+	// res2 := procGetCapture.Call()
+	// if windows.Handle(res2.R1) != mainMsgHwnd {
+	// 	logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+	// 	// handle recovery (e.g. post message to main thread to retry)
+	// }
 
 	// This ensures:
 	//mouse capture is owned by your thread
@@ -1521,7 +1528,12 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		actually it is my hook thread that calls SetCapture in 2 places one for move and one for resize!
 	*/
 	if releaseCapture {
-		procReleaseCapture.Call()
+		if mainMsgHwnd != 0 {
+			procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_RELEASE_CAPTURE, 0, 0)
+		} else {
+			logf("mainMsgHwnd is 0 in softReset when trying to send a WM_DO_RELEASE_CAPTURE, falling back to calling ReleaseCapture now!")
+			procReleaseCapture.Call() // fallback, but should rarely hit
+		}
 	}
 
 	//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
@@ -2470,19 +2482,23 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				initialAspectRatio: float64(w) / float64(h),
 			})
 
-			_ = procSetCapture.Call(uintptr(mainMsgHwnd)) //FIXME: The thread that calls SetCapture must be the thread that created the window. Calling it cross-thread from the hook worker leads to silent failure, erratic capture, or no capture at all.
-			// Now verify on the SAME thread that should own it
-			res2 := procGetCapture.Call()
-			if windows.Handle(res2.R1) != mainMsgHwnd {
-				logf("in mouseProc, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
-				// handle recovery (e.g. post message to main thread to retry)
+			if mainMsgHwnd != 0 {
+				procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0)
+			} else {
+				logf("mainMsgHwnd is 0 in mouseProc/WM_RBUTTONDOWN !")
 			}
+			// _ = procSetCapture.Call(uintptr(mainMsgHwnd)) //doneFIXME: The thread that calls SetCapture must be the thread that created the window. Calling it cross-thread from the hook worker leads to silent failure, erratic capture, or no capture at all.
+			// // Now verify on the SAME thread that should own it
+			// res2 := procGetCapture.Call()
+			// if windows.Handle(res2.R1) != mainMsgHwnd {
+			// 	logf("in mouseProc, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+			// 	// handle recovery (e.g. post message to main thread to retry)
+			// }
 
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
 			}
 			return 1 // Swallow
-
 		} //if
 
 	case WM_MBUTTONDOWN: //MMB pressed
@@ -3092,6 +3108,37 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 	case WM_HIDE_OVERLAY:
 		hideOverlay()
+		return 0
+
+	case WM_DO_SET_CAPTURE:
+		target := windows.Handle(wParam)
+		if target == 0 {
+			target = mainMsgHwnd // fallback
+			logf("BUG: had to fallback the target to mainMsgHwnd 0x%X", target)
+		}
+		res1 := procSetCapture.Call(uintptr(target))
+		res2 := procGetCapture.Call()
+		prev := windows.Handle(res1.R1)
+		after := windows.Handle(res2.R1)
+		if after != target {
+			logf("WARNING: SetCapture in main thread failed to take ownership. Got 0x%X, want 0x%X, prev was 0x%X", after, target, prev)
+		}
+		// Success case stays silent
+		return 0
+
+	case WM_DO_RELEASE_CAPTURE:
+		res1 := procReleaseCapture.Call()
+		res2 := procGetCapture.Call()
+		prev := windows.Handle(res1.R1)
+		current := windows.Handle(res2.R1)
+		// Normal case (prev=1 or 0, current=0) → completely silent
+		if current != 0 {
+			logf("in wndProc part2of2, WM_DO_RELEASE_CAPTURE says the current capture (after releasing) is still 0x%X instead of none aka 0", current)
+		} else if prev != 0 && prev != mainMsgHwnd && prev != 1 { // 1 is the common "desktop" value
+			// Only log unusual previous owners (debug only)
+			logf("in wndProc, WM_DO_RELEASE_CAPTURE: previous owner was unexpected 0x%X (mainMsgHwnd=0x%X)", prev, mainMsgHwnd)
+		}
+
 		return 0
 
 	case WM_QUERYENDSESSION:
@@ -5175,12 +5222,10 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			// }
 			//hardReset(true)
 			softReset(true)
-		} else {
-			if shouldLogFocusChanges {
-				//logf("Err: %v, IL=0x%x", err, il)
-				logf("PID=%d IL=0x%x err=%v", pid, targetIL, err)
-				//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
-			}
+		} else if shouldLogFocusChanges {
+			//logf("Err: %v, IL=0x%x", err, il)
+			logf("PID=%d IL=0x%x err=%v", pid, targetIL, err)
+			//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
 		}
 		//} else {
 		//	logf("event: %v hwnd=0x%x", event, hwnd)

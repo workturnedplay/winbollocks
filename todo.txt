@@ -1,5 +1,7 @@
 todo:
-* fix some big issues in v0.1.0 (done: todo: 1,2,3,4): https://gemini.google.com/app/5fe7cce3ffd63bc6
+* maybe I should do the 2 SetCapture(s) at the moment the resize actually happens, tho it has to be done only one time (the first time) instead of doing it from mouseProc (via sendmessage to wndProc) and (2nd case) from RMB button down.
+* resizing tcmd window is slow/smooth possibly due to too many resize messages sent to it and it taking its time to paint, so basically it looks like it's lagging, smoothly, behind the mouse pointer.
+* fix some big issues in v0.1.0 (done: 1 todo: 2,3,4): https://gemini.google.com/app/5fe7cce3ffd63bc6
 * extract constants like EVENT_SYSTEM_FOREGROUND
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, now they're hidden behind(because of) WinResult (the return from .Call()) !
 
