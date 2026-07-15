@@ -2765,7 +2765,7 @@ func hookWorker() {
 			}
 		} //if recover
 		logf("hookWorker clean exit (but not quitting thread)")
-		select {} //infinite wait, or else secondary_defer() will trigger, FIXME: find a better way to not os.Exit and still exit this thread. liek tell secondary_defer to not os.Exit via a global bool?!
+		select {} //infinite wait, or else secondary_defer() will trigger, FIXME: find a better way to not os.Exit and still exit this thread. like tell secondary_defer to not os.Exit via a global bool?!
 	}() // defer
 
 	// 2. Save the OS Thread ID so our main thread can talk to it later
