@@ -1,10 +1,12 @@
 todo:
+* wait for hook thread to finish before continuing to deinit() or primary_defer() in main(), else it wouldn't have finished unhooking before main() os.Exit()s
+
 * resizing tcmd window is slow/smooth possibly due to too many resize messages sent to it and it taking its time to paint, so basically it looks like it's lagging, smoothly, behind the mouse pointer.
   * make adaptive-resizing for a window like tcmd whereby measured delay compared to amount of resize events we sent it should cause us to recompute the rate at which we can send them thus we can lower it(from the normal)(but never increase it) and remember it (in activeSession?) until a different hwnd is targeted. This will avoid queuing events like 17 events queued, because we don't intend to send more than the target hwnd can handle. Of course there should be a minimum though, maybe 1 resize per second, the minimum?!
-  * this ^ should probably only happen when Async Window Resizing is false (the default)
+  * this ^ should probably only happen when Async Window Resizing is false (the default) else we can't measure that delay between send-resize msg and it finishing the resize event.
   * when that ^ is done, test it on the Find(in progress) tiny window of regedit, which lags for 2 sec sometimes, this will hit the 1 resize minimum. Which makes me wonder, should we snap back to the normal amount of resize requests sent to it if we see it can now handle it? because this Find(while it searches for a string, ie. find is in progress) window of regedit will in fact stutter/freeze sometimes but then be back to normal. So it's unclear how we should handle this case, maybe only down-regulate if the target constantly lags in repaint/resizes ?
 
-* incredible amount of errcheck (116 of them) ie. returned errors not checked, now they're hidden behind(because of) WinResult (the return from .Call()) !
+* incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
 * fix this: i press/hold shift then winkey (in this order) them MMB click, then release shift (still holding winkey) and it pops up the start menu! it shouldn't (note that i'm already using Rshift as the workaround for not opening Start menu)
