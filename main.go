@@ -2718,7 +2718,7 @@ func hookWorker() {
 			hookPanicPayload.Store(r)
 
 			if status, ok := r.(exitStatus); ok {
-				currentExitCode.Store(int32(status.Code))
+				currentExitCode.Store(status.Code)
 				// This was an intentional exit(code)
 				//if code != 0 {
 				logf("hookWorker thread intentionally exited with code: '%d' and error message: '%s'", currentExitCode.Load(), status.Message)
@@ -3427,7 +3427,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_CLOSE:
 		//exit(0)
 		//WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage() -> getmessage() -> break loop -> outside of loop continuation...
-		procDestroyWindow.Call(uintptr(hwnd))
+		procDestroyWindow.Call(hwnd)
 		return 0
 
 	case WM_DESTROY:
@@ -3537,7 +3537,6 @@ func deinitOverlayClass() {
 	instance := res1.R1
 	classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
 	procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance)
-
 }
 
 func deinitMainMsgHwnd() {
@@ -4504,7 +4503,7 @@ func primary_defer() { //primary defer
 	*/
 	if r := recover(); r != nil {
 		if status, ok := r.(exitStatus); ok {
-			currentExitCode.Store(int32(status.Code))
+			currentExitCode.Store(status.Code)
 			// This was an intentional exit(code)
 			//if code != 0 {
 			logf("Program intentionally exited with code: '%d' and error message: '%s'", currentExitCode.Load(), status.Message)
