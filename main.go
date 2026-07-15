@@ -1727,7 +1727,7 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 	procSetWindowPos.Call( //TODO: handle errors/returns here
 		uintptr(overlayHwnd),
 		HWND_TOPMOST,
-		uintptr(ox), uintptr(oy),
+		uintptr(int(ox)), uintptr(int(oy)),
 		300, 50,
 		SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
 	)
@@ -2962,7 +2962,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			uintptr(target),
 			uintptr(data.InsertAfter),
 			0, 0, // X and Y are ignored because of SWP_NOMOVE
-			uintptr(data.W), uintptr(data.H),
+			uintptr(int(data.W)), uintptr(int(data.H)),
 			uintptr(data.Flags|SWP_NOMOVE),
 		)
 		if !async {
@@ -3043,7 +3043,7 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		res3 := procSetWindowPos.Call(
 			uintptr(target),
 			uintptr(data.InsertAfter),
-			uintptr(correctedX), uintptr(correctedY),
+			uintptr(int(correctedX)), uintptr(int(correctedY)),
 			0, 0, // W and H are ignored because of SWP_NOSIZE
 			uintptr(data.Flags|SWP_NOSIZE),
 		)
@@ -3081,8 +3081,8 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		res4 := procSetWindowPos.Call(
 			uintptr(target),
 			uintptr(data.InsertAfter),
-			uintptr(data.X), uintptr(data.Y),
-			uintptr(data.W), uintptr(data.H),
+			uintptr(int(data.X)), uintptr(int(data.Y)),
+			uintptr(int(data.W)), uintptr(int(data.H)),
 			uintptr(data.Flags),
 		)
 		//if ret == 0 { //failed
@@ -3536,7 +3536,7 @@ func deinitMainMsgHwnd() {
 }
 
 // type exitCode int // Custom type so recover knows it's an intentional exit
-func exit(code int) {
+func exit(code int32) {
 	// if code == 0 {
 	// 	return // Just return and let main finish naturally, so bad Gemini 3 Fast!
 	// }
@@ -4627,12 +4627,12 @@ func unreachable() {
 //		panic(fmt.Errorf(format, a...))
 //	}
 type exitStatus struct {
-	Code    int
+	Code    int32
 	Message string
 }
 
 // exitf allows you to provide a code and a formatted message
-func exitf(code int, format string, a ...interface{}) {
+func exitf(code int32, format string, a ...interface{}) {
 	//deinit()
 	//this panic will run the primary and potentially secondary(if primary fails) deferrers! ie. primary_defer
 	panic(exitStatus{
