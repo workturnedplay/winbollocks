@@ -2739,11 +2739,13 @@ var hookWorkerDone = make(chan struct{})
 func hookWorkerSecondaryDefer() {
 	if r2 := recover(); r2 != nil {
 		directLoggerf("!hookWorker secondary defer here! [CRITICAL ERROR IN hookWorker's panic-bridge defer]: '%v'\n%s\n----snip----", r2, debug.Stack())
-		directLoggerf("!hookWorker secondary defer here! forcing process exit with code 120 (hookWorker's own exit code was: '%d')", currentExitCode.Load())
-		closeAndFlushLog() // still flush the old ones tho.
-		os.Exit(120)       // XXX: oughtta be the only os.Exit! well 3of3
+		const exitCodeNow = 120
+		directLoggerf("!hookWorker secondary defer here! forcing process exit with code %d (hookWorker's own exit code was: '%d')", exitCodeNow, currentExitCode.Load())
+		closeAndFlushLog()   // still flush the old ones tho.
+		os.Exit(exitCodeNow) // XXX: oughtta be the only os.Exit! well 3of3
 	}
 	// recover() == nil: expected — see doc comment above.
+	// so this case just falls thru to next defer ie. runtime.UnlockOSThread() then it will thread finish/exit.
 }
 
 func hookWorker() {
@@ -2795,26 +2797,27 @@ func hookWorker() {
 
 			const waitForMainSeconds = 2
 			// 2. The Watchdog Timer
+			logf("hookWorker is now waiting %d seconds for main to exit us...", waitForMainSeconds)
 			select {
-			case <-mainAcknowledgedShutdown:
-				//logf("Main acknowledged panic. Handing over control...")
-				logf("hookWorker is now waiting %d seconds for main to exit us...", waitForMainSeconds)
+			case <-mainAcknowledgedShutdown: // Check if closed
+				logf("main() acknowledged shutdown. hookWorker is now waiting indefinitely for main to terminate the process.")
 				// We wait here forever. Why? Because we want the main thread's
 				// deinit() to be the one that finishes and potentially waits for
-				// the user's "Press a key or Enter" keypress.
+				// the user's "Press a key or Enter" keypress. It then calls os.Exit there in primary_defer() in main() thread.
+				close(hookWorkerDone)
 				select {}
 
 			case <-time.After(waitForMainSeconds * time.Second):
-				//logf("Main thread UNRESPONSIVE after 2s. Emergency exit.")
-				logf("hookWorker done waiting for main to die, proceeding to secondary_defer which exits...")
-				// Main is frozen. If we don't exit now, the app hangs forever.
-				//we let it continue/fallthru2below which means it calls secondary_defer() next!
+				directLoggerf("CRITICAL: Main thread unresponsive after %d seconds. hookWorker will now hang forever", waitForMainSeconds)
+				// Main is frozen.
+				//we let it fall thru to below which means it hangs forever
 			}
 			// Panic path, main unresponsive: block forever, unchanged from
 			// before this change. hookWorkerDone is intentionally NOT closed
 			// here — primary_defer()'s wait on it will simply time out,
 			// which is the correct, already-bounded fallback for this case.
-			logf("hookWorker clean exit (but not quitting thread)")
+			directLoggerf("hookWorker clean exit (but not quitting thread because main is hung or taking too long to exit)")
+			close(hookWorkerDone)
 			select {} //infinite wait, or else secondary_defer() will trigger, doneFIXME: find a better way to not os.Exit and still exit this thread. like tell secondary_defer to not os.Exit via a global bool?!
 		} //if recover
 
@@ -2875,7 +2878,7 @@ func hookWorker() {
 	// 4. The Thread's Private Message Loop
 	var msg MSG
 	for {
-		exitf(1, "temp. manual panic")
+		//exitf(1, "temp. manual panic")
 		res3 := procGetMessage.Call( // GetMessage here calls the hook(s)
 			uintptr(unsafe.Pointer(&msg)),
 			0, 0, 0,
@@ -4554,7 +4557,7 @@ func primary_defer() { //primary defer
 	// SIGNAL THE WATCHDOG:
 	// Closing this channel releases the hookWorker from its 2s timer.
 	select {
-	case <-mainAcknowledgedShutdown:
+	case <-mainAcknowledgedShutdown: // Check if closed
 		// already closed
 	default:
 		close(mainAcknowledgedShutdown)
@@ -4581,7 +4584,7 @@ func primary_defer() { //primary defer
 
 	deinit()
 
-	logf("Execution finished.")
+	logf("Execution finished (from main())")
 	if writeProfile {
 		writeHeapProfileOnExit()
 	}
@@ -4610,7 +4613,7 @@ func primary_defer() { //primary defer
 	if hookThreadID != 0 {
 		const hookWorkerExitTimeout = 2 * time.Second
 		select {
-		case <-hookWorkerDone:
+		case <-hookWorkerDone: // Check if closed
 			logf("main here, hookWorker signaled clean exit; proceeding.")
 		case <-time.After(hookWorkerExitTimeout):
 			logf("main here, timed out waiting for hookWorker's clean-exit signal (%v); proceeding anyway.", hookWorkerExitTimeout)
