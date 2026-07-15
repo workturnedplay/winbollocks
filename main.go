@@ -1070,13 +1070,13 @@ func injectLMBClickAtCoords(x, y int32) {
 	// not relative to (0,0).
 
 	res1 := procGetSystemMetrics.Call(SM_XVIRTUALSCREEN)
-	virtualLeft := res1.R1
+	var virtualLeft int32 = int32(res1.R1)
 	res1 = procGetSystemMetrics.Call(SM_YVIRTUALSCREEN)
-	virtualTop := res1.R1
+	var virtualTop int32 = int32(res1.R1)
 	res1 = procGetSystemMetrics.Call(SM_CXVIRTUALSCREEN)
-	virtualWidth := res1.R1
+	var virtualWidth int32 = int32(res1.R1)
 	res1 = procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
-	virtualHeight := res1.R1
+	var virtualHeight int32 = int32(res1.R1)
 
 	// Prevent divide-by-zero and nonsensical coordinate transforms.
 	//
@@ -1105,8 +1105,8 @@ func injectLMBClickAtCoords(x, y int32) {
 	//   relX = 1820
 	//
 	// which can then be normalized correctly.
-	relX := x - int32(virtualLeft)
-	relY := y - int32(virtualTop)
+	relX := x - virtualLeft
+	relY := y - virtualTop
 
 	// Defensive clamping.
 	//
@@ -1117,14 +1117,14 @@ func injectLMBClickAtCoords(x, y int32) {
 	// caller, so clamp coordinates before normalization.
 	if relX < 0 {
 		relX = 0
-	} else if relX >= int32(virtualWidth) {
-		relX = int32(virtualWidth) - 1
+	} else if relX >= virtualWidth {
+		relX = virtualWidth - 1
 	}
 
 	if relY < 0 {
 		relY = 0
-	} else if relY >= int32(virtualHeight) {
-		relY = int32(virtualHeight) - 1
+	} else if relY >= virtualHeight {
+		relY = virtualHeight - 1
 	}
 
 	//Windows maps pixels to "mickeys"
@@ -1140,8 +1140,8 @@ func injectLMBClickAtCoords(x, y int32) {
 	//   rightmost pixel -> 65535
 	//
 	// exactly.
-	normalizedX := (relX * 65535) / (int32(virtualWidth) - 1)
-	normalizedY := (relY * 65535) / (int32(virtualHeight) - 1)
+	normalizedX := (relX * 65535) / (virtualWidth - 1)
+	normalizedY := (relY * 65535) / (virtualHeight - 1)
 
 	inputs := []INPUT{
 		{
@@ -1201,8 +1201,12 @@ func injectLMBClickAtCoords(x, y int32) {
 	}
 	// 3. Teleport the mouse back to where the user had it a millisecond ago
 	res3 := procSetCursorPos.Call(
-		uintptr(currentPt.X),
-		uintptr(currentPt.Y),
+		//When SetCursorPos(X, Y) is called, Windows expects the X coordinate to be in the RCX register and Y to be in RDX.
+		// Even though the arguments are 32-bit integers, Windows expects the entire 64-bit register to be properly sign-extended.
+		// If the upper 32 bits contain garbage or are cleared to zero when they shouldn't be, the CPU behavior or the OS wrapper can misinterpret the value.
+		// and that's why the 'inf' cast is needed.
+		uintptr(int(currentPt.X)),
+		uintptr(int(currentPt.Y)),
 	)
 
 	//if restoreRet == 0 {
