@@ -2013,7 +2013,7 @@ func forceForeground(target windows.Handle) bool {
 
 	//if err2 != nil || ret == 0 {
 	if res3.Failed() {
-		logf("Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", res3.Err, target)
+		logf("Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
 		return false
 	}
 
@@ -3313,7 +3313,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				//logf("injecting LMB click")
 				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
-				//we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/inital window where gesture started upon.
+				//we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/initial window where gesture started upon.
 				injectLMBClickAtCoords(x, y)
 			}
 			// // Non-attachment focus: Simulate safe click to focus, doesn't work due to focus stealing prevention (win11) and thus only flashes the taskbar button of the target window. Actually the flashing is due to the above focus try(via attach thread first) failing! This may or may not do it alone, unsure.
@@ -5372,7 +5372,6 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	}
 
 	if shouldLogFocusChanges {
-
 		// Get the top-level owner of this HWND to see if it belongs to CMD
 		// GA_ROOT (2) gets the "real" parent window
 		res1 := procGetAncestor.Call(uintptr(hwnd), 2)
