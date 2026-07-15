@@ -1,4 +1,12 @@
-//go:build windows
+//go:build windows && amd64
+
+// winbollocks targets 64-bit Windows only. Several Win32 ABI details are
+// architecture-specific:
+//   - The INPUT / KEYBDINPUT struct layout includes explicit 64-bit padding.
+//   - WindowFromPoint receives POINT by value packed into a single 64-bit
+//     register (the amd64 calling convention); on x86 it would be two stack args.
+//   - assertStructSizes() validates the 64-bit ABI layout at startup.
+// Add a separate build target (and struct definitions) before enabling x86.
 
 // Copyright 2026 workturnedplay
 //
@@ -20,14 +28,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -1231,30 +1242,49 @@ func injectLMBDown() {
 }
 
 func initDPIAwareness() {
-	// Try modern API first (Win10 1607+)
+	// Try the modern API first (Win10 1607+).
 	if procSetProcessDpiAwarenessContext.Find() == nil {
 		res1 := procSetProcessDpiAwarenessContext.Call(
 			DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 		)
-		//if err != nil {
 		if res1.Succeeded() {
-			return // success
+			return
 		}
-		logf("SetProcessDpiAwarenessContext DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 failed, err:'%v', continuing with fallback.", res1.Err)
+		// ERROR_ACCESS_DENIED means DPI awareness was already locked before main()
+		// ran — most likely by an embedded application manifest in a .syso file.
+		// This is expected and benign; log informationally and skip the fallback.
+		if res1.ErrIs(windows.ERROR_ACCESS_DENIED) {
+			logf("DPI awareness already set before main() (application manifest?); runtime initialization skipped.")
+			return
+		}
+		logf("SetProcessDpiAwarenessContext failed (not manifest-locked), err:'%v'; trying shcore fallback.", res1.Err)
 	}
 
-	// Fallback: Windows 8.1+
+	// Fallback: Windows 8.1+ shcore API.
 	if procSetProcessDpiAwareness.Find() == nil {
-		res2 := procSetProcessDpiAwareness.Call(
-			PROCESS_PER_MONITOR_DPI_AWARE,
-		)
+		res2 := procSetProcessDpiAwareness.Call(PROCESS_PER_MONITOR_DPI_AWARE)
 		if res2.Failed() {
+			// SetProcessDpiAwareness returns an HRESULT, not a Win32 errno.
+			// E_ACCESSDENIED (0x80070005) means DPI is already locked; this is
+			// the HRESULT equivalent of the ERROR_ACCESS_DENIED check above.
+			// Note: windows.ERROR_ACCESS_DENIED (errno 5) != windows.Errno(0x80070005),
+			// so we must compare R1 directly rather than using ErrIs.
+			const hresultEAccessDenied uintptr = 0x80070005
+			//The hresultEAccessDenied constant is intentionally local to the function rather than a package-level constant, since it's a HRESULT interpretation of an API that's an exception to the project's general use of CheckBool/CheckErrno.
+			if res2.R1 == hresultEAccessDenied {
+				logf("DPI awareness (shcore fallback) already set before main() (application manifest?); skipping.")
+				return
+			}
 			logf("SetProcessDpiAwareness PROCESS_PER_MONITOR_DPI_AWARE failed, err:'%v'", res2.Err)
 		}
 	}
 }
 
 func windowFromPoint(pt POINT) windows.Handle {
+	// On amd64, Win32 passes POINT by value in a single 64-bit register.
+	// Reinterpreting the 8-byte struct as a uintptr packs X (low 32 bits)
+	// and Y (high 32 bits) exactly as the calling convention requires.
+	// This is intentionally amd64-specific; see the //go:build constraint.
 	res1 := procWindowFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt)))
 	//if err != nil || ret == 0 {
 	if res1.Failed() {
@@ -3539,6 +3569,47 @@ var ctrlHandler = windows.NewCallback(func(ctrlType uint32) uintptr {
 	return 1 // 1=true aka i handled this event ie. don't do the default handling which would exit.
 })
 
+// slogBridge routes wincoe's internal slog calls into winbollocks' async
+// log channel. Without this, wincoe's defensive paths (impossibiru, ClearStdin
+// warnings, etc.) write synchronously to os.Stderr, bypassing logWorker entirely
+// and risking torn lines or hook stutter under load.
+//
+// WithAttrs and WithGroup return a fresh slogBridge and intentionally discard the
+// accumulated attrs/group chain. wincoe's internal logging is infrequent and
+// entirely non-chained, so this simplification carries no practical cost.
+type slogBridge struct{}
+
+func (*slogBridge) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (*slogBridge) Handle(_ context.Context, r slog.Record) error {
+	var b strings.Builder
+	b.WriteString(r.Level.String())
+	b.WriteString(": ")
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		fmt.Fprintf(&b, " %s=%v", a.Key, a.Value.Any())
+		return true
+	})
+	logf("[wincoe] %s", b.String())
+	return nil
+}
+
+func (*slogBridge) WithAttrs(_ []slog.Attr) slog.Handler { return &slogBridge{} }
+func (*slogBridge) WithGroup(_ string) slog.Handler      { return &slogBridge{} }
+
+// initWincoeLogging wires wincoe's Logger and bugLogger into winbollocks'
+// async log channel. Must be called after logWorker has started (which happens
+// in main() before runApplication), so logChan is ready to accept sends.
+func initWincoeLogging() {
+	/*
+		One edge case to be aware of: if something somehow calls through the bridge after closeAndFlushLog() has closed logChan, sending to a closed channel panics.
+		In practice this can't happen because wincoe's defensive paths are never reached during teardown, but it's worth knowing the constraint exists.
+	*/
+	bridge := slog.New(&slogBridge{})
+	wincoe.Logger.Store(bridge)
+	wincoe.SetBugLogger(bridge)
+}
+
 var (
 	logFile *os.File
 	//hasConsole bool
@@ -3979,19 +4050,26 @@ func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
 }
 
 func assertStructSizes() {
+	// These are the Win32 ABI sizes for the INPUT union on 64-bit Windows (amd64).
+	// The build tag enforces we only reach this code on that architecture.
+	// If the Go struct layout ever drifts from what Win32 expects (e.g. due to
+	// a struct field reorder), SendInput will silently send garbage — panic early.
 	const (
-		expectedINPUT      = 40
-		expectedKEYBDINPUT = 24
+		expectedINPUT      uintptr = 40 // sizeof(INPUT) on x64: 4 type + 4 pad + 32 union
+		expectedKEYBDINPUT uintptr = 24 // sizeof(KEYBDINPUT) on x64: with 8-byte DwExtraInfo
 	)
 
-	if unsafe.Sizeof(INPUT{}) != expectedINPUT {
-		logf("FATAL: INPUT size mismatch (%d)", unsafe.Sizeof(INPUT{}))
-		panic("INPUT size mismatch: ABI layout is wrong") // exit code 2
+	if got := unsafe.Sizeof(INPUT{}); got != expectedINPUT {
+		panic(fmt.Sprintf(
+			"INPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d — SendInput will be broken",
+			got, expectedINPUT,
+		))
 	}
-
-	if unsafe.Sizeof(KEYBDINPUT{}) != expectedKEYBDINPUT {
-		logf("FATAL: KEYBDINPUT size mismatch (%d)", unsafe.Sizeof(KEYBDINPUT{}))
-		panic("KEYBDINPUT size mismatch: ABI layout is wrong") // exit code 2
+	if got := unsafe.Sizeof(KEYBDINPUT{}); got != expectedKEYBDINPUT {
+		panic(fmt.Sprintf(
+			"KEYBDINPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d",
+			got, expectedKEYBDINPUT,
+		))
 	}
 }
 
@@ -4544,6 +4622,7 @@ func exitf(code int, format string, a ...interface{}) {
 func runApplication(_token theILockedMainThreadToken) error { //XXX: must be called on main() and after that runtime.LockOSThread()
 	_ = _token // silence warning!
 	assertStructSizes()
+	initWincoeLogging() // ← must be before any wincoe calls
 	logf("Started")
 
 	if writeProfile {
