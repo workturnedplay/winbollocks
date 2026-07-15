@@ -4423,8 +4423,14 @@ func internalLogger(finalMsg string) {
 		}
 	}
 
-	fmt.Fprintf(logFile, "%s", finalMsg)
-	logFile.Sync()
+	_, err := fmt.Fprintf(logFile, "%s", finalMsg)
+	if err != nil && canUseConsoleStderr {
+		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't write to logFile %q the logline: %s", err, logFile.Name(), finalMsg)
+	}
+	err2 := logFile.Sync()
+	if err2 != nil && canUseConsoleStderr {
+		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't sync logFile %q after writing to it this logline: %s", err2, logFile.Name(), finalMsg)
+	}
 }
 
 func closeAndFlushLog() {
