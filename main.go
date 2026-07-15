@@ -1347,12 +1347,15 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	defer token.Close()
 
 	var needed uint32
-	windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
+	if err == nil {
+		return 0, fmt.Errorf("GetTokenInformation getting the proper size, succeeded but it's supposed to fail because we're passing 0 to get the proper size")
+	}
 
 	buf := make([]byte, needed)
 	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], needed, &needed)
 	if err != nil {
-		return 0, fmt.Errorf("GetTokenInformation failed: %w", err)
+		return 0, fmt.Errorf("GetTokenInformation after having size, failed: %w", err)
 	}
 
 	// Debug: log buffer size (should be ~28-40 bytes)
@@ -2732,7 +2735,7 @@ func hookWorker() {
 
 			// 2. Nuke the main thread's GetMessage loop, works only if systray popup menu isn't open!
 			// Use PostThreadMessage to mainThreadId, or post WM_CLOSE to your main HWND
-			procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0)
+			procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0) //TODO: investigate if mainThreadID can be unset or 0 here.
 			//doneFIXME: what if main is dead too, and would ignore the signal or what, then we exit here? sure after X seconds
 
 			if mainMsgHwnd != 0 {
@@ -4208,7 +4211,7 @@ func init() {
 	il, err := processIntegrityLevel(selfPID)
 	if err != nil {
 		//myIntegrityLevel = 0x2000 // Default to Medium if check fails
-		panic("can't get own integrity level!") // and don't wanna default to anything
+		panic(fmt.Sprintf("can't get own integrity level! err=%v", err)) // and don't wanna default to anything
 	} else {
 		selfIntegrityLevel = il
 	}
