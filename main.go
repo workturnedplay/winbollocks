@@ -3031,9 +3031,10 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		)
 		if !async {
 			duration := time.Since(start)
-			if duration > 25*time.Millisecond {
+			const ifMoreThanMs = 25 //ms
+			if duration > ifMoreThanMs*time.Millisecond {
 				//only in ModeResize and when SWP_ASYNCWINDOWPOS isn't used(but now it is), then if you try to resize the Find window in regedit (first u must run as admin because regedit runs as admin) while it's searching for some random text! then this triggers!
-				logf("SetWindowPos/Resize took %d ms", duration.Milliseconds())
+				logf("SetWindowPos/Resize for HWND 0x%X took %d ms >%dms", target, duration.Milliseconds(), ifMoreThanMs)
 			}
 		}
 		//if err1 != nil { //aka ret == 0 { //failed
@@ -3227,8 +3228,9 @@ func UnpackLParam(lParam uintptr) (x, y int32) {
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_DO_SETWINDOWPOS:
-		drainMoveChannel() // Pull everything from the channel
-		return 0           // Handled
+		//drainMoveChannel() // Pull everything from the channel, sequentially
+		drainMoveChannelCoalesced() // ← new coalescing version
+		return 0                    // Handled
 
 	case WM_HIDE_OVERLAY:
 		hideOverlay()
@@ -5243,6 +5245,99 @@ func drainMoveChannel() {
 			return // Channel empty, go back to GetMessage
 		}
 	}
+}
+
+// // drainMoveChannelCoalesced implements latest-wins per window.
+// // Replaces the old sequential drain.
+// func drainMoveChannelCoalesced() {
+// 	latest := make(map[windows.Handle]WindowMoveData, 8) // small initial capacity; grows rarely
+
+// 	// 1. Non-blocking full drain
+// 	for {
+// 		select {
+// 		case data := <-moveDataChan:
+// 			// 2+3. Overwrite → keep only newest state per HWND
+// 			latest[data.Hwnd] = data
+// 		default:
+// 			// Queue empty → proceed to batch apply
+// 			goto applyBatch
+// 		}
+// 	}
+
+// applyBatch:
+// 	// 4. Batch apply: exactly once per active window
+// 	for hwnd, data := range latest {
+// 		if hwnd == 0 || !isWindowValid(hwnd) { // lightweight check
+// 			continue
+// 		}
+// 		handleActualMoveOrResize(data)
+// 	}
+
+// 	// Optional: clear map for GC friendliness (not strictly needed)
+// 	// clear(latest) // Go 1.21+
+// }
+
+// drainMoveChannelCoalesced implements event coalescing (latest-wins per window)
+// while preserving approximate inter-window ordering using a first-seen slice.
+// This directly addresses the rubber-banding issue described.
+func drainMoveChannelCoalesced() {
+	// latest holds only the most recent state for each window
+	latest := make(map[windows.Handle]WindowMoveData, 8)
+
+	// order records the first-seen order of windows in this drain batch.
+	// This gives us stable FIFO-like behavior across different windows
+	// without sacrificing per-window coalescing.
+	order := make([]windows.Handle, 0, 8)
+
+	// 1. Non-blocking full drain of the channel
+	for {
+		select {
+		case data := <-moveDataChan:
+			if _, exists := latest[data.Hwnd]; !exists {
+				order = append(order, data.Hwnd) // record first appearance order
+			}
+			latest[data.Hwnd] = data // always overwrite with newest state
+		default:
+			// Channel is empty → proceed to batch apply
+			goto applyBatch
+		}
+	}
+
+applyBatch:
+	// 2. Batch apply in first-seen order
+	for _, hwnd := range order {
+		data, ok := latest[hwnd]
+		if !ok || hwnd == 0 {
+			continue
+		}
+
+		if !isWindowValid(hwnd) {
+			continue
+		}
+
+		// IMPORTANT: Throttle handling for multi-window batches
+		// The global throttle (ShouldThrottle) is intentionally kept
+		// to protect the mouse hook from overload. However, in a coalesced
+		// batch we still want to apply the *latest* state even if some
+		// earlier windows in the batch triggered the throttle.
+		if ShouldThrottle() {
+			// Optional: log only in debug mode
+			logf("Throttle active during coalesced batch for hwnd=0x%X (FIXME: must still be applying latest state)", hwnd)
+		}
+
+		handleActualMoveOrResize(data)
+	}
+}
+
+// Simple helper (add near other utils)
+func isWindowValid(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return false
+	}
+	// Fast check without sending messages
+	var rect RECT
+	res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
+	return res.Succeeded()
 }
 
 func getClassName(hwnd windows.Handle) string {
