@@ -4621,10 +4621,6 @@ type exitStatus struct {
 }
 
 // exitf allows you to provide a code and a formatted message
-//
-// the hint below has no apparent effect or i didn't use it in proper context and something else was in effect which made it seems as having no effect!
-//
-//go:panicnhint
 func exitf(code int, format string, a ...interface{}) {
 	//deinit()
 	//this panic will run the primary and potentially secondary(if primary fails) deferrers! ie. primary_defer
