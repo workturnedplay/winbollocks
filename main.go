@@ -3129,9 +3129,9 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		// Always update your visual overlay bounding variables with the true positions
 		nx, ny, nw, nh := correctedX, correctedY, actualW, actualH
 
-		ptr := activeSession.Load()
-		if ptr != nil {
-			session := *ptr // TODO: use this on-stack thing for other session:=activeSession.Load() places
+		session := activeSession.Load()
+		if session != nil {
+			//session := *ptr // noneedTODO: use this on-stack thing for other session:=activeSession.Load() places; so this was for "The compiler can then perform an optimization called Register Promotion. It can load your entire struct's fields directly into CPU registers (RAX, RBX, etc.)."
 			if session.mode != ModeResize {
 				//if !resizing.Load() {
 				logf("delayed resizing detected, while not 'resizing'.")
@@ -3140,8 +3140,8 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			startW := session.state.startRect.Right - session.state.startRect.Left
 			startH := session.state.startRect.Bottom - session.state.startRect.Top
 			updateOverlay(nx, ny, nw, nh, startW, startH)
-		} else {
-			logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
+			// } else {
+			// 	logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
 	} else {
 		//here for ModeMove, async resize
