@@ -1205,8 +1205,10 @@ func injectLMBClickAtCoords(x, y int32) {
 		// Even though the arguments are 32-bit integers, Windows expects the entire 64-bit register to be properly sign-extended.
 		// If the upper 32 bits contain garbage or are cleared to zero when they shouldn't be, the CPU behavior or the OS wrapper can misinterpret the value.
 		// and that's why the 'inf' cast is needed.
-		uintptr(int(currentPt.X)),
-		uintptr(int(currentPt.Y)),
+		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+		uintptr(currentPt.X),
+		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+		uintptr(currentPt.Y),
 	)
 
 	//if restoreRet == 0 {
@@ -1727,7 +1729,10 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 	procSetWindowPos.Call( //TODO: handle errors/returns here
 		uintptr(overlayHwnd),
 		HWND_TOPMOST,
-		uintptr(int(ox)), uintptr(int(oy)),
+		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+		uintptr(ox),
+		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+		uintptr(oy),
 		300, 50,
 		SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
 	)
@@ -1791,6 +1796,7 @@ func isInSameThreadID(hwnd windows.Handle) bool {
 	if res1.Failed() {
 		return false
 	}
+	// #nosec G115 -- safe: Win32 Thread IDs are 32-bit DWORDs
 	return uint32(res1.R1 /*aka tid aka thread id*/) == windows.GetCurrentThreadId()
 }
 
@@ -1843,6 +1849,7 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 
 	res1 := procGetWindowLongPtrW.Call(
 		uintptr(hwnd),
+		// #nosec G115 -- safe: Win32 ABI expects negative offsets to be cast to uintptr
 		uintptr(index),
 	)
 	ret := res1.R1
@@ -1890,7 +1897,9 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 		return
 	}
 
+	// #nosec G115 -- safe: Win32 window styles are 32-bit bitmasks
 	s := uint32(style)
+	// #nosec G115 -- safe: Win32 extended window styles are 32-bit bitmasks
 	ex := uint32(exStyle)
 
 	// Child windows cannot be foreground windows
@@ -2962,7 +2971,12 @@ func handleActualMoveOrResize(data WindowMoveData) {
 			uintptr(target),
 			uintptr(data.InsertAfter),
 			0, 0, // X and Y are ignored because of SWP_NOMOVE
-			uintptr(int(data.W)), uintptr(int(data.H)),
+
+			// #nosec G115 -- safe: Win32 dimensions are sign-extended from int32 into uintptr
+			uintptr(data.W),
+			// #nosec G115 -- safe: Win32 dimensions are sign-extended from int32 into uintptr
+			uintptr(data.H),
+
 			uintptr(data.Flags|SWP_NOMOVE),
 		)
 		if !async {
@@ -3043,7 +3057,12 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		res3 := procSetWindowPos.Call(
 			uintptr(target),
 			uintptr(data.InsertAfter),
-			uintptr(int(correctedX)), uintptr(int(correctedY)),
+
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(correctedX),
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(correctedY),
+
 			0, 0, // W and H are ignored because of SWP_NOSIZE
 			uintptr(data.Flags|SWP_NOSIZE),
 		)
@@ -3081,8 +3100,16 @@ func handleActualMoveOrResize(data WindowMoveData) {
 		res4 := procSetWindowPos.Call(
 			uintptr(target),
 			uintptr(data.InsertAfter),
-			uintptr(int(data.X)), uintptr(int(data.Y)),
-			uintptr(int(data.W)), uintptr(int(data.H)),
+
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(data.X),
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(data.Y),
+			// #nosec G115 -- safe: Win32 dimensions are sign-extended from int32 into uintptr
+			uintptr(data.W),
+			// #nosec G115 -- safe: Win32 dimensions are sign-extended from int32 into uintptr
+			uintptr(data.H),
+
 			uintptr(data.Flags),
 		)
 		//if ret == 0 { //failed
@@ -3140,7 +3167,9 @@ func UnpackLParam(lParam uintptr) (x, y int32) {
 	*/
 	// x = int32(int16(lParam))
 	// y = int32(int16(lParam >> 16))
+	// #nosec G115 -- safe: explicitly truncating to 16-bit to unpack Win32 coordinates
 	x = int32(int16(lParam & 0xFFFF))
+	// #nosec G115 -- safe: explicitly truncating to 16-bit to unpack Win32 coordinates
 	y = int32(int16((lParam >> 16) & 0xFFFF))
 	return x, y
 }
@@ -4158,6 +4187,7 @@ func init() {
 var selfPID uint32
 
 func init() {
+	// #nosec G115 -- safe: Windows PIDs are DWORDs and fit perfectly in uint32
 	selfPID = uint32(os.Getpid())
 	if selfPID == 0 {
 		badprogramming("shouldn't happen that own pid is 0")
@@ -5067,13 +5097,14 @@ func setAndVerifyPriority() {
 		if res4.Failed() {
 			logf("Failed to get thread priority, err:%v", res4.Err)
 		}
-		tprio := res4.R1
+		// #nosec G115 -- safe: Win32 thread priorities are small integers that fit in int32
+		tprio := int32(res4.R1)
 
 		// GetThreadPriority returns an int. 15 is TIME_CRITICAL.
-		if int32(tprio) == wantedThreadPrio {
+		if tprio == wantedThreadPrio {
 			logf("Thread Priority confirmed: %d", tprio)
 		} else {
-			logf("Thread Priority mismatch! OS returned prio: %d instead of %d and err was: %v, callStatus: %v", int32(tprio), wantedThreadPrio, res4.Err, res4.CallStatus)
+			logf("Thread Priority mismatch! OS returned prio: %d instead of %d and err was: %v, callStatus: %v", tprio, wantedThreadPrio, res4.Err, res4.CallStatus)
 		}
 	}
 
@@ -5350,6 +5381,7 @@ func getProcessNameFast(pid uint32) string {
 	defer windows.CloseHandle(h)
 
 	buf := make([]uint16, windows.MAX_PATH)
+	// #nosec G115 -- safe: buffer length is a small constant aka windows.MAX_PATH aka 260 which is well within uint32 bounds
 	size := uint32(len(buf))
 	// QueryFullProcessImageName is significantly faster than Toolhelp snapshots
 	err = windows.QueryFullProcessImageName(h, 0, &buf[0], &size)
