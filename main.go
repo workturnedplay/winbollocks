@@ -2912,7 +2912,8 @@ func MarkAsResizedNow() {
 	lastResizeUnixNano.Store(time.Now().UnixNano())
 }
 
-const forceMoveOrResizeActionsToBeThisManyMSApart = 10
+const forceMoveOrResizeActionsToBeThisManyMSApart = 16 // 16ms is 60fps, 10ms is 100fps
+
 const WS_THICKFRAME = 0x00040000 // or WS_SIZEBOX which has same value (as per chatgpt 5.5)
 
 func handleActualMoveOrResize(data WindowMoveData) {
