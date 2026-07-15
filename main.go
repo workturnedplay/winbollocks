@@ -1707,7 +1707,7 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 	return res8.R1 //LRESULT
 }
 
-func updateOverlay(x, y, w, h int32, startW, startH int32) {
+func updateOverlay(x, y, w, h, startW, startH int32) {
 	if overlayHwnd == 0 {
 		return
 	}
@@ -3871,7 +3871,7 @@ ffs, AI, chatgpt 5.2 make up ur gdammn mind already, what is true and what isn't
 
 "No, your low-level hooks (WH_KEYBOARD_LL and WH_MOUSE_LL) will not be called in parallel in any realistic scenario that would require atomics for shared state." - Grok
 */
-func keyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
+func keyboardProc(nCode int, wParam, lParam uintptr) uintptr {
 	/*
 			For low-level hooks:
 
