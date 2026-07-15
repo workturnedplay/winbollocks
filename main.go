@@ -3093,20 +3093,9 @@ func handleActualMoveOrResize(data WindowMoveData) {
 	}
 }
 
-// func makeLParam(x, y int32) uintptr { // chatgpt
-//
-//		return uintptr(uint32(uint16(x)) | (uint32(uint16(y)) << 16))
-//	}
-//
-// func makeLParam(x, y int32) uintptr { //grok, dumb for y needs &
-//
-//		return uintptr((int64(y) << 16) | (int64(x) & 0xFFFF))
-//	}
-//
-// func makeLParam(x, y int32) uintptr { //grok, fixed by me
-//
-//		return uintptr(((int64(y) << 16) & 0xFFFF0000) | (int64(x) & 0xFFFF))
-//	}
+// makeLParam packs signed 16-bit x,y coordinates into a Win32 LPARAM (uintptr).
+// This ensures proper sign-extension to 64 bits on x64, matching MAKELPARAM / LPARAM semantics.
+// Handles negative coordinates (multi-monitor setups where monitors are left/above primary).
 func makeLParam(x, y int32) uintptr { // grok again
 	//AND ensures 16-bit truncation, prevents high bits bleed. No warnings, handles negatives.
 	// cast doesn't change bits only interpretation
@@ -3114,7 +3103,19 @@ func makeLParam(x, y int32) uintptr { // grok again
 	// and &0xFFFF truncates to the low 16 bits correctly before shifting).
 	// The following line suppresses the warning:
 	// #nosec G115 -- safe: coords are screen pixels, always fit in 16 bits
-	return uintptr((uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF))
+	//return uintptr((uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF))
+
+	// Pack low 16 bits of x and y (preserves 2's complement for negatives)
+	// 1. Pack exactly as before (low 16=x, high 16=y, 2's complement preserved)
+	packed := (uint32(y)&0xFFFF)<<16 | (uint32(x) & 0xFFFF)
+
+	// Critical: cast to int32 first (interprets bit 31 as sign),
+	// then to uintptr (sign-extends to 64 bits on x64).
+	// This matches C behavior and Microsoft's extension rules.
+	// 2. Interpret as signed 32-bit (this captures whether bit 31 is set)
+	// 3. Convert to uintptr → proper sign extension to 64 bits
+	// #nosec G115 -- safe: coords are screen pixels, always fit in 2x16 bits
+	return uintptr(int32(packed))
 }
 
 // UnpackLParam extracts the signed X and Y coordinates from a window message lParam.
