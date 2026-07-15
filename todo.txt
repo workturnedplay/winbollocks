@@ -1,7 +1,5 @@
 todo:
-* maybe I should do the 2 SetCapture(s) at the moment the resize actually happens, tho it has to be done only one time (the first time) instead of doing it from mouseProc (via sendmessage to wndProc) and (2nd case) from RMB button down.
 * resizing tcmd window is slow/smooth possibly due to too many resize messages sent to it and it taking its time to paint, so basically it looks like it's lagging, smoothly, behind the mouse pointer.
-* extract constants like EVENT_SYSTEM_FOREGROUND
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, now they're hidden behind(because of) WinResult (the return from .Call()) !
 
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
@@ -18,6 +16,8 @@ notmybug:
 
 
 done:
+//* maybe I should do the 2 SetCapture(s) at the moment the resize actually happens, tho it has to be done only one time (the first time) instead of doing it from mouseProc (via sendmessage to wndProc) and (2nd case) from RMB button down.
+//* extract constants like EVENT_SYSTEM_FOREGROUND
 //* fix some big issues in v0.1.0 (done: 1,2,3,4 todo: ): https://gemini.google.com/app/5fe7cce3ffd63bc6
 //* use wincoe.NewBoundProc instead of the usual NewProc
 //fixedproperly//* current bug is: during resize releasing RMB won't run the corrected move-back because session is nil so a fixed-size unresizable window remains at the position it woulda been at if it resized! also if it doesn't hit this bug, you can still see it jump(now fixed too) during resizing attempts!

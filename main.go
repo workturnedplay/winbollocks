@@ -512,8 +512,8 @@ const (
 	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = WM_USER + 205
-	WM_DO_SET_CAPTURE              = WM_USER + 210
-	WM_DO_RELEASE_CAPTURE          = WM_USER + 215
+	// WM_DO_SET_CAPTURE              = WM_USER + 210
+	WM_DO_RELEASE_CAPTURE = WM_USER + 215
 )
 const (
 	MENU_EXIT                         = 1
@@ -1401,7 +1401,7 @@ func initTray() error {
 
 	res1 := procLoadIcon.Call(0, IDI_APPLICATION)
 	if res1.Failed() {
-		return fmt.Errorf("LoadIcon IDI_APPLICATION failed, err: %v", res1.Err)
+		return fmt.Errorf("LoadIcon IDI_APPLICATION failed, err: %w", res1.Err)
 	}
 	trayIcon.HIcon = windows.Handle(res1.R1)
 	trayIcon.UCallbackMessage = WM_MYSYSTRAY
@@ -1481,25 +1481,23 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 		uintptr(unsafe.Pointer(&r)),
 	)
 
-	if mainMsgHwnd != 0 {
-		procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0) // tell wndProc aka main thread to capture to your hidden window; it can only be done on same thread that made that hwnd
-	} else {
-		logf("mainMsgHwnd is 0 in startManualDrag!")
-	}
-	// _ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: doneFIXME: window was made by another thread!
-	// // Now verify on the SAME thread that should own it
-	// res2 := procGetCapture.Call()
-	// if windows.Handle(res2.R1) != mainMsgHwnd {
-	// 	logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
-	// 	// handle recovery (e.g. post message to main thread to retry)
+	// if mainMsgHwnd != 0 {
+	// 	procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0) // tell wndProc aka main thread to capture to your hidden window; it can only be done on same thread that made that hwnd
+	// } else {
+	// 	logf("mainMsgHwnd is 0 in startManualDrag!")
 	// }
+	// // _ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: doneFIXME: window was made by another thread!
+	// // // Now verify on the SAME thread that should own it
+	// // res2 := procGetCapture.Call()
+	// // if windows.Handle(res2.R1) != mainMsgHwnd {
+	// // 	logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+	// // 	// handle recovery (e.g. post message to main thread to retry)
+	// // }
 
-	// This ensures:
-	//mouse capture is owned by your thread
-	//capture is released cleanly
-	//no weird input edge cases
-
-	// Both variables are published to the rest of the application simultaneously
+	// // This ensures:
+	// //mouse capture is owned by your thread
+	// //capture is released cleanly
+	// //no weird input edge cases
 
 	if cur := activeSession.Load(); cur != nil {
 		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
@@ -1548,7 +1546,7 @@ func keyDown(vk uintptr) bool {
 func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	//do this first
 	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
-
+	captureHeldForSession.Store(nil)
 	/*
 		The Problem: If you call it in the hook, you are releasing capture on the Hook Thread. But window capture is thread-specific.
 		If your SetCapture was originally called by the Main Thread (which is usually where windows and UI live),
@@ -2512,18 +2510,18 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				initialAspectRatio: float64(w) / float64(h),
 			})
 
-			if mainMsgHwnd != 0 {
-				procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0)
-			} else {
-				logf("mainMsgHwnd is 0 in mouseProc/WM_RBUTTONDOWN !")
-			}
-			// _ = procSetCapture.Call(uintptr(mainMsgHwnd)) //doneFIXME: The thread that calls SetCapture must be the thread that created the window. Calling it cross-thread from the hook worker leads to silent failure, erratic capture, or no capture at all.
-			// // Now verify on the SAME thread that should own it
-			// res2 := procGetCapture.Call()
-			// if windows.Handle(res2.R1) != mainMsgHwnd {
-			// 	logf("in mouseProc, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
-			// 	// handle recovery (e.g. post message to main thread to retry)
+			// if mainMsgHwnd != 0 {
+			// 	procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0)
+			// } else {
+			// 	logf("mainMsgHwnd is 0 in mouseProc/WM_RBUTTONDOWN !")
 			// }
+			// // _ = procSetCapture.Call(uintptr(mainMsgHwnd)) //doneFIXME: The thread that calls SetCapture must be the thread that created the window. Calling it cross-thread from the hook worker leads to silent failure, erratic capture, or no capture at all.
+			// // // Now verify on the SAME thread that should own it
+			// // res2 := procGetCapture.Call()
+			// // if windows.Handle(res2.R1) != mainMsgHwnd {
+			// // 	logf("in mouseProc, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+			// // 	// handle recovery (e.g. post message to main thread to retry)
+			// // }
 
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
@@ -2873,6 +2871,20 @@ const forceMoveOrResizeActionsToBeThisManyMSApart = 10
 const WS_THICKFRAME = 0x00040000 // or WS_SIZEBOX which has same value (as per chatgpt 5.5)
 
 func handleActualMoveOrResize(data WindowMoveData) {
+	//Top of handleActualMoveOrResize, before the rate-limit check (capture should be set even if we throttle the actual SetWindowPos):
+	// Lazy once-per-session SetCapture.
+	// We are guaranteed to be on the main thread here (wndProc context).
+	if cur := activeSession.Load(); cur != nil && captureHeldForSession.Load() != cur {
+		procSetCapture.Call(uintptr(mainMsgHwnd))
+		/*
+			One caveat worth stating: since you're using WH_MOUSE_LL, you receive all mouse events globally regardless of capture.
+			 SetCapture here is about preventing other windows from acting on cursor interactions during a drag, not about receiving events yourself.
+			 So if you find a future reason to drop it entirely, no events would be lost.
+			  - Claude 4.6 Sonnet High Thinking
+		*/
+		captureHeldForSession.Store(cur)
+	}
+
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
 	// Most monitors are 60Hz-144Hz. Anything faster than 10ms is wasted CPU.
 	//if time.Since(lastResize) < forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
@@ -3140,21 +3152,21 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		hideOverlay()
 		return 0
 
-	case WM_DO_SET_CAPTURE:
-		target := windows.Handle(wParam)
-		if target == 0 {
-			target = mainMsgHwnd // fallback
-			logf("BUG: had to fallback the target to mainMsgHwnd 0x%X", target)
-		}
-		res1 := procSetCapture.Call(uintptr(target))
-		res2 := procGetCapture.Call()
-		prev := windows.Handle(res1.R1)
-		after := windows.Handle(res2.R1)
-		if after != target {
-			logf("WARNING: SetCapture in main thread failed to take ownership. Got 0x%X, want 0x%X, prev was 0x%X", after, target, prev)
-		}
-		// Success case stays silent
-		return 0
+	// case WM_DO_SET_CAPTURE:
+	// 	target := windows.Handle(wParam)
+	// 	if target == 0 {
+	// 		target = mainMsgHwnd // fallback
+	// 		logf("BUG: had to fallback the target to mainMsgHwnd 0x%X", target)
+	// 	}
+	// 	res1 := procSetCapture.Call(uintptr(target))
+	// 	res2 := procGetCapture.Call()
+	// 	prev := windows.Handle(res1.R1)
+	// 	after := windows.Handle(res2.R1)
+	// 	if after != target {
+	// 		logf("WARNING: SetCapture in main thread failed to take ownership. Got 0x%X, want 0x%X, prev was 0x%X", after, target, prev)
+	// 	}
+	// 	// Success case stays silent
+	// 	return 0
 
 	case WM_DO_RELEASE_CAPTURE:
 		res1 := procReleaseCapture.Call()
@@ -4560,7 +4572,7 @@ func getConsoleWindow() (windows.HWND, error) {
 		// when no failure occurred, so treat that as nil.
 		// if err != nil && err != windows.ERROR_SUCCESS {
 		if res1.Failed() {
-			return 0, fmt.Errorf("in getConsoleWindow, GetConsoleWindow() failed, err=%v", res1.Err)
+			return 0, fmt.Errorf("in getConsoleWindow, GetConsoleWindow() failed, err=%w", res1.Err)
 		}
 
 		// No console is a normal state, not an error.
@@ -4659,7 +4671,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	mainMsgHwnd = hwnd
 
 	if err4 := initTray(); err4 != nil {
-		return fmt.Errorf("failed to init tray: %v", err4)
+		return fmt.Errorf("failed to init tray: %w", err4)
 	}
 
 	go hookWorker()
@@ -4679,14 +4691,15 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 
 	// Global foreground change hook, this is the WH_SHELL hook, changed tho to accommodate needs.
 	if res1 := procSetWinEventHook.Call(
-		0x0003, // EVENT_SYSTEM_FOREGROUND min
+		uintptr(EVENT_SYSTEM_FOREGROUND), //0x0003, // EVENT_SYSTEM_FOREGROUND min
 		//0x0003, // max
-		0x8005, // EVENT_OBJECT_FOCUS (Catch lower-level focus shifts)
-		0,      // hmod = 0 (out-of-context callback)
+		uintptr(EVENT_OBJECT_FOCUS), // max; spans 0x4xxx console band too //0x8005, // EVENT_OBJECT_FOCUS (Catch lower-level focus shifts)
+
+		0, // hmod = 0 (out-of-context callback)
 		winEventCallback,
-		0,             // idProcess = 0 (all)
-		0,             // idThread = 0 (all)
-		0x0000|0x0002, // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
+		0, // idProcess = 0 (all)
+		0, // idThread = 0 (all)
+		uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS), //0x0000|0x0002, // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
 	); res1.Failed() { //err != nil || h == 0 {
 		logf("SetWinEventHook failed, hooking of winEventHook, from main thread: %v", res1.Err)
 	} else {
@@ -5161,7 +5174,7 @@ By treating them as atomic assignments, you effectively forced the CPU to perfor
 */
 func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
 	// ONLY process if it's the actual window, not a sub-control/caret/item
-	if idObject != 0 { // 0 is OBJID_WINDOW
+	if idObject != OBJID_WINDOW { // 0 is OBJID_WINDOW
 		return 0 // WinEvent callbacks return 0 (no chaining)
 	}
 
@@ -5175,33 +5188,34 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	var untrackedEvent bool = false
 
 	switch event {
-	case 0x0003:
+	case EVENT_SYSTEM_FOREGROUND: //0x0003:
 		eventName = "EVENT_SYSTEM_FOREGROUND"
-	case 0x0008:
-		eventName = "EVENT_SYSTEM_MENUSTART"
-	case 0x0009:
-		eventName = "EVENT_SYSTEM_MENUEND"
-	case 0x4002:
+	case EVENT_SYSTEM_CAPTURESTART: //0x0008:
+		eventName = "EVENT_SYSTEM_CAPTURESTART"
+	case EVENT_SYSTEM_CAPTUREEND: //0x0009:
+		eventName = "EVENT_SYSTEM_CAPTUREEND"
+	case EVENT_CONSOLE_UPDATE_REGION: //0x4002:
 		//This fires when an object (window, button, menu item) is made visible. During a Regedit search,
 		// it might fire if the UI is dynamically popping elements in and out of the view.
-		eventName = "EVENT_OBJECT_SHOW"
-	case 0x4005:
-		//It fires every time a window or an element moves or changes size.
-		eventName = "EVENT_OBJECT_LOCATIONCHANGE"
+		eventName = "EVENT_CONSOLE_UPDATE_REGION"
 		untrackedEvent = true
-	case 0x8000:
+	case EVENT_CONSOLE_LAYOUT: // 0x4005:
+		//It fires every time a window or an element moves or changes size.
+		eventName = "EVENT_CONSOLE_LAYOUT"
+		untrackedEvent = true
+	case EVENT_OBJECT_CREATE: //0x8000:
 		eventName = "EVENT_OBJECT_CREATE"
 		untrackedEvent = true
-	case 0x8001:
+	case EVENT_OBJECT_DESTROY: //0x8001:
 		eventName = "EVENT_OBJECT_DESTROY"
 		untrackedEvent = true
-	case 0x8002:
+	case EVENT_OBJECT_SHOW: //0x8002:
 		eventName = "EVENT_OBJECT_SHOW"
-	case 0x8003:
+	case EVENT_OBJECT_HIDE: // 0x8003:
 		eventName = "EVENT_OBJECT_HIDE"
-	case 0x8004:
+	case EVENT_OBJECT_REORDER: //0x8004:
 		eventName = "EVENT_OBJECT_REORDER"
-	case 0x8005:
+	case EVENT_OBJECT_FOCUS: // 0x8005:
 		eventName = "EVENT_OBJECT_FOCUS"
 	default:
 		// Return early if it's an event we aren't tracking to keep logs clean
@@ -5233,7 +5247,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	}
 
 	var pid uint32
-	if shouldLogFocusChanges || event == 0x0003 /*EVENT_SYSTEM_FOREGROUND*/ {
+	if shouldLogFocusChanges || event == EVENT_SYSTEM_FOREGROUND /*0x0003*/ {
 		//then pid is needed in one OR two places
 		procGetWindowThreadProcessID.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
 		//"Pro-tip: You don't need to check err for this specific API because it doesn't set LastError in the traditional way; you just check if the return value (or the written pid variable) is 0. Your current check if pid == 0 is the correct way to handle it." - gemini 3 Fast
@@ -5353,3 +5367,38 @@ func getWindowTextFast(hwnd windows.Handle) string {
 	}
 	return windows.UTF16ToString(buf[:res1.R1])
 }
+
+// Package-level. Non-nil = capture is currently held for that session pointer.
+var captureHeldForSession atomic.Pointer[dragSession]
+
+// WinEvent hook flags (SetWinEventHook dwFlags argument).
+const (
+	WINEVENT_OUTOFCONTEXT   uint32 = 0x0000 // callback delivered out-of-context (different process)
+	WINEVENT_SKIPOWNPROCESS uint32 = 0x0002 // suppress events originating in our own process
+)
+
+// WinEvent event codes.
+// The hook registered in runApplication covers EVENT_SYSTEM_FOREGROUND..EVENT_OBJECT_FOCUS,
+// which incidentally includes the 0x4xxx console-event band.
+const (
+	// System events
+	EVENT_SYSTEM_FOREGROUND   uint32 = 0x0003
+	EVENT_SYSTEM_CAPTURESTART uint32 = 0x0008 // a window acquired mouse capture
+	EVENT_SYSTEM_CAPTUREEND   uint32 = 0x0009 // mouse capture was released
+
+	// Console events (received because hook range 0x0003–0x8005 spans 0x4xxx)
+	EVENT_CONSOLE_UPDATE_REGION uint32 = 0x4002
+	EVENT_CONSOLE_LAYOUT        uint32 = 0x4005
+
+	// Object events
+	EVENT_OBJECT_CREATE  uint32 = 0x8000
+	EVENT_OBJECT_DESTROY uint32 = 0x8001
+	EVENT_OBJECT_SHOW    uint32 = 0x8002
+	EVENT_OBJECT_HIDE    uint32 = 0x8003
+	EVENT_OBJECT_REORDER uint32 = 0x8004
+	EVENT_OBJECT_FOCUS   uint32 = 0x8005
+)
+
+// OBJID_WINDOW is the idObject value meaning the event concerns the window itself,
+// not a child control, caret, or accessibility item.
+const OBJID_WINDOW int32 = 0
