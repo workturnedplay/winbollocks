@@ -3473,8 +3473,11 @@ func deinit() {
 	if hookThreadID != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
 		procPostThreadMessage.Call(uintptr(hookThreadID), WM_QUIT, 0, 0)
+		//FIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho)
 	}
 	if deinitThreadID == hookThreadID {
+		logf("BUG: deinit() should never run from hook thread!")
+
 		//XXX:The rule is: The thread that calls SetWindowsHookEx MUST be the thread that calls UnhookWindowsHookEx.
 		//noFIXME: won't the above run the below as defer-ers and thus race ? actually can I even unhook those from this diff. thread?! it won't because those are in defer-ers too, so deferers are serialized.
 		if mouseHook != 0 {
