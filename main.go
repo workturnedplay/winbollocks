@@ -227,6 +227,7 @@ var (
 	// procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
 	// procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
 	procSetCapture            = wincoe.NewBoundProc(user32, "SetCapture", wincoe.CheckNone)
+	procGetCapture            = wincoe.NewBoundProc(user32, "GetCapture", wincoe.CheckNone)
 	procSetConsoleCtrlHandler = wincoe.NewBoundProc(kernel32, "SetConsoleCtrlHandler", wincoe.CheckBool)
 	procGetForegroundWindow   = wincoe.NewBoundProc(user32, "GetForegroundWindow", wincoe.CheckNone)
 
@@ -1203,17 +1204,12 @@ func injectLMBDown() {
 			Type: INPUT_MOUSE,
 			Ki:   KEYBDINPUT{}, // union placeholder
 		},
-		// {
-		// 	Type: INPUT_MOUSE,
-		// 	Ki:   KEYBDINPUT{}, // union placeholder
-		// },
 	}
 
 	// Fill the union as MOUSEINPUT
 	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
-	//(*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
 
-	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
+	//Your inject (MOUSEEVENTF_LEFTDOWN): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
 
 	//SendInput is synchronous—blocks until inputs queued/processed by system. In WH_MOUSE_LL (global, synchronous chain), this blocks all mouse input until done.
 	//SendInput is synchronous — blocks caller until inputs queued to system queue (not processed).
@@ -1255,12 +1251,6 @@ func initDPIAwareness() {
 		}
 	}
 }
-
-// func winKeyDown() bool {
-// l, _, _ := procGetAsyncKeyState.Call(VK_LWIN)
-// r, _, _ := procGetAsyncKeyState.Call(VK_RWIN)
-// return (l&0x8000 != 0) || (r&0x8000 != 0)
-//}
 
 func windowFromPoint(pt POINT) windows.Handle {
 	res1 := procWindowFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt)))
@@ -1459,14 +1449,19 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 		uintptr(unsafe.Pointer(&r)),
 	)
 
-	//	procSetCapture.Call(0) // capture to current thread
-	procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window:
+	_ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: FIXME: window was made by another thread!
+	// Now verify on the SAME thread that should own it
+	res2 := procGetCapture.Call()
+	if windows.Handle(res2.R1) != mainMsgHwnd {
+		logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+		// handle recovery (e.g. post message to main thread to retry)
+	}
+
 	// This ensures:
 	//mouse capture is owned by your thread
 	//capture is released cleanly
 	//no weird input edge cases
 
-	//currentDrag = &dragState{startPt: pt, startRect: r}
 	// Both variables are published to the rest of the application simultaneously
 
 	if cur := activeSession.Load(); cur != nil {
@@ -1484,10 +1479,7 @@ func startDrag(hwnd windows.Handle, pt POINT) bool {
 
 	pid := getWindowPID(hwnd)
 	targetIL, e1 := processIntegrityLevel(pid)
-	//selfIL, e2 := processIntegrityLevel(uint32(windows.GetCurrentProcessId())) //bugged it said, it noticed.
-	// #nosec G115 --- it's actually uint32 wrapped in an int
 
-	//selfIL, e2 := processIntegrityLevel(selfPID)
 	if e1 == nil && targetIL > selfIntegrityLevel {
 		//XXX: this actually never gets reached because windows doesn't allow winbollocks to see the events(while higher itegrity window is focused) thus the gesture to drag it can never trigger!
 		procName := getProcessNameFast(pid)
@@ -1497,9 +1489,7 @@ func startDrag(hwnd windows.Handle, pt POINT) bool {
 	if e1 != nil {
 		logf("e1: %v", e1)
 	}
-	//if e2 != nil {
-	//		logf("e2: %v", e2)
-	//	}
+
 	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
 	if isMaximized(hwnd) {
 		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
@@ -1565,7 +1555,6 @@ func initOverlay() error {
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = windows.NewCallback(overlayWndProc)
 	wc.LpszClassName = className
-	//hinst, _, _ := procGetModuleHandle.Call(0)
 	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
 	if res1.Failed() {
 		return fmt.Errorf("failed GetModuleHandle(0) in initOverlay(), err: %w", res1.Err)
@@ -2000,7 +1989,7 @@ func logLMBState(prefix string) {
 }
 
 /* ---------------- Mouse Hook ---------------- */
-const fiveMs = 5 * time.Millisecond // aka 5 million ns aka nanosec
+const fiveMs time.Duration = 5 * time.Millisecond // aka 5 million ns aka nanosec
 
 /*
 "High-input scenarios (gaming, rapid typing) may queue many events, but your callbacks still run one-by-one — the queue just grows temporarily. If you take too long in a callback (> ~1 second, controlled by LowLevelHooksTimeout registry key), Windows may drop or timeout subsequent calls, but it won't parallelize them." - Grok
@@ -2481,7 +2470,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				initialAspectRatio: float64(w) / float64(h),
 			})
 
-			procSetCapture.Call(uintptr(mainMsgHwnd))
+			_ = procSetCapture.Call(uintptr(mainMsgHwnd)) //FIXME: The thread that calls SetCapture must be the thread that created the window. Calling it cross-thread from the hook worker leads to silent failure, erratic capture, or no capture at all.
+			// Now verify on the SAME thread that should own it
+			res2 := procGetCapture.Call()
+			if windows.Handle(res2.R1) != mainMsgHwnd {
+				logf("in mouseProc, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
+				// handle recovery (e.g. post message to main thread to retry)
+			}
 
 			if nowDiff := time.Since(start); nowDiff > fiveMs {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())

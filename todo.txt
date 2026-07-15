@@ -1,4 +1,5 @@
 todo:
+* fix some big issues in v0.1.0 (done: todo: 1,2,3,4): https://gemini.google.com/app/5fe7cce3ffd63bc6
 * extract constants like EVENT_SYSTEM_FOREGROUND
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, now they're hidden behind(because of) WinResult (the return from .Call()) !
 
