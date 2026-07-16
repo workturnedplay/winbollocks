@@ -5064,6 +5064,7 @@ func primary_defer() { //primary defer
 		releaseSingleInstance() // don't hog the mutex while waiting for key, else program exit cleans it.
 
 		if startupTerminalHwnd != 0 {
+			//this isn't reached if compiled with 'go build -ldflags="-H=windowsgui" ' because it's 0
 			logf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
 			// Use your existing thread-attaching focus method to bypass UIPI/Focus Stealing Prevention
 			forceForeground(startupTerminalHwnd)
