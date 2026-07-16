@@ -2704,7 +2704,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 			/*
 				(alt+z to toggle word wrapping)
-				Claude 5 Sonnet Extra Thinking said:
+				Claude 5 Sonnet High Thinking said:
 				"Honest caveat: your app also takes mouse capture (SetCapture(mainMsgHwnd)) once the first move is processed, and releases it via a posted (async) message from softReset. So there's a small theoretical race where, right at button-release, capture might not have been relinquished yet by the time this up-event is routed — in which case it'd go to your hidden window instead of conhost, not fixing the "stuck" state that one time. In practice, for any drag lasting more than a few ms (i.e. essentially all real drags), the posted release will have long since been processed, so this should work correctly the overwhelming majority of the time. If you find it's still occasionally sticky in testing, the more bulletproof fix is to have softReset post the capture-release and then, only for recovery sessions, post a second message that gets processed after it and re-injects a synthetic up-click via SendInput from the main thread (same pattern as WM_INJECT_SEQUENCE) — I didn't implement that since it's meaningfully more invasive and worth validating the simple fix first."
 			*/
 
