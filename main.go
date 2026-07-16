@@ -767,6 +767,19 @@ type dragSession struct {
 	resizeZone         int
 	mode               DragMode
 	initialAspectRatio float64
+
+	// viaMissedGestureRecovery is true when this session was started by the
+	// missed-gesture recovery path (see checkForMissedGestureOnNextMove)
+	// instead of a real WM_LBUTTONDOWN/WM_RBUTTONDOWN our hook actually saw
+	// and swallowed. In that case the initiating LMB/RMB-down was delivered
+	// to the target window normally (our hooks were blind to it while a
+	// higher-integrity window still had the foreground), so the target's
+	// own input state (e.g. a console starting a text selection on
+	// LMB-down) genuinely believes the button is held. Its eventual up-event
+	// must reach it normally instead of being swallowed like an ordinary
+	// gesture's, or the target is left stuck thinking the button is still
+	// down — see mouseProc's WM_LBUTTONUP/WM_RBUTTONUP and WM_MOUSEMOVE handling.
+	viaMissedGestureRecovery bool
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -1506,7 +1519,7 @@ func showTrayInfo(title, msg string) {
 
 /* ---------------- Drag Logic ---------------- */
 
-func startManualDrag(hwnd windows.Handle, pt POINT) {
+func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) {
 	var r RECT
 	procGetWindowRect.Call(
 		uintptr(hwnd),
@@ -1535,13 +1548,14 @@ func startManualDrag(hwnd windows.Handle, pt POINT) {
 		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
 	}
 	activeSession.Store(&dragSession{
-		targetWnd: hwnd,
-		mode:      ModeMove,
-		state:     dragState{startPt: pt, startRect: r},
+		targetWnd:                hwnd,
+		mode:                     ModeMove,
+		state:                    dragState{startPt: pt, startRect: r},
+		viaMissedGestureRecovery: viaMissedGestureRecovery,
 	})
 }
 
-func startDrag(hwnd windows.Handle, pt POINT) bool {
+func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) bool {
 	pid := getWindowPID(hwnd)
 	targetIL, e1 := processIntegrityLevel(pid)
 
@@ -1561,7 +1575,7 @@ func startDrag(hwnd windows.Handle, pt POINT) bool {
 		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
 		//TODO: should I re-maximize if it was maximized, after drag/move is done?
 	}
-	startManualDrag(hwnd, pt)
+	startManualDrag(hwnd, pt, viaMissedGestureRecovery)
 	return true
 }
 
@@ -1585,7 +1599,12 @@ func startDrag(hwnd windows.Handle, pt POINT) bool {
 // If a ModeResize session is active instead, this is a no-op (finish the
 // resize first), matching prior behavior. Returns false if there's no
 // window under pt, or a resize is already running.
-func tryBeginMoveGestureAt(pt POINT) bool {
+//
+// viaMissedGestureRecovery must be true only when called from the
+// missed-gesture recovery path (we never saw/swallowed the real LMB-down),
+// and false when called from the real WM_LBUTTONDOWN handler (we did). It's
+// stored on the resulting dragSession — see dragSession.viaMissedGestureRecover
+func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	wantTargetWnd := windowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)")
@@ -1631,7 +1650,7 @@ func tryBeginMoveGestureAt(pt POINT) bool {
 		softReset(true)
 	}
 	//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
-	if !startDrag(wantTargetWnd, pt) {
+	if !startDrag(wantTargetWnd, pt, viaMissedGestureRecovery) {
 		return false
 	}
 	//so startDrag succeeded if we're here
@@ -1655,7 +1674,7 @@ func tryBeginMoveGestureAt(pt POINT) bool {
 // tryBeginResizeGestureAt is tryBeginMoveGestureAt's ModeResize counterpart,
 // used by both the real WM_RBUTTONDOWN handler and the missed-gesture
 // recovery path from WM_MOUSEMOVE.
-func tryBeginResizeGestureAt(pt POINT) bool {
+func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	wantTargetWnd := windowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window, window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)")
@@ -1705,8 +1724,9 @@ func tryBeginResizeGestureAt(pt POINT) bool {
 		mode:      ModeResize,
 		state:     dragState{startPt: pt, startRect: r},
 
-		resizeZone:         getResizeZone(pt, r),
-		initialAspectRatio: float64(w) / float64(h),
+		resizeZone:               getResizeZone(pt, r),
+		initialAspectRatio:       float64(w) / float64(h),
+		viaMissedGestureRecovery: viaMissedGestureRecovery,
 	})
 	return true
 }
@@ -2310,7 +2330,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
 			}
 
-			tryBeginMoveGestureAt(info.Pt) // return value ignored: started, restarted, or ignored, we swallow LMB regardless.
+			tryBeginMoveGestureAt(info.Pt, false) // return value ignored: started, restarted, or ignored, we swallow LMB regardless.
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter8 %d ns", nowDiff.Nanoseconds())
@@ -2344,15 +2364,15 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 								winGestureUsed.Store(true)
 								injectShiftTapOnly()
 							}
-							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need for this.")
-							tryBeginMoveGestureAt(info.Pt)
+							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
+							tryBeginMoveGestureAt(info.Pt, true)
 						case keyDown(VK_RBUTTON):
 							if !winGestureUsed.Load() {
 								winGestureUsed.Store(true)
 								injectShiftTapOnly()
 							}
-							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need for this.")
-							tryBeginResizeGestureAt(info.Pt)
+							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
+							tryBeginResizeGestureAt(info.Pt, true)
 						}
 						session = activeSession.Load() // may now be non-nil
 					}
@@ -2367,6 +2387,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			if requireWinDownHeldDuringGesture.Load() {
 				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 				if !winDown {
+					//FIXME: shouldn't I also stop drag if LMB (for ModeMove) or RMB(for ModeResize) aren't also down?! especially when unlocking a Winkey+L locked Desktop which was locked while doing any of the two gestures(ie. winkey+LMB drag to move, then pressed L without first releasing any of winkey or LMB, but then unlocked with both being released which means we didn't sense them being released)
 					logf("winkey is no longer down, stopping drag")
 					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
 					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
@@ -2566,13 +2587,38 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//} //second 'if', for resizing
 		} //switch
 
+		// if session != nil && session.viaMissedGestureRecovery {//XXX: doesn't work since it eats moves globally, it won't move on drag, it snaps back to origin.
+		// 	// This session's LMB/RMB-down was never seen/swallowed by us,
+		// 	// so the target window's own button-driven state (e.g. a
+		// 	// console's in-progress text selection) is genuinely still
+		// 	// active and would keep extending on every move we let through,
+		// 	// on top of us repositioning the window ourselves. Our own
+		// 	// move/resize logic above already has everything it needs
+		// 	// straight from MSLLHOOKSTRUCT, so nothing depends on the
+		// 	// target actually receiving these — swallow them for the
+		// 	// duration of a recovery-started drag.
+		// 	return 1 //swallow
+		// 	//Trade-off worth knowing: this swallows WM_MOUSEMOVE system-wide (low-level hooks see raw input, before any per-window routing),
+		// 	// so other apps briefly stop getting hover/move updates while a recovery-drag is in progress.
+		// 	// Given this path only triggers in the rare "switched away from an elevated window" case,
+		// 	// that seems like a good trade for killing the selection-growth bug.
+		// }
+
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
 		session := activeSession.Load()
 		if session == nil {
 			break // No drag or resize is active, do nothing!
 		}
 		if session.mode == ModeMove {
+			viaRecovery := session.viaMissedGestureRecovery
 			softReset(true) // this means that when winkey goes UP it will make sure from keyboardProc that start menu doesn't pop up!
+			if viaRecovery {
+				// This session's LMB-down was never seen/swallowed by us, so the
+				// target's own state (e.g. a console mid-selection) genuinely
+				// needs this LMB-up delivered normally, or it's left stuck
+				// thinking LMB is still down until the user clicks it again.
+				break // let it fall thru so CallNextHookEx is also called!
+			}
 
 			//return 0 //0 is to let it thru (1 was to swallow)
 			//XXX: let it fall thru so CallNextHookEx is also called!
@@ -2587,11 +2633,21 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			break // No drag or resize is active, do nothing!
 		}
 		if session.mode == ModeResize {
+			viaRecovery := session.viaMissedGestureRecovery
 			//if resizing.Load() && currentDrag != nil {
 			softReset(true)
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // FIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
 			}
+			if viaRecovery {
+				// See the identical comment in WM_LBUTTONUP.
+				break
+			}
+			/*
+				(alt+z to toggle word wrapping)
+				Claude 5 Sonnet Extra Thinking said:
+				"Honest caveat: your app also takes mouse capture (SetCapture(mainMsgHwnd)) once the first move is processed, and releases it via a posted (async) message from softReset. So there's a small theoretical race where, right at button-release, capture might not have been relinquished yet by the time this up-event is routed — in which case it'd go to your hidden window instead of conhost, not fixing the "stuck" state that one time. In practice, for any drag lasting more than a few ms (i.e. essentially all real drags), the posted release will have long since been processed, so this should work correctly the overwhelming majority of the time. If you find it's still occasionally sticky in testing, the more bulletproof fix is to have softReset post the capture-release and then, only for recovery sessions, post a second message that gets processed after it and re-injects a synthetic up-click via SendInput from the main thread (same pattern as WM_INJECT_SEQUENCE) — I didn't implement that since it's meaningfully more invasive and worth validating the simple fix first."
+			*/
 
 			return 1 // Swallow
 		}
@@ -2607,7 +2663,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				injectShiftTapOnly() // prevent releasing of winkey later from popping up Start menu!
 			}
 
-			tryBeginResizeGestureAt(info.Pt) // return value ignored: started, restarted, or ignored, we swallow RMB regardless.
+			tryBeginResizeGestureAt(info.Pt, false) // return value ignored: started, restarted, or ignored, we swallow RMB regardless.
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
@@ -3444,7 +3500,16 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as: if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false)
 			coalesceEventsText := mustUTF16("Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps")
 			immediateOverlayRepaintText := mustUTF16("Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints")
-			missedGestureRecoveryText := mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (e.g. Task Manager, unelevated)")
+			var missedGestureRecoveryText *uint16
+			if isAdmin {
+				// Ordinary windows can no longer outrank us once elevated (High IL), so
+				// this now only matters for the rarer System-integrity foreground
+				// windows. Not greyed out: that edge case is uncommon but real, and the
+				// IL comparison in winEventProc already makes this a no-op otherwise.
+				missedGestureRecoveryText = mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (you're elevated, so this now only matters for rarer System-integrity windows)")
+			} else {
+				missedGestureRecoveryText = mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (e.g. Task Manager) (you're not elevated)")
+			}
 
 			exitText := mustUTF16("Exit")
 
@@ -4365,11 +4430,12 @@ func init() {
 	immediateOverlayRepaint.Store(false)          // default to false
 	foregroundWasHigherIntegrity.Store(false)     // no known-blocked foreground yet
 	checkForMissedGestureOnNextMove.Store(false)  // nothing to recover yet
-	missedGestureRecoveryEnabled.Store(!isAdmin)  // default on if not admin
+
+	//"But there genuinely are windows that can outrank even an elevated High-IL process: anything running at System integrity (0x4000) — some SYSTEM-owned services with UI, certain security-related dialogs, etc. It's rare, but real. " -Claude
+	missedGestureRecoveryEnabled.Store(!isAdmin) // default on if not admin
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
-	//nowOffset := time.Now().Sub(appStartTime)
 	nowOffset := time.Since(appStartTime)
 	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
 	lastRateLogTime.Store(int64(nowOffset))
@@ -4951,6 +5017,8 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 			winEventHook = 0
 			logf("normal unhooking of winEventHook, from main thread")
 		}()
+
+		initForegroundIntegrityState() //"This runs synchronously, single-threaded, before the message loop starts pumping — so there's no race with winEventProc itself (it literally can't fire yet)." - Claude
 	}
 
 	if err5 := initOverlay(); err5 != nil {
@@ -5736,3 +5804,40 @@ const (
 // OBJID_WINDOW is the idObject value meaning the event concerns the window itself,
 // not a child control, caret, or accessibility item.
 const OBJID_WINDOW int32 = 0
+
+// initForegroundIntegrityState seeds foregroundWasHigherIntegrity with the
+// integrity level of whatever window currently has the foreground, at the
+// moment winEventHook is installed. Without this, missed-gesture recovery
+// never arms on the very first switch away from an already-elevated
+// foreground window (e.g. Task Manager, if it was already focused before
+// winbollocks started) — only from the second time onward, once
+// winEventProc had a chance to observe a real transition *into* such a
+// window while our hook was already active.
+func initForegroundIntegrityState() {
+	res1 := procGetForegroundWindow.Call()
+	if res1.Failed() {
+		logf("initForegroundIntegrityState: GetForegroundWindow failed, err: %v", res1.Err)
+		return
+	}
+	hwnd := windows.Handle(res1.R1)
+	if hwnd == 0 {
+		return // no foreground window right now; nothing to seed
+	}
+
+	pid := getWindowPID(hwnd)
+	if pid == 0 {
+		logf("initForegroundIntegrityState: couldn't get PID for current foreground HWND=0x%X", hwnd)
+		return
+	}
+
+	il, err := processIntegrityLevel(pid)
+	if err != nil {
+		logf("initForegroundIntegrityState: processIntegrityLevel failed for PID %d (HWND=0x%X), err: %v", pid, hwnd, err)
+		return
+	}
+
+	if il > selfIntegrityLevel {
+		foregroundWasHigherIntegrity.Store(true)
+		logf("initForegroundIntegrityState: current foreground HWND=0x%X (PID=%d, IL=0x%x) is already higher integrity than us (0x%x); seeded foregroundWasHigherIntegrity=true so missed-gesture recovery can arm on the next foreground change.", hwnd, pid, il, selfIntegrityLevel)
+	}
+}
