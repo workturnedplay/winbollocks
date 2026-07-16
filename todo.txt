@@ -1,4 +1,5 @@
 todo:
+* fixes for v0.6.0 (todo: 1,2,3_1,3_2 done:) from here: https://gemini.google.com/app/3721acef35215c20
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 * do I want to bring focused to front(on drag/move gesture) no matter what (or check if not in front first?) this way, if I winkey+MMB (send it to back) then winkey+click it to drag/move it, it won't remain in the back it will be brought to front. But this should be a systray on/off setting.
 * make an option which when on then when currently focused window is fullscreen or borderless fullscreen (if detectable ofc) then don't try to use the gestures ie. bypass the code checking for them, so for example: winkey held down code won't activate, this way, any kind of theoretical slowdown on input(due to calls to getasyncstate or saving/reading atomic bools) will be removed. - it's more expensive than just checking for keys to activate, if I do it in the same place (in hooks), but maybe if I do it in some specific on focus hook then it would work.
