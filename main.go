@@ -987,33 +987,55 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 	return x, y, w, h
 }
 
+// injectShiftTapOnly uses the unassigned vkE8 key to mask the Winkey.
+// It is guaranteed to register as a state change, disarming the Start menu,
+// even if Shift, Ctrl, or Alt are currently held down.
+//
+// old info:
 // this way when winUP happens it won't pop up start menu
 // this doesn't work in this one case only: if(in this order!) shift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release shift, it pops startmenu!
 // but it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!
+//
+// fixed now: using "Unassigned virtual key (vkE8)"(instead of RShift) as per Gemini 3.1 Pro 's suggestion did fix the above case ^!
 func injectShiftTapOnly() {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
+	// inputs := []INPUT{
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
+	// 			//WVk: VK_E,
+	// 			//WScan:   0x12, // scancode for 'E',
+	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+	// 			DwFlags: KEYEVENTF_SCANCODE,
+	// 		},
+	// 	},
+	// 	{ // putting this after winUP below has same effect!
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			//WVk:     VK_SHIFT,
+	// 			//WVk: VK_E,
+	// 			//DwFlags: KEYEVENTF_KEYUP,
+	// 			//WScan:   0x12, // 'E' key
+	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+	// 			DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+	// 		},
+	// 	},
+	// }
 	inputs := []INPUT{
 		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
-				//WVk: VK_E,
-				//WScan:   0x12, // scancode for 'E',
-				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-				DwFlags: KEYEVENTF_SCANCODE,
+				WVk: 0xE8, // Unassigned virtual key (vkE8)
 			},
 		},
-		{ // putting this after winUP below has same effect!
+		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				//WVk:     VK_SHIFT,
-				//WVk: VK_E,
-				//DwFlags: KEYEVENTF_KEYUP,
-				//WScan:   0x12, // 'E' key
-				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+				WVk:     0xE8,
+				DwFlags: KEYEVENTF_KEYUP,
 			},
 		},
 	}
@@ -1029,30 +1051,55 @@ func injectShiftTapOnly() {
 		//	logf("done injectShiftTapOnly")
 	}
 }
+
+// injectShiftTapThenWinUp injects the vkE8 dummy tap(ie. down then up) [instead of RShift which had an edge case!] followed by the Win UP event.
+// This prevents Start Menu from poping/showing up.
 func injectShiftTapThenWinUp(whichWinUp uint16) {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
+	// inputs := []INPUT{
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
+	// 			//WVk: VK_E,
+	// 			//WScan:   0x12, // scancode for 'E',
+	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+	// 			DwFlags: KEYEVENTF_SCANCODE,
+	// 		},
+	// 	},
+	// 	{ // putting this after winUP below has same effect!
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			//WVk:     VK_SHIFT,
+	// 			//WVk: VK_E,
+	// 			//DwFlags: KEYEVENTF_KEYUP,
+	// 			//WScan:   0x12, // 'E' key
+	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
+	// 			DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+	// 		},
+	// 	},
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			WVk:     whichWinUp,
+	// 			DwFlags: KEYEVENTF_KEYUP,
+	// 		},
+	// 	},
+	// }
 	inputs := []INPUT{
 		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
-				//WVk: VK_E,
-				//WScan:   0x12, // scancode for 'E',
-				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-				DwFlags: KEYEVENTF_SCANCODE,
+				WVk: 0xE8, // Unassigned virtual key (vkE8)
 			},
 		},
-		{ // putting this after winUP below has same effect!
+		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				//WVk:     VK_SHIFT,
-				//WVk: VK_E,
-				//DwFlags: KEYEVENTF_KEYUP,
-				//WScan:   0x12, // 'E' key
-				WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+				WVk:     0xE8,
+				DwFlags: KEYEVENTF_KEYUP,
 			},
 		},
 		{
