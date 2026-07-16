@@ -2396,14 +2396,41 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			if requireWinDownHeldDuringGesture.Load() {
 				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 				if !winDown {
-					//FIXME: shouldn't I also stop drag if LMB (for ModeMove) or RMB(for ModeResize) aren't also down?! especially when unlocking a Winkey+L locked Desktop which was locked while doing any of the two gestures(ie. winkey+LMB drag to move, then pressed L without first releasing any of winkey or LMB, but then unlocked with both being released which means we didn't sense them being released)
+					//cantFIXME: shouldn't I also stop drag if LMB (for ModeMove) or RMB(for ModeResize) aren't also down?! especially when unlocking a Winkey+L locked Desktop which was locked while doing any of the two gestures(ie. winkey+LMB drag to move, then pressed L without first releasing any of winkey or LMB, but then unlocked with both being released which means we didn't sense them being released). It doesn't work, checking async state reports it's actually UP not down because we swallowed it!
 					logf("winkey is no longer down, stopping drag")
-					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... yes this should work! async state isn't affected by any of our 'return 1' aka swallow the event!
+					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... won't work because we ate LMB down and async state depends on us not eating it.
 					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
 
 					break //exit case/switch!
 				}
 			}
+
+			//XXX: doesn't work, because we eat LMB via 'return 1' the async state reports it as UP not down!
+			// // doneFIXME: also stop dragging if LMB itself is no longer physically
+			// // held, independently of requireWinDownHeldDuringGesture above. This
+			// // catches the Winkey+L case: lock mid-drag (winkey+LMB still held), type
+			// // the password on the secure desktop (which necessarily releases both,
+			// // but our hook never sees either up-event since it isn't invoked on the
+			// // secure desktop), then unlock. Without this, a stale ModeMove session
+			// // would survive the lock/unlock cycle and keep "dragging" the window on
+			// // every subsequent mouse move, with nothing actually held down.
+			// //
+			// // This relies on GetAsyncKeyState(VK_LBUTTON) reflecting the real
+			// // hardware state even though our hook swallowed the original
+			// // WM_LBUTTONDOWN — the same assumption the winDown check above already
+			// // makes for VK_LWIN, and borne out by the missed-gesture recovery logic
+			// // below, which reads keyDown(VK_LBUTTON) for a down-event our hook never
+			// // even saw. We skip this for a viaMissedGestureRecovery session: starting
+			// // one deliberately injects a synthetic LMB-up (see the recovery branch in
+			// // WM_MOUSEMOVE below) so the target's own click-drag state doesn't fight
+			// // our window move — which would make this check fire immediately on an
+			// // entirely ordinary recovery-drag. Those sessions rely on the real
+			// // WM_LBUTTONUP reaching us instead (see its handling below).
+			// if !session.viaMissedGestureRecovery && !keyDown(VK_LBUTTON) {
+			// 	logf("LMB is no longer down (its up-event was likely missed, e.g. due to a Winkey+L lock/unlock during the drag), stopping drag-move for HWND=0x%X", session.targetWnd)
+			// 	hardReset(true)
+			// 	break
+			// }
 
 			if !ShouldThrottle() {
 				// At the very beginning of the drag/move logic (e.g., right after checking if dragging is active)
@@ -2547,13 +2574,23 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 				if !winDown {
 					logf("winkey is no longer down, stopping resize")
-					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
-					//stopDrag = true
+					//don't think of doing this if RMB is no longer down also, it won't work because we 'return 1' on RMB so async state will see it UP, logically.
+					// See the identical comment(s) in the ModeMove case above
 					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
 
 					break //exit case/switch!
 				}
 			}
+
+			//XXX: doesn't work, because we eat RMB via 'return 1' the async state reports it as UP not down!
+			// // See the identical comment in the ModeMove case above; RMB is
+			// // ModeResize's equivalent of ModeMove's LMB.
+			// if !session.viaMissedGestureRecovery && !keyDown(VK_RBUTTON) {
+			// 	logf("RMB is no longer down (its up-event was likely missed, e.g. due to a Winkey+L lock/unlock during the resize), stopping resize for HWND=0x%X", session.targetWnd)
+			// 	hardReset(true)
+			// 	break
+			// }
+
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
