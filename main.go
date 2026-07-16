@@ -2398,7 +2398,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				if !winDown {
 					//FIXME: shouldn't I also stop drag if LMB (for ModeMove) or RMB(for ModeResize) aren't also down?! especially when unlocking a Winkey+L locked Desktop which was locked while doing any of the two gestures(ie. winkey+LMB drag to move, then pressed L without first releasing any of winkey or LMB, but then unlocked with both being released which means we didn't sense them being released)
 					logf("winkey is no longer down, stopping drag")
-					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... actually i can't do it due to winkey+L and because we eat LMB Down so async state cannot be used to check it!
+					//nevermindTODO: make systray option to keep dragging even if winkey's no longer down(bad idea for winkey+L case, see todo.txt about it), once initiated. But this means the edge case with Winkey+L (search for it above) can happen! unless i check if LMB is still down in async state here hmmm... yes this should work! async state isn't affected by any of our 'return 1' aka swallow the event!
 					hardReset(true) //XXX: resets gesture used which means doesn't prevent a winUP from popping start menu, this is correct because we detected winkey as being UP here!
 
 					break //exit case/switch!
