@@ -173,6 +173,7 @@ var (
 	psapi    = windows.NewLazySystemDLL("psapi.dll")
 	advapi32 = windows.NewLazySystemDLL("advapi32.dll")
 	ntdll    = windows.NewLazySystemDLL("ntdll.dll")
+	wtsapi32 = windows.NewLazySystemDLL("wtsapi32.dll")
 
 	// procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
 	procNtSetInformationProcess = wincoe.NewBoundProc(ntdll, "NtSetInformationProcess", wincoe.CheckNTSTATUS) // NTSTATUS (0 == success)
@@ -362,6 +363,9 @@ var (
 	// procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
 	procSetWinEventHook = wincoe.NewBoundProc(user32, "SetWinEventHook", wincoe.CheckNull)
 	procUnhookWinEvent  = wincoe.NewBoundProc(user32, "UnhookWinEvent", wincoe.CheckBool)
+
+	procWTSRegisterSessionNotification   = wincoe.NewBoundProc(wtsapi32, "WTSRegisterSessionNotification", wincoe.CheckBool)
+	procWTSUnRegisterSessionNotification = wincoe.NewBoundProc(wtsapi32, "WTSUnRegisterSessionNotification", wincoe.CheckBool)
 )
 
 /* ---------------- Constants ---------------- */
@@ -424,6 +428,15 @@ const (
 const (
 	WM_QUERYENDSESSION = 0x0011
 	WM_ENDSESSION      = 0x0016
+)
+
+const (
+	WM_WTSSESSION_CHANGE = 0x02B1
+
+	WTS_SESSION_LOCK   = 0x7
+	WTS_SESSION_UNLOCK = 0x8
+
+	NOTIFY_FOR_THIS_SESSION = 0
 )
 
 const (
@@ -3412,6 +3425,17 @@ func UnpackLParam(lParam uintptr) (x, y int32) {
 	return x, y
 }
 
+func wtsSessionChangeName(code uintptr) string {
+	switch code {
+	case WTS_SESSION_LOCK:
+		return "lock"
+	case WTS_SESSION_UNLOCK:
+		return "unlock"
+	default:
+		return fmt.Sprintf("0x%x", code)
+	}
+}
+
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_DO_SETWINDOWPOS:
@@ -3455,6 +3479,51 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			logf("in wndProc, WM_DO_RELEASE_CAPTURE: previous owner was unexpected 0x%X (mainMsgHwnd=0x%X)", prev, mainMsgHwnd)
 		}
 
+		return 0
+
+	case WM_WTSSESSION_CHANGE:
+		switch wParam {
+		case WTS_SESSION_LOCK, WTS_SESSION_UNLOCK:
+			// Real key/button releases that happen on the secure desktop
+			// while locked are invisible to our low-level hooks (it's a
+			// separate desktop object entirely), so two independent pieces
+			// of state can go stale across a lock/unlock cycle:
+			//
+			//  1. winGestureUsed can be left stuck 'true' if the physical
+			//     winkey-up happened on the secure desktop: keyboardProc
+			//     never ran to clear it or inject the compensating
+			//     synthetic up (see its WM_KEYUP/WM_SYSKEYUP handling),
+			//     yet the real winkey is genuinely up again once we
+			//     unlock. Left stuck, some unrelated future stand-alone
+			//     winkey tap would have its Start-menu-opening up-event
+			//     incorrectly swallowed.
+			//
+			//  2. Any active drag/resize session is unsafe to keep
+			//     trusting. We can't fall back on
+			//     GetAsyncKeyState(VK_LBUTTON/VK_RBUTTON) to check whether
+			//     the initiating button is still physically held, because
+			//     starting a session ALWAYS swallows the real LMB/RMB-down
+			//     (see WM_LBUTTONDOWN/WM_RBUTTONDOWN in mouseProc) and, for
+			//     an ordinary non-recovery session, its matching up-event
+			//     too (see WM_LBUTTONUP/WM_RBUTTONUP there) — every
+			//     transition we ourselves swallow is invisible to the OS's
+			//     own key-state tracking, so that button's async state is
+			//     permanently stale for the entire life of a self-driven
+			//     session, not merely across a lock/unlock. So rather than
+			//     trying to infer "is it still really held", we
+			//     unconditionally drop any in-progress session across
+			//     this boundary instead.
+			//
+			// We act on either LOCK or UNLOCK (whichever fires first for a
+			// given cycle) purely for defense-in-depth; only UNLOCK is
+			// strictly required, since no further input reaches us at all
+			// while genuinely locked.
+			winGestureUsed.Store(false)
+			if session := activeSession.Load(); session != nil {
+				logf("WTS session %s detected mid-%v; discarding stale drag/resize session for HWND=0x%X", wtsSessionChangeName(wParam), session.mode, session.targetWnd)
+				softReset(true)
+			}
+		}
 		return 0
 
 	case WM_QUERYENDSESSION:
@@ -3543,7 +3612,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
 			asyncText := mustUTF16("Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)")
-			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as: if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false)
+			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as(not anymore this): if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false); actually not anymore now that I got lock/unlock hooks and I reset when winkey+L locks !
 			coalesceEventsText := mustUTF16("Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps")
 			immediateOverlayRepaintText := mustUTF16("Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints")
 			var missedGestureRecoveryText *uint16
@@ -5022,6 +5091,16 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 
 	if err4 := initTray(); err4 != nil {
 		return fmt.Errorf("failed to init tray: %w", err4)
+	}
+
+	if res := procWTSRegisterSessionNotification.Call(uintptr(mainMsgHwnd), NOTIFY_FOR_THIS_SESSION); res.Failed() {
+		logf("WTSRegisterSessionNotification failed, err: %v; lock/unlock-triggered stale-session cleanup (see WM_WTSSESSION_CHANGE in wndProc) will be unavailable this run.", res.Err)
+	} else {
+		defer func() {
+			if res2 := procWTSUnRegisterSessionNotification.Call(uintptr(mainMsgHwnd)); res2.Failed() {
+				logf("WTSUnRegisterSessionNotification failed, err: %v", res2.Err)
+			}
+		}()
 	}
 
 	go hookWorker()
