@@ -243,6 +243,7 @@ var (
 	procGetCapture            = wincoe.NewBoundProc(user32, "GetCapture", wincoe.CheckNone)
 	procSetConsoleCtrlHandler = wincoe.NewBoundProc(kernel32, "SetConsoleCtrlHandler", wincoe.CheckBool)
 	procGetForegroundWindow   = wincoe.NewBoundProc(user32, "GetForegroundWindow", wincoe.CheckNone)
+	// procIsWindow              = wincoe.NewBoundProc(user32, "IsWindow", wincoe.CheckBool)
 
 	// procCreatePopupMenu = user32.NewProc("CreatePopupMenu")
 	// procAppendMenu      = user32.NewProc("AppendMenuW")
@@ -987,6 +988,8 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 }
 
 // this way when winUP happens it won't pop up start menu
+// this doesn't work in this one case only: if(in this order!) shift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release shift, it pops startmenu!
+// but it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!
 func injectShiftTapOnly() {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
@@ -2028,8 +2031,8 @@ func isWindowForeground(hwnd windows.Handle) bool {
 	//To answer your performance and safety concerns: GetForegroundWindow and GetCursorPos are both "safe" to call within your mouseProc because they are simple getters
 	// that query the system's internal state without sending messages to other windows.
 	res1 := procGetForegroundWindow.Call()
-	if res1.Failed() {
-		logf("Failed to GetForegroundWindow, err: %v", res1.Err)
+	if res1.R1 == 0 || res1.Failed() { //it's CheckNone so it never fails!
+		logf("in isWindowForeground, failed to GetForegroundWindow, err: %v callStatus: %v", res1.Err, res1.CallStatus)
 		return false
 	}
 	return windows.Handle(res1.R1) == hwnd
@@ -2037,8 +2040,8 @@ func isWindowForeground(hwnd windows.Handle) bool {
 
 func getForegroundWindow() windows.Handle {
 	res1 := procGetForegroundWindow.Call()
-	if res1.Failed() {
-		logf("Failed to GetForegroundWindow, err: %v", res1.Err)
+	if res1.R1 == 0 || res1.Failed() { //it's CheckNone so it never fails!
+		logf("Failed to GetForegroundWindow, err: %v callStatus: %v", res1.Err, res1.CallStatus)
 		return windows.Handle(0)
 	}
 	return windows.Handle(res1.R1)
@@ -3790,11 +3793,37 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// var pt POINT
 			// procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 
+			//doneelsewhereFIXME: doesn't work because prev. focused window was explorer.exe always!
+			// // Capture whatever window currently owns the foreground BEFORE we
+			// // steal it for ourselves below (required so TrackPopupMenu behaves
+			// // like a normal context menu - dismiss on click-away, etc). Without
+			// // restoring it afterward, our own invisible hidden window keeps the
+			// // real keyboard-input focus indefinitely, even though some other
+			// // window (e.g. a dev-build console launched via run.bat) may still
+			// // visually show as focused (Windows 11's focus border). Symptom:
+			// // clicking Exit and then pressing a key at "Press any key to
+			// // exit..." does nothing until you first LMB-click the console.
+			// prevForegroundBeforeTrayMenu := getForegroundWindow()
+			// restoreForegroundAfterTrayMenu := func() {
+			// 	if prevForegroundBeforeTrayMenu == 0 || prevForegroundBeforeTrayMenu == windows.Handle(hwnd) {
+			// 		logf("in wndProc, WM_MYSYSTRAY, skipping foreground restore: prev_hwnd:0x%X is 0 or us aka 0x%X", prevForegroundBeforeTrayMenu, hwnd)
+			// 		return
+			// 	}
+			// 	if resIsWin := procIsWindow.Call(uintptr(prevForegroundBeforeTrayMenu)); resIsWin.Failed() {
+			// 		logf("in wndProc, WM_MYSYSTRAY, skipping foreground restore: pre-tray-menu HWND=0x%X is no longer a valid window", prevForegroundBeforeTrayMenu)
+			// 		return
+			// 	}
+			// 	if resRestore := procSetForegroundWindow.Call(uintptr(prevForegroundBeforeTrayMenu)); resRestore.Failed() {
+			// 		logf("in wndProc, WM_MYSYSTRAY, failed to restore foreground window to pre-tray-menu HWND=0x%X, err=%v callStatus=%v", prevForegroundBeforeTrayMenu, resRestore.Err, resRestore.CallStatus)
+			// 	}
+			// }
+
 			procSetForegroundWindow.Call(hwnd)
+			// logf("Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
 
 			res2 := procTrackPopupMenu.Call(
 				hMenu,
-				0x0100, // TPM_RETURNCMD
+				TPM_RETURNCMD, //0x0100, // TPM_RETURNCMD
 				uintptr(pt.X),
 				uintptr(pt.Y),
 				0,
@@ -3803,11 +3832,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			)
 			if res2.Failed() {
 				logf("in wndProc, WM_MYSYSTRAY, failed to TrackPopupMenu, err=%v", res2.Err)
+				// restoreForegroundAfterTrayMenu()
 				return 0 // Handled
 			}
 			cmd := res2.R1
 			// Required by MSDN to dismiss menu correctly
 			res3 := procSendMessage.Call(hwnd, WM_NULL, 0, 0) // Send WM_NULL
+			// restoreForegroundAfterTrayMenu()
 			if res3.Failed() {
 				logf("in wndProc, WM_MYSYSTRAY, failed to SendMessage(WM_NULL) to (correctly)dismiss systray menu, err=%v", res3.Err)
 				return 0 // Handled
@@ -4984,10 +5015,15 @@ func primary_defer() { //primary defer
 	// // 2. Check if Stdin is actually a terminal (not a pipe/null)
 	if wincoe.IsStdinConsoleInteractive() {
 		releaseSingleInstance() // don't hog the mutex while waiting for key, else program exit cleans it.
-		//waitAnyKeyIfInteractive() //TODO: copy code over from the other project, for this. Or make it a common library or smth, then vendor it.
-		// logf("Press Enter to exit... TODO: use any key and clrbuf before&after")
-		// var dummy string
-		// _, _ = fmt.Scanln(&dummy)
+
+		if startupTerminalHwnd != 0 {
+			logf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
+			// Use your existing thread-attaching focus method to bypass UIPI/Focus Stealing Prevention
+			forceForeground(startupTerminalHwnd)
+		}
+
+		// focusedNow := getForegroundWindow()
+		// logf("Currently focused window is 0x%X", focusedNow) //before the above fix, this is 0x0 (tho no error happened), or it's explorer.exe's window if restoreForegroundAfterTrayMenu() was allowed to run.
 		wincoe.WaitAnyKey()
 	} else {
 		logf("Didn't wait for keypress due to not an interactive/terminal.")
@@ -5137,6 +5173,10 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	_ = _token // silence warning!
 	assertStructSizes()
 	initWincoeLogging() // ← must be before any wincoe calls
+
+	// Capture the actual terminal/console window that launched us
+	resFg := procGetForegroundWindow.Call()
+	startupTerminalHwnd = windows.Handle(resFg.R1)
 
 	logf("Started")
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
@@ -6167,3 +6207,7 @@ func initDarkMode() {
 		logf("Failed to find uxtheme ordinal 136: %v", err)
 	}
 }
+
+const TPM_RETURNCMD = 0x0100
+
+var startupTerminalHwnd windows.Handle

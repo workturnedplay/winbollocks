@@ -1,5 +1,4 @@
 todo:
-* if I click Exit from systray, even tho the run.bat cmd.exe terminal where dev build (so with console) winbollocks is running is focused (based on the green square around the window, showing which window has focus) pressing any key at the prompt has no effect unless a LMB on contents or on title bar is pressed first!
 
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 
@@ -17,6 +16,7 @@ notmybug:
 
 
 done:
+//* if I click Exit from systray, even tho the run.bat cmd.exe terminal where dev build (so with console) winbollocks is running is focused (based on the green square around the window, showing which window has focus) pressing any key at the prompt has no effect unless a LMB on contents or on title bar is pressed first! Ok, so focused window on Exit is hwnd 0x0 or hwnd of explorer.exe if you let restoreForegroundAfterTrayMenu() run! Both fail to focus the cmd.exe window where I can press a key aka wincoe.WaitAnyKey()!
 //* make the systray menu dark not white background, ie. dark themed, or if possible follow system theme(whether dark or normal).
 //* when missedGestureRecoveryEnabled happens(i mean, the "Recovering a missed winkey+RMB ..." triggers), the LMB is still held down from before but it started doing a selection eg. in cmd.exe so while drag-moving the window now, it also extends the text selection temporarily(because LMB on cmd.exe text starts selection) until window is finished moving then unextends it(because moving window has a tiny delay between where mouse cursor is and where window is before the move happens, so window perceives the cursor move as a selection extend for the text). Doesn't seem fixable without sending a LMB_UP or RMB_UP depending on which gesture just triggered... This might not be doable, sending an UP event is kinda invasive? altho we already send LMB to focus in fallback case, hmm... anyway Claude suggested doing it anyway, here: https://claude.ai/chat/7e747d1d-7c63-481a-85ff-3eaa0385bf41 (as todo2)  ok i'm doing the LMB UP inject.
 //  //fixed//* also, when releasing LMB or RMB from the gesture, it gets swallowed(because it was doing the gesture) but in this case, due to missedGestureRecoveryEnabled having been applied, it shouldn't swallow it, because now it's stuck held down, so the selection extending keep happening on move even tho LMB is released(need to press LMB again to release it), or for RMB you can't LMB to focus any other window unless RMB is pressed again to unstuck it.
