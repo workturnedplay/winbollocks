@@ -5409,8 +5409,9 @@ func getClassName(hwnd windows.Handle) string {
 	return windows.UTF16ToString(buf[:res1.R1])
 }
 
+// TODO: shall we make these toggles in systray? probably not, it's spammy debug!
 var shouldLogFocusChanges = false
-var shouldLogWindowEvents = true
+var shouldLogWindowEvents = false
 
 var (
 	// XXX: You already safely manage eventCount using atomic.AddUint64 and atomic.SwapUint64, which is good practice. Because you passed WINEVENT_OUTOFCONTEXT to SetWinEventHook, Windows delivers those callbacks to the message queue of the thread that registered the hook (the Main Thread). Therefore, lastReport and eventCount are technically single-threaded in this specific architecture, but keeping the atomics there is a smart defensive move against future refactors.
@@ -5543,7 +5544,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
 	}
 
-	if event == 0x0003 { // EVENT_SYSTEM_FOREGROUND
+	if event == EVENT_SYSTEM_FOREGROUND { //0x0003 { // EVENT_SYSTEM_FOREGROUND
 		if shouldLogFocusChanges {
 			logf("Foreground changed to hwnd=0x%x", hwnd)
 		}
