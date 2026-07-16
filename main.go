@@ -529,16 +529,17 @@ const (
 	WM_DO_RELEASE_CAPTURE = WM_USER + 215
 )
 const (
-	MENU_EXIT                             = 1
-	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK     = 2
-	MENU_ACTIVATE_MOVE                    = 3
-	MENU_RATELIMIT_MOVES                  = 4
-	MENU_LOG_RATE_OF_MOVES                = 5
-	MENU_TOGGLE_ASYNC_RESIZE              = 6
-	MENU_TOGGLE_REQUIRE_WINDOWN           = 7
-	MENU_TOGGLE_COALESCE_EVENTS           = 8
-	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT = 9
-	MENU_TOGGLE_MISSED_GESTURE_RECOVERY   = 10
+	MENU_EXIT                                = 1
+	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK        = 2
+	MENU_ACTIVATE_MOVE                       = 3
+	MENU_RATELIMIT_MOVES                     = 4
+	MENU_LOG_RATE_OF_MOVES                   = 5
+	MENU_TOGGLE_ASYNC_RESIZE                 = 6
+	MENU_TOGGLE_REQUIRE_WINDOWN              = 7
+	MENU_TOGGLE_COALESCE_EVENTS              = 8
+	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT    = 9
+	MENU_TOGGLE_MISSED_GESTURE_RECOVERY      = 10
+	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY = 11
 
 	MF_STRING = 0x0000
 
@@ -788,10 +789,15 @@ type dragSession struct {
 	// to the target window normally (our hooks were blind to it while a
 	// higher-integrity window still had the foreground), so the target's
 	// own input state (e.g. a console starting a text selection on
-	// LMB-down) genuinely believes the button is held. Its eventual up-event
-	// must reach it normally instead of being swallowed like an ordinary
-	// gesture's, or the target is left stuck thinking the button is still
-	// down — see mouseProc's WM_LBUTTONUP/WM_RBUTTONUP and WM_MOUSEMOVE handling.
+	// LMB-down) genuinely believes the button is held. We inject a
+	// synthetic LMB-up/RMB-up right when the session starts (see the
+	// recovery branch in mouseProc's WM_MOUSEMOVE handling) so the target
+	// stops extending that state (e.g. its selection) on every subsequent
+	// move we let through. The eventual REAL up-event must still reach it
+	// normally instead of being swallowed like an ordinary gesture's — see
+	// mouseProc's WM_LBUTTONUP/WM_RBUTTONUP handling — both as a backstop
+	// in case the target ignored our synthetic one, and so whatever window
+	// is now under the cursor gets a normal release.
 	viaMissedGestureRecovery bool
 }
 
@@ -828,6 +834,19 @@ var checkForMissedGestureOnNextMove atomic.Bool
 // (see foregroundWasHigherIntegrity / checkForMissedGestureOnNextMove).
 // Defaults to true; toggleable via systray.
 var missedGestureRecoveryEnabled atomic.Bool
+
+// injectButtonUpOnMissedGestureRecovery gates whether starting a
+// missed-gesture-recovery drag/resize session (see viaMissedGestureRecovery)
+// injects a synthetic LMB-up/RMB-up to stop the target window's own
+// click-drag state (e.g. a console's text-selection extension) from
+// fighting the window move on every subsequent mouse-move we let through.
+// Off by default: the injection is a genuine, unfiltered button-up
+// delivered wherever the target window currently is, so it can have side
+// effects unrelated to selection state — e.g. a bare RMB-up landing outside
+// any active selection in a classic conhost console window triggers Paste,
+// and a click on a push-button rather than a text area could fire that
+// control's action a little early. Toggleable via systray.
+var injectButtonUpOnMissedGestureRecovery atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -2387,14 +2406,56 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 								injectShiftTapOnly()
 							}
 							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
-							tryBeginMoveGestureAt(info.Pt, true)
+							if tryBeginMoveGestureAt(info.Pt, true) {
+								// The real LMB-down already reached the target window normally
+								// (our hook was blind to it), so if it's something like a
+								// console, it's genuinely mid its own click-drag (e.g. extending
+								// a text selection) and still believes LMB is held. Telling it
+								// LMB is up now stops that from fighting our window move on
+								// every subsequent mouse-move we let through — our own move
+								// logic doesn't need LMB to read as "down", it drives entirely
+								// off activeSession + MSLLHOOKSTRUCT. The real LMB-up still
+								// reaches the target later too (see WM_LBUTTONUP's
+								// viaMissedGestureRecovery handling) — a second "up" while
+								// already up is a harmless no-op for most windows.
+								// Caveat: if the initiating click actually landed on something
+								// like a push-button rather than a text/console area, this
+								// synthetic up could fire that control's click action a little
+								// early. Not observed in practice (this path only triggers when
+								// switching focus away from a higher-integrity window), but
+								// worth knowing.
+								if injectButtonUpOnMissedGestureRecovery.Load() {
+									session2 := activeSession.Load() // it's updated in the above try
+									var hwnd windows.Handle
+									if session2 != nil {
+										hwnd = session2.targetWnd
+									} else {
+										hwnd = windows.Handle(0)
+									}
+									logf("Injecting synthetic LMB-up for missed-gesture recovery drag (HWND=0x%X); note this will trigger an unintended click, especially if the initiating click landed on a button, or unwanted paste behavior in some console windows if RMB is used instead.", hwnd)
+									injectLMBUp()
+								}
+							}
 						case keyDown(VK_RBUTTON):
 							if !winGestureUsed.Load() {
 								winGestureUsed.Store(true)
 								injectShiftTapOnly()
 							}
 							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
-							tryBeginResizeGestureAt(info.Pt, true)
+							if tryBeginResizeGestureAt(info.Pt, true) {
+								// See the identical comment in the LMB/ModeMove case above.
+								if injectButtonUpOnMissedGestureRecovery.Load() {
+									session2 := activeSession.Load() // it's updated in the above try
+									var hwnd windows.Handle
+									if session2 != nil {
+										hwnd = session2.targetWnd
+									} else {
+										hwnd = windows.Handle(0)
+									}
+									logf("Injecting synthetic RMB-up for missed-gesture recovery resize (HWND=0x%X); note in classic console windows (conhost) a bare RMB-up outside of an active selection triggers Paste, or pop the RMB menu in notepad.", hwnd)
+									injectRMBUp()
+								}
+							}
 						}
 						session = activeSession.Load() // may now be non-nil
 					}
@@ -2646,6 +2707,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			//} //second 'if', for resizing
 		} //switch
 
+		// SUPERSEDED: see injectLMBUp()/injectRMBUp(), injected once at
+		// recovery-session start instead (in the WM_MOUSEMOVE recovery branch
+		// above). A single synthetic up avoids whatever broke dragging visually
+		// with the swallow-every-move approach below.
 		// if session != nil && session.viaMissedGestureRecovery {//XXX: doesn't work since it eats moves globally, it won't move on drag, it snaps back to origin.
 		// 	// This session's LMB/RMB-down was never seen/swallowed by us,
 		// 	// so the target window's own button-driven state (e.g. a
@@ -3626,6 +3691,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				missedGestureRecoveryText = mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (e.g. Task Manager) (you're not elevated)")
 			}
 
+			injectButtonUpOnMissedGestureRecoveryText := mustUTF16("(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)")
+
 			exitText := mustUTF16("Exit")
 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
@@ -3707,6 +3774,16 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			procAppendMenu.Call(hMenu, missedGestureRecoveryFlags, MENU_TOGGLE_MISSED_GESTURE_RECOVERY,
 				uintptr(unsafe.Pointer(missedGestureRecoveryText)))
 
+			var injectButtonUpFlags uintptr = MF_STRING
+			if injectButtonUpOnMissedGestureRecovery.Load() {
+				injectButtonUpFlags |= MF_CHECKED
+			}
+			if !missedGestureRecoveryEnabled.Load() {
+				injectButtonUpFlags |= MF_DISABLED | MF_GRAYED
+			}
+			procAppendMenu.Call(hMenu, injectButtonUpFlags, MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY,
+				uintptr(unsafe.Pointer(injectButtonUpOnMissedGestureRecoveryText)))
+
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
 			// var pt POINT
@@ -3782,6 +3859,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_MISSED_GESTURE_RECOVERY:
 				missedGestureRecoveryEnabled.Store(!missedGestureRecoveryEnabled.Load())
+
+			case MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY:
+				injectButtonUpOnMissedGestureRecovery.Store(!injectButtonUpOnMissedGestureRecovery.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -4548,6 +4628,8 @@ func init() {
 
 	//"But there genuinely are windows that can outrank even an elevated High-IL process: anything running at System integrity (0x4000) — some SYSTEM-owned services with UI, certain security-related dialogs, etc. It's rare, but real. " -Claude
 	missedGestureRecoveryEnabled.Store(!isAdmin) // default on if not admin
+
+	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -6016,4 +6098,41 @@ func initForegroundIntegrityState() {
 		foregroundWasHigherIntegrity.Store(true)
 		logf("initForegroundIntegrityState: current foreground HWND=0x%X (PID=%d, IL=0x%x) is already higher integrity than us (0x%x); seeded foregroundWasHigherIntegrity=true so missed-gesture recovery can arm on the next foreground change.", hwnd, pid, il, selfIntegrityLevel)
 	}
+}
+
+// injectMouseButtonUp injects a single, bare button-up event (no down, no
+// movement) at the current cursor position via SendInput. Used by the
+// missed-gesture recovery path to tell whatever window legitimately saw the
+// real LMB/RMB-down (because our hook was blind to it — see
+// dragSession.viaMissedGestureRecovery) that the button is up now, so it
+// stops treating subsequent mouse moves as an extension of its own
+// click-drag (e.g. a console extending a text selection) while we drive the
+// window move/resize ourselves.
+func injectMouseButtonUp(flag uint32) {
+	inputs := []INPUT{
+		{
+			Type: INPUT_MOUSE,
+			Ki:   KEYBDINPUT{}, // union placeholder
+		},
+	}
+
+	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = flag
+
+	res1 := procSendInput.Call(
+		uintptr(len(inputs)),
+		uintptr(unsafe.Pointer(&inputs[0])),
+		unsafe.Sizeof(inputs[0]),
+	)
+
+	if res1.Failed() || res1.R1 != uintptr(len(inputs)) {
+		logf("SendInput mouse button-up injection (flag=0x%x) failed: ret=%d err=%v", flag, res1.R1, res1.Err)
+	}
+}
+
+func injectLMBUp() {
+	injectMouseButtonUp(MOUSEEVENTF_LEFTUP)
+}
+
+func injectRMBUp() {
+	injectMouseButtonUp(MOUSEEVENTF_RIGHTUP)
 }
