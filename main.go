@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -5136,7 +5137,9 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	_ = _token // silence warning!
 	assertStructSizes()
 	initWincoeLogging() // ← must be before any wincoe calls
+
 	logf("Started")
+	initDarkMode() // ← Tell Windows to enable modern theme support for menus
 
 	if writeProfile {
 		// In main(), before the GetMessage loop:
@@ -6135,4 +6138,32 @@ func injectLMBUp() {
 
 func injectRMBUp() {
 	injectMouseButtonUp(MOUSEEVENTF_RIGHTUP)
+}
+
+// initDarkMode tells Windows this app supports dark mode,
+// allowing standard Win32 context menus to follow the system theme.
+func initDarkMode() {
+	uxtheme := windows.NewLazySystemDLL("uxtheme.dll")
+	if err := uxtheme.Load(); err != nil {
+		logf("Failed to load uxtheme.dll for dark mode: %v", err)
+		return
+	}
+
+	// PreferredAppMode: 0=Default, 1=AllowDark, 2=ForceDark, 3=ForceLight, 4=Max
+	// Passing 1 allows it to seamlessly follow the system's active theme.
+	const AllowDark uintptr = 1
+
+	// Ordinal 135: SetPreferredAppMode (Windows 10 1903+) / AllowDarkModeForApp (Windows 10 1809)
+	if procSetPreferredAppMode, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 135); err == nil {
+		syscall.SyscallN(procSetPreferredAppMode, AllowDark)
+	} else {
+		logf("Failed to find uxtheme ordinal 135: %v", err)
+	}
+
+	// Ordinal 136: FlushMenuThemes (forces Windows to refresh the menu rendering cache)
+	if procFlushMenuThemes, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 136); err == nil {
+		syscall.SyscallN(procFlushMenuThemes)
+	} else {
+		logf("Failed to find uxtheme ordinal 136: %v", err)
+	}
 }
