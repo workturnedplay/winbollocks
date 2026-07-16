@@ -1,0 +1,44 @@
+---------------------
+---------------------
+* Investigating a Windows / Windows Terminal focus-notification quirk.
+
+Observed:
+- Only reproducible when returning from a higher-UIPI window (e.g. Task Manager) to the same Windows Terminal instance that originally launched winbollocks(as non-Admin).
+- Reproducible when winbollocks is started by directly running `winbollocks.exe` (or via `run.bat`) in an already-existing Windows Terminal window.
+- Still reproducible when `run.bat` launches winbollocks via `start "" /wait "winbollocks.exe"` (the original Terminal window remains affected).
+- Not reproducible when launching winbollocks via `start "" "winbollocks.exe"` (creates a new Windows Terminal window) which is typed in a new cmd.exe launch.
+- Not reproducible with a freshly opened cmd.exe/Windows Terminal session that did not launch the original winbollocks instance.
+- Not reproducible with Notepad.
+- Only the first return/focus transition is affected; subsequent transitions behave normally.
+- GetForegroundWindow() already reports the Windows Terminal window as foreground immediately during EVENT_SYSTEM_CAPTURESTART (and still 20 ms and 100 ms later).
+- EVENT_SYSTEM_CAPTURESTART and EVENT_SYSTEM_CAPTUREEND are delivered normally.
+- Neither EVENT_SYSTEM_FOREGROUND nor EVENT_OBJECT_FOCUS is delivered for that first activation, despite the window already being foreground.
+- Because EVENT_SYSTEM_FOREGROUND is never received, foregroundWasHigherIntegrity is never cleared and missed-gesture recovery is never armed, so the first Win+mouse gesture is missed.
+- Releasing the Win key later (opening the Start menu) does generate EVENT_SYSTEM_FOREGROUND as expected.
+
+Unknown:
+- Why Windows updates GetForegroundWindow() without delivering the corresponding WinEvent notification(s).
+- Whether this is specific to Windows Terminal, to the Terminal instance hosting the launching shell, or to a broader Windows accessibility/WinEvent quirk.
+
+aka
+---------------------
+* Windows quirk(?): The first time focus returns from a higher-UIPI window (e.g. Task Manager) to the same Windows Terminal instance that originally launched winbollocks, Windows sometimes never delivers EVENT_SYSTEM_FOREGROUND (nor EVENT_OBJECT_FOCUS), even though GetForegroundWindow() already reports the Terminal as foreground. This causes missed-gesture recovery not to arm, so the first Win+mouse gesture is missed. Subsequent focus transitions behave normally.
+
+aka
+---------------------
+* Windows Terminal quirk(?): The first activation of the Terminal instance that launched winbollocks may not generate EVENT_SYSTEM_FOREGROUND/EVENT_OBJECT_FOCUS after returning from a higher-UIPI window, despite GetForegroundWindow() already reporting it as foreground. This prevents the first missed-gesture recovery from triggering; later activations are normal.
+
+aka
+---------------------
+Known issue: On Windows 11, when winbollocks is started from an existing Windows Terminal session(as non-Admin), the first activation of that same Terminal window after switching away to a higher-integrity (elevated/UIPI-blocked) application may not generate an EVENT_SYSTEM_FOREGROUND (or EVENT_OBJECT_FOCUS) WinEvent, even though GetForegroundWindow() already reports the Terminal as the foreground window.
+
+As a result, the missed-gesture recovery mechanism is not armed for that first transition, so the first Win+mouse gesture after returning from the elevated application may be missed. Subsequent transitions behave normally.
+
+This issue has only been observed with the Windows Terminal instance that launched winbollocks; fresh Terminal windows and other applications (e.g. Notepad) do not appear to exhibit the problem.
+
+Workaround: repeat the gesture once, launch winbollocks in a fresh Terminal window, or run winbollocks elevated so UIPI does not block the hooks in the first place.
+
+doneTODO: Investigate using GetForegroundWindow() reconciliation (e.g. on EVENT_SYSTEM_CAPTURESTART) instead of relying solely on EVENT_SYSTEM_FOREGROUND notifications, as the WinEvent stream appears to occasionally omit this transition.
+
+this ^ is the workaround currently, in 0.5.0!
+---------------------

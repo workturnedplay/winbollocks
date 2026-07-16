@@ -2002,6 +2002,15 @@ func isWindowForeground(hwnd windows.Handle) bool {
 	return windows.Handle(res1.R1) == hwnd
 }
 
+func getForegroundWindow() windows.Handle {
+	res1 := procGetForegroundWindow.Call()
+	if res1.Failed() {
+		logf("Failed to GetForegroundWindow, err: %v", res1.Err)
+		return windows.Handle(0)
+	}
+	return windows.Handle(res1.R1)
+}
+
 // aka in window in my own process?
 func isOwnWindow(hwnd windows.Handle) bool {
 	if hwnd == 0 {
@@ -5596,6 +5605,16 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		eventName = "EVENT_SYSTEM_FOREGROUND"
 	case EVENT_SYSTEM_CAPTURESTART: //0x0008:
 		eventName = "EVENT_SYSTEM_CAPTURESTART"
+		// fg := getForegroundWindow()
+		// logf("CaptureStart: FG=0x%x eventHWND=0x%x", fg, hwnd)
+
+		// time.AfterFunc(20*time.Millisecond, func() {
+		// 	logf("20ms later FG=0x%x", getForegroundWindow())
+		// })
+
+		// time.AfterFunc(100*time.Millisecond, func() {
+		// 	logf("100ms later FG=0x%x", getForegroundWindow())
+		// })
 	case EVENT_SYSTEM_CAPTUREEND: //0x0009:
 		eventName = "EVENT_SYSTEM_CAPTUREEND"
 	case EVENT_CONSOLE_UPDATE_REGION: //0x4002:
@@ -5650,14 +5669,46 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		return 0
 	}
 
+	// --- THE RECONCILIATION TRIGGER ---
+	// If we are currently locked out by a High-IL window, we hijack other
+	// reliable events (like a mouse click causing CAPTURESTART) to manually
+	// double-check if the foreground has secretly shifted back to normal.
+	//
+	// Windows occasionally(the first time always does it! not second+ times apparently)
+	//  fails to emit EVENT_SYSTEM_FOREGROUND when returning
+	// from a higher-integrity foreground window (observed with some Windows
+	// Terminal activation paths). If we're currently waiting for such a
+	// transition, use the first reliable mouse-capture event to reconcile the
+	// actual foreground window via GetForegroundWindow().
+	forceReconcile := foregroundWasHigherIntegrity.Load() &&
+		event == EVENT_SYSTEM_CAPTURESTART // || event == EVENT_SYSTEM_CAPTUREEND || event == EVENT_OBJECT_FOCUS) // these two aren't needed, and last one isn't hit anyway!
+
 	var pid uint32
-	if shouldLogFocusChanges || event == EVENT_SYSTEM_FOREGROUND /*0x0003*/ {
-		//then pid is needed in one OR two places
-		procGetWindowThreadProcessID.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
+	targetHwnd := hwnd
+
+	if shouldLogFocusChanges || event == EVENT_SYSTEM_FOREGROUND || forceReconcile {
+		// If reconciling, the event's 'hwnd' might just be a child element.
+		// We want the absolute master foreground window to bypass the glitch.
+		if forceReconcile && event != EVENT_SYSTEM_FOREGROUND {
+			res1 := procGetForegroundWindow.Call()
+			targetHwnd = windows.Handle(res1.R1)
+		}
+
+		if targetHwnd == 0 {
+			if forceReconcile {
+				logf("Reconciliation via %s: GetForegroundWindow() returned NULL; skipping reconciliation.", eventName)
+			} else {
+				logf("winEventProc's hwnd was 0, this is very undexpected! eventName=%s", eventName)
+			}
+			return 0 // WinEvent callbacks return 0 (no chaining)
+		}
+
+		//pid is needed in one OR two places outside of this 'if' block
+		procGetWindowThreadProcessID.Call(uintptr(targetHwnd), uintptr(unsafe.Pointer(&pid)))
 		//"Pro-tip: You don't need to check err for this specific API because it doesn't set LastError in the traditional way; you just check if the return value (or the written pid variable) is 0. Your current check if pid == 0 is the correct way to handle it." - gemini 3 Fast
 		if pid == 0 {
 			//some error or wtw
-			logf("Couldn't get pid(it's 0) for HWND=0x%x for event 0x%x(%s)", hwnd, event, eventName)
+			logf("Couldn't get pid(it's 0) for HWND=0x%x for event 0x%x(%s)", targetHwnd, event, eventName)
 			return 0 // WinEvent callbacks return 0 (no chaining)
 		}
 	}
@@ -5665,36 +5716,35 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	if shouldLogFocusChanges {
 		// Get the top-level owner of this HWND to see if it belongs to CMD
 		// GA_ROOT (2) gets the "real" parent window
-		res1 := procGetAncestor.Call(uintptr(hwnd), 2)
+		res1 := procGetAncestor.Call(uintptr(targetHwnd), 2)
 		if res1.Failed() {
-			logf("failed to get rootHwnd via GetAncestor on HWND=0x%x", hwnd)
+			logf("failed to get rootHwnd via GetAncestor on HWND=0x%x", targetHwnd)
 			return 0 // WinEvent callbacks return 0 (no chaining)
 		}
-		rootHwnd := res1.R1
+		rootHwnd := windows.Handle(res1.R1)
 
-		title := getWindowTextFast(windows.Handle(rootHwnd))
+		title := getWindowTextFast(rootHwnd)
 		procName := getProcessNameFast(pid)
-		class := getClassName(hwnd)
+		class := getClassName(targetHwnd)
+		// if (event == EVENT_SYSTEM_CAPTURESTART) || (event == EVENT_SYSTEM_CAPTUREEND) { // yes it does have focus, even tho EVENT_SYSTEM_FOREGROUND is never sent! see caveats1.txt
+		//	focusedHwnd := getForegroundWindow()
+		// 	if focusedHwnd == hwnd || focusedHwnd == rootHwnd {
+		// 		logf("at %s, the foreground window 0x%X is the same one that caused this event 0x%X or its rootHwnd 0x%X !", eventName, focusedHwnd, hwnd, rootHwnd)
+		// 	} else {
+		// 		logf("at %s, the foreground window 0x%X is NOT the same one that caused this event 0x%X or its rootHwnd 0x%X !", eventName, focusedHwnd, hwnd, rootHwnd)
+		// 	}
+		// }
 
 		logf("[%s] HWND=0x%x (Root=0x%x) objId=%d childId=%d [%s] Class=[%s] PID=%d (%s)",
-			eventName, hwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
+			eventName, targetHwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
 	}
 
-	if event == EVENT_SYSTEM_FOREGROUND { //0x0003 { // EVENT_SYSTEM_FOREGROUND
-		if shouldLogFocusChanges {
-			logf("Foreground changed to hwnd=0x%x", hwnd)
-		}
-
-		// Optional: Check for elevated
-		//var pid uint32
-		// if !shouldLogFocusChanges || pid == 0 { //then pid wasn't already computed above so we should do it
-		// 	procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pid)))
-
-		// }
+	if event == EVENT_SYSTEM_FOREGROUND || forceReconcile {
 		if pid == 0 {
 			badprogramming("pid is 0 here, code logic was changed!")
 		}
 		targetIL, err := processIntegrityLevel(pid)
+
 		if err == nil && targetIL > selfIntegrityLevel {
 			// 		Quick Cheat Sheet for Levels:
 			// 0x0000: Untrusted
@@ -5703,23 +5753,33 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			// 0x3000: High (Administrator / Elevated)
 			// 0x4000: System
 
-			//if shouldLogFocusChanges {
-			logf("Target window HWND=0x%x is higher integrity (0x%x > 0x%x). UIPI will block movement(no key/mouse events will be received while it is focused!thus can't trigger the gesture).", hwnd, targetIL, selfIntegrityLevel)
-			//logf("Focus changed to HWND=0x%x event 0x%x(%s) which is Elevated foreground (IL=0x%x) → reconciling state (and you won't be able to use gestures on this window, run winbollocks as admin to can)", hwnd, event, eventName, targetIL)
-			//}
-			softReset(true)
-			foregroundWasHigherIntegrity.Store(true)
+			// Only lock the state down if this was a genuine foreground transition
+			if event == EVENT_SYSTEM_FOREGROUND {
+				logf("Target window HWND=0x%x is higher integrity (0x%x > 0x%x). UIPI will block movement(no key/mouse events will be received while it is focused!thus can't trigger the gesture).", targetHwnd, targetIL, selfIntegrityLevel)
+				softReset(true)
+				foregroundWasHigherIntegrity.Store(true)
+			}
 		} else {
 			if shouldLogFocusChanges {
-				logf("PID=%d IL=0x%x err=%v", pid, targetIL, err)
-				//logf("Foreground hwnd=0x%x PID=%d bufLen=%d subCount=%d RID=0x%x err=%v", hwnd, pid, len(buf), subCount, rid, err)
+				logf("Current foreground PID=%d IL=0x%x ILerr=%v", pid, targetIL, err)
 			}
+			// We successfully detected a return to a normal window!
 			if foregroundWasHigherIntegrity.Swap(false) {
 				if missedGestureRecoveryEnabled.Load() {
 					checkForMissedGestureOnNextMove.Store(true)
-					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", hwnd, pid, targetIL)
+
+					// reason := "EVENT_SYSTEM_FOREGROUND"
+					// if forceReconcile && event != EVENT_SYSTEM_FOREGROUND {
+					// 	reason = fmt.Sprintf("reconciliation via %s", eventName)
+					// }
+					reason := eventName
+					if forceReconcile {
+						reason = "reconciliation via " + reason
+					}
+
+					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) [%s] after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", targetHwnd, pid, targetIL, reason)
 				} else if shouldLogFocusChanges {
-					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x), but missed-gesture recovery is disabled; not arming.", hwnd, pid, targetIL)
+					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x), but missed-gesture recovery is disabled; not arming.", targetHwnd, pid, targetIL)
 				}
 			}
 		}

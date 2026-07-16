@@ -89,6 +89,7 @@ rem won't see it: go env GORACE
 echo GORACE is '%GORACE%'
 
 echo Running command^(in current dir^): "!exe_name!"
+rem start "" /wait "!exe_name!"
 "!exe_name!"
 set "ec=%ERRORLEVEL%"
 
