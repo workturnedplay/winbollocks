@@ -2125,7 +2125,11 @@ func hideOverlay() {
 // copy-pasted across WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN.
 // NOTE: cannot use a bare 'break' inside this; callers must do that themselves.
 func shouldBypassGestureNow() bool {
-	return bypassGesturesWhenFullscreen.Load() && foregroundIsFullscreen.Load()
+	should := bypassGesturesWhenFullscreen.Load() && foregroundIsFullscreen.Load()
+	if should {
+		logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)")
+	}
+	return should
 }
 
 // alignRestoredWindowToCursor repositions the restored-window rect so the
