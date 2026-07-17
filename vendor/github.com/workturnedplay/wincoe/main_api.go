@@ -1636,6 +1636,29 @@ var (
 	serviceCacheTTL = 60 * time.Second
 )
 
+// serviceLookupInFlight coordinates a single in-progress
+// GetServiceNamesFromPIDUncached call for a given PID, so concurrent cache
+// misses for the SAME PID (e.g. a burst of UDP/TCP packets from one process
+// arriving faster than the 60s cache TTL) coalesce into one SCM enumeration
+// instead of a thundering herd of duplicate EnumServicesStatusEx calls.
+//
+// done is closed exactly once, by the single "leader" goroutine that
+// actually performed the lookup, only after it has written names/err.
+// Closing a channel happens-after any writes made before the close and
+// happens-before any receive of that close completes, so waiters reading
+// names/err after <-done observe a fully-published result with no
+// additional synchronization needed.
+type serviceLookupInFlight struct {
+	done  chan struct{}
+	names []string
+	err   error
+}
+
+var (
+	serviceInFlightMu sync.Mutex
+	serviceInFlight   = make(map[uint32]*serviceLookupInFlight)
+)
+
 func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	// Fast path: check cache under lock.
 	serviceCacheMu.Lock()
@@ -1646,20 +1669,53 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	}
 	serviceCacheMu.Unlock()
 
-	// Slow path: do the actual SCM enumeration.
+	// Slow path: coalesce concurrent cache misses for this PID into a
+	// single SCM enumeration.
+	serviceInFlightMu.Lock()
+	if inFlight, ok := serviceInFlight[targetPID]; ok {
+		// Someone else is already fetching this PID; wait for their result
+		// instead of starting a duplicate, expensive enumeration ourselves.
+		serviceInFlightMu.Unlock()
+		<-inFlight.done
+		return inFlight.names, inFlight.err
+	}
+	inFlight := &serviceLookupInFlight{done: make(chan struct{})}
+	serviceInFlight[targetPID] = inFlight
+	serviceInFlightMu.Unlock()
+
 	names, err := GetServiceNamesFromPIDUncached(targetPID)
-	if err != nil {
-		return nil, err
+	inFlight.names = names
+	inFlight.err = err
+
+	if err == nil {
+		serviceCacheMu.Lock()
+		serviceCache[targetPID] = serviceCacheEntry{
+			names:     names,
+			expiresAt: time.Now().Add(serviceCacheTTL),
+		}
+		serviceCacheMu.Unlock()
 	}
 
-	serviceCacheMu.Lock()
-	serviceCache[targetPID] = serviceCacheEntry{
-		names:     names,
-		expiresAt: time.Now().Add(serviceCacheTTL),
-	}
-	serviceCacheMu.Unlock()
+	// Remove ourselves from the in-flight map before broadcasting, so that
+	// as soon as waiters wake up, a fresh caller either sees the (already
+	// updated, on success) cache entry or is free to start a brand-new
+	// lookup rather than incorrectly rejoining a completed one.
+	//
+	// NOTE: there's a narrow, benign race on the failure path (err != nil,
+	// so the cache is intentionally NOT updated): a caller arriving between
+	// the delete below and the close(inFlight.done) broadcast finds neither
+	// a fresh cache entry nor an in-flight lookup, and starts its own
+	// redundant GetServiceNamesFromPIDUncached call. That's an acceptable,
+	// rare duplicate call — the same trade-off any singleflight-style
+	// "forget" step makes — and is categorically better than every
+	// concurrent caller stampeding the SCM on every miss.
+	serviceInFlightMu.Lock()
+	delete(serviceInFlight, targetPID)
+	serviceInFlightMu.Unlock()
 
-	return names, nil
+	close(inFlight.done)
+
+	return names, err
 }
 
 func GoRoutineId() int64 {
