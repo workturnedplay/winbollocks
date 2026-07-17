@@ -1830,10 +1830,20 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 		softReset(true)
 	}
 
-	// Restore the window first so the resize starts from, and is measured
-	// against, the non-maximized rect. Without this the OS leaves the window
-	// in a mixed state (visually resized but still flagged as maximized).
-	if isMaximized(wantTargetWnd) {
+	// Capture the maximized rect before restoring so alignRestoredWindowToCursor
+	// can compute the proportional cursor position within the restored window.
+	var preRestoreRect RECT
+	wasMaximized := isMaximized(wantTargetWnd)
+
+	if wasMaximized {
+		if res := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&preRestoreRect))); res.Failed() {
+			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", wantTargetWnd, res.Err)
+			wasMaximized = false // skip alignment rather than use a zero rect
+		}
+
+		// Restore the window first so the resize starts from, and is measured
+		// against, the non-maximized rect. Without this the OS leaves the window
+		// in a mixed state (visually resized but still flagged as maximized).
 		procShowWindow.Call(uintptr(wantTargetWnd), SW_RESTORE)
 	}
 
@@ -1843,6 +1853,27 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 		logf("GetWindowRect on target HWND=0x%X failed(ret is 0) for resize startup, err:%v", wantTargetWnd, res1.Err)
 		return false
 	}
+
+	// Reposition the restored window under the cursor BEFORE setting up the resize session
+	if wasMaximized {
+		r = alignRestoredWindowToCursor(pt, preRestoreRect, r)
+		if res := procSetWindowPos.Call(
+			uintptr(wantTargetWnd),
+			0, // ignored due to SWP_NOZORDER
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(r.Left),
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(r.Top),
+			0, 0, // ignored due to SWP_NOSIZE
+			SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
+		); res.Failed() {
+			logf("SetWindowPos (post-restore alignment) on HWND=0x%X failed: %v; re-reading rect for consistent resize origin", wantTargetWnd, res.Err)
+			if res2 := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r))); res2.Failed() {
+				logf("GetWindowRect (post-SetWindowPos failure) on HWND=0x%X also failed: %v", wantTargetWnd, res2.Err)
+			}
+		}
+	}
+
 	w := r.Right - r.Left
 	h := r.Bottom - r.Top
 	if w <= 0 || h <= 0 {
