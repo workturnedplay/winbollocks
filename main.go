@@ -6784,15 +6784,16 @@ func initDarkMode() {
 	// PreferredAppMode: 0=Default, 1=AllowDark, 2=ForceDark, 3=ForceLight, 4=Max
 	// Passing 1 allows it to seamlessly follow the system's active theme.
 	const AllowDark uintptr = 1
+	const wanted = AllowDark
 
 	// Ordinal 135: SetPreferredAppMode (Windows 10 1903+) / AllowDarkModeForApp (Windows 10 1809)
 	if procSetPreferredAppMode, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 135); err == nil {
-		r1, _, errno := syscall.SyscallN(procSetPreferredAppMode, AllowDark)
+		r1, _, errno := syscall.SyscallN(procSetPreferredAppMode, wanted)
 		if errno != 0 {
 			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) returned errno: %v", errno)
 		} else {
 			// SetPreferredAppMode usually returns the previous state as r1.
-			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, prev mode: %d", r1)
+			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, current mode: %d, prev mode: %d", wanted, r1) //prev was 0
 		}
 	} else {
 		logf("initDarkMode: Failed to find uxtheme ordinal 135: %v", err)
