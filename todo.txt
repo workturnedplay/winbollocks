@@ -1,6 +1,5 @@
 todo:
-* apparently maximized notepad window is detected as fullscreen! not good!
-* in initDarkMode, check returns of syscall.SyscallN
+* don't spam this say it only once per window maybe? or once per second, in case 30mins pass and user just tried it again looking for debug/err msgs as to why it doesn't work?! "Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)"
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 * check if it's bad to deinit() in the recovered panic, i remember some AI saying it's bad in the past, but not why.
@@ -17,6 +16,8 @@ dontdothis:
 
 
 done:
+//* apparently maximized notepad window is detected as fullscreen! not good! so, isWindowFullscreenOnMonitor(hwnd) catched Maximized too! Maybe fullscreen or borderless fullscreen are also Maximized? in which case we can't just exclude if Maximized, hmm.
+//* in initDarkMode, check returns of syscall.SyscallN
 //* add option whether to focus window while the resize is happening/started, same 2 that ModeMove has: focusOnDrag and bringToFrontOnDrag, but don't merge them! they've to be independent/4 of them.
 //* bypassGesturesWhenFullscreen (the atomic bool) seems flakey or laggy or too late to be updated! and mouseProc's LMB/RMB down will check for its value before it actually gets updated by wndProc, thus will trigger the gesture anyway even if fullscreen window. Didn't test this, just based on theoretical. One fix seems to be to use isWindowFullscreenOnMonitor() directly in tryBeginMoveGestureAt and tryBeginResizeGestureAt, "While you generally want to avoid heavy API calls inside a low-level hook, doing this only on WM_LBUTTONDOWN and WM_RBUTTONDOWN is perfectly fine. You are only incurring that ~1ms penalty once per click, not on every single mouse movement.", as per the suggestion in(it's private, you can't access it/read/see it, don't try): https://gemini.google.com/app/d04c99222a90158d But I'd also need to do it in WM_MOUSEMOVE:checkForMissedGestureOnNextMove:missedGestureRecoveryEnabled in VK_LBUTTON and VK_RBUTTON, oh wait, no I don't because they both use tryBeginMoveGestureAt respectively tryBeginResizeGestureAt. Well, looking at this myself, i just have to modify shouldBypassGestureNow() to use isWindowFullscreenOnMonitor(wantTargetWnd) directly instead (and ofc. it needs a hwnd arg)! and don't modify anything else, well ok, can't because hwnd is detected inside the tryBegin*() functions!!
 //made AttachThreadInput optional,but can't fix the Start Menu issue//* these 2 loglines happen every time I try to winkey+LMB drag a cmd.exe window that's running as Admin:

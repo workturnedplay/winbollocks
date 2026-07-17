@@ -2356,18 +2356,46 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 	if hwnd == 0 {
 		return false
 	}
+
+	// FIX: Exclude regular maximized windows (like Notepad).
+	// They retain their title bar style even though their window rect bleeds
+	// past the monitor edges. True fullscreen or borderless windows drop WS_CAPTION.
+	// We use ^uintptr(15) to represent -16 (GWL_STYLE) to prevent Go constant overflow errors.
+
+	//too convoluted:
+	// const GWL_STYLE = ^uintptr(15)
+	// styleRes := procGetWindowLongPtrW.Call(uintptr(hwnd), GWL_STYLE)
+	// if !styleRes.Failed() {
+	// 	const WS_CAPTION uintptr = 0x00C00000 // WS_BORDER | WS_DLGFRAME
+	// 	if (styleRes.R1 & WS_CAPTION) == WS_CAPTION {
+	// 		return false // It's just a normal window (likely maximized)
+	// 	}
+	// }
+
+	if style, err := getWindowLongPtr(hwnd, GWL_STYLE); err != nil {
+		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
+		return false
+	} else {
+		if (style & WS_CAPTION) == WS_CAPTION {
+			return false // It's just a normal window (likely maximized)
+		}
+	}
+
 	var r RECT
 	if res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r))); res.Failed() {
+		logf("isWindowFullscreenOnMonitor:GetWindowRect failed, err:%v", res.Err)
 		return false
 	}
 	res := procMonitorFromWindow.Call(uintptr(hwnd), MONITOR_DEFAULTTONEAREST)
 	hMon := res.R1
 	if hMon == 0 {
+		logf("isWindowFullscreenOnMonitor:MonitorFromWindow says no monitor!")
 		return false
 	}
 	var mi MONITORINFO
 	mi.CbSize = uint32(unsafe.Sizeof(mi))
 	if res2 := procGetMonitorInfo.Call(hMon, uintptr(unsafe.Pointer(&mi))); res2.Failed() {
+		logf("isWindowFullscreenOnMonitor:GetMonitorInfo failed, err:%v", res2.Err)
 		return false
 	}
 	return r.Left <= mi.RcMonitor.Left &&
@@ -2473,8 +2501,9 @@ func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 const (
 	WS_CHILD         = 0x40000000
 	WS_POPUP         = 0x80000000
-	WS_EX_TOOLWINDOW = 0x00000080
+	WS_CAPTION       = 0x00C00000
 	WS_EX_NOACTIVATE = 0x08000000
+	WS_EX_TOOLWINDOW = 0x00000080
 )
 const WS_EX_TOPMOST = 0x00000008
 const (
@@ -2541,15 +2570,15 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 	// exStyle, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_EXSTYLE))
 	style, err := getWindowLongPtr(hwnd, GWL_STYLE)
 	if err != nil {
-		logf("GetWindowLongPtr STYLE failed: %v", err)
-		reason = "GetWindowLongPtr STYLE failed"
+		logf("GetWindowLongPtr GWL_STYLE failed: %v", err)
+		reason = "GetWindowLongPtr GWL_STYLE failed"
 		return
 	}
 
 	exStyle, err := getWindowLongPtr(hwnd, GWL_EXSTYLE)
 	if err != nil {
-		logf("GetWindowLongPtr EXSTYLE failed: %v", err)
-		reason = "GetWindowLongPtr EXSTYLE failed"
+		logf("GetWindowLongPtr GWL_EXSTYLE failed: %v", err)
+		reason = "GetWindowLongPtr GWL_EXSTYLE failed"
 		return
 	}
 
@@ -6748,7 +6777,7 @@ func injectRMBUp() {
 func initDarkMode() {
 	uxtheme := windows.NewLazySystemDLL("uxtheme.dll")
 	if err := uxtheme.Load(); err != nil {
-		logf("Failed to load uxtheme.dll for dark mode: %v", err)
+		logf("initDarkMode: Failed to load uxtheme.dll for dark mode: %v", err)
 		return
 	}
 
@@ -6758,16 +6787,25 @@ func initDarkMode() {
 
 	// Ordinal 135: SetPreferredAppMode (Windows 10 1903+) / AllowDarkModeForApp (Windows 10 1809)
 	if procSetPreferredAppMode, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 135); err == nil {
-		syscall.SyscallN(procSetPreferredAppMode, AllowDark)
+		r1, _, errno := syscall.SyscallN(procSetPreferredAppMode, AllowDark)
+		if errno != 0 {
+			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) returned errno: %v", errno)
+		} else {
+			// SetPreferredAppMode usually returns the previous state as r1.
+			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, prev mode: %d", r1)
+		}
 	} else {
-		logf("Failed to find uxtheme ordinal 135: %v", err)
+		logf("initDarkMode: Failed to find uxtheme ordinal 135: %v", err)
 	}
 
 	// Ordinal 136: FlushMenuThemes (forces Windows to refresh the menu rendering cache)
 	if procFlushMenuThemes, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 136); err == nil {
-		syscall.SyscallN(procFlushMenuThemes)
+		_, _, errno := syscall.SyscallN(procFlushMenuThemes)
+		if errno != 0 {
+			logf("initDarkMode: uxtheme ordinal 136 (FlushMenuThemes) returned errno: %v", errno)
+		}
 	} else {
-		logf("Failed to find uxtheme ordinal 136: %v", err)
+		logf("initDarkMode: Failed to find uxtheme ordinal 136: %v", err)
 	}
 }
 
