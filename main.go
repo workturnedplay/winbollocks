@@ -548,6 +548,7 @@ const (
 	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY    = 11
 	MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG          = 12
 	MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN = 13
+	MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS = 14
 
 	MF_STRING = 0x0000
 
@@ -861,6 +862,7 @@ var bringToFrontOnDrag atomic.Bool
 // result updated on each foreground change by winEventProc.
 var bypassGesturesWhenFullscreen atomic.Bool
 var foregroundIsFullscreen atomic.Bool
+var useThreadAttachInputForFocus atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -2292,7 +2294,26 @@ func isInSameThreadID(hwnd windows.Handle) bool {
 	return uint32(res1.R1 /*aka tid aka thread id*/) == windows.GetCurrentThreadId()
 }
 
-// requires: procAttachThreadInput
+// requires: procAttachThreadInput to have been done first, to work. XXX: apparently, 17 July 2026, it doesn't require this anymore!!?! maybe I changed something via w11privacy ?! as it used to require it or it would focus-steal prevent it from getting focused!
+/*
+Why your app (winbollocks) doesn't need AttachThreadInput
+
+Windows explicitly outlines the rules for when a process is allowed to call SetForegroundWindow successfully. An app is granted focus privileges if:
+
+    It is already the foreground process.
+
+    It received the last input event.
+
+    It is handling a window hook.
+
+Because your app operates via low-level global hooks (WH_MOUSE_LL and WH_KEYBOARD_LL), you are intercepting physical hardware events (Winkey + LMB) in real-time. The OS recognizes that your application is directly tied to the user's active, physical input. Therefore, Windows automatically grants your process the privilege to change the foreground window.
+
+    When it works: SetForegroundWindow succeeds instantly without any thread attaching.
+
+    When it fails (The Start Menu case): When the modern Windows Start Menu or Shell is open, the OS enforces an absolute lock. In this edge case, SetForegroundWindow fails. But guess what? AttachThreadInput doesn't bypass this lock either!
+
+So, in the scenarios where SetForegroundWindow works, it works entirely on its own. In the scenarios where it gets blocked by the Shell, AttachThreadInput was failing or doing nothing anyway.
+*/
 func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 	res1 := procSetForegroundWindow.Call(uintptr(target))
 	//if fgRet != 1 { // this was wrong
@@ -2451,7 +2472,21 @@ func forceForeground(target windows.Handle) bool {
 					//lastErr := windows.GetLastError()
 					// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
 					//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err='%v' callErr:'%v'", res1.R1, res1.Err, res1.CallStatus)
+					/*
+						The SetForegroundWindow Silent Failure
+						The Culprit: The Windows 10/11 Start Menu (Focus Stealing Prevention).
+						When the Start Menu is open, the Windows Shell (StartMenuExperienceHost.exe) aggressively locks the foreground. Windows actively blocks background applications from stealing focus to prevent malicious pop-ups from hijacking your keystrokes while you're trying to search or launch an app.
+						When your code calls SetForegroundWindow while Start is open:
+						    It returns 0 (Failure).
+						    GetLastError() returns 0 ("The operation completed successfully").
+						This isn't a bug in Go or your code; this is Windows politely saying, "I heard your request perfectly, and the answer is absolutely not."
+							- Gemini 3.1 Pro
+						so since we swallow the LMB click when gesture triggers for ModeMove, and we instead try to basically steal the focus from Start Menu, win11 disallows this. If LMB were allowed then it woulda worked, which is why the fallback synthetic/injected LMB click works and will focus it.
+
+						So the error below is:
+						"failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=0 err='"SetForegroundWindow" windows call reported failure (ret=0) but no usable error was provided' callErr:'The operation completed successfully.'"
+					*/
+					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err='%v' callErr:'%v' (this usually happens because Start menu was open, as: ret==0 and callErr is success)", res1.R1, res1.Err, res1.CallStatus)
 					return false
 				} else {
 					return true
@@ -2464,57 +2499,77 @@ func forceForeground(target windows.Handle) bool {
 			}
 			//unreachable()
 		}
-	} // a block
+	} // a block to not leak defined vars
 
-	var targetProcessID uint32
-	res2 := procGetWindowThreadProcessID.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessID)))
-	//if r1 == 0 {
-	if res2.Failed() {
-		logf("GetWindowThreadProcessId failed: %v", res2.Err)
-		return false
-	}
-	var targetThreadID uint32 = uint32(res2.R1)
+	if useThreadAttachInputForFocus.Load() {
+		class := getClassName(target)
+		isConsole := class == "ConsoleWindowClass" || class == "PseudoConsoleWindow"
+		//logf("isConsole:%v class:%v", isConsole, class) //XXX:ok, admin console(or non-admin but set to conhost aka Console Host Terminal in Settings->Default Terminal Application) is console, the normal non-admin one (with "Let Windows decide" or "Windows Terminal" in same Settings) is not console.
 
-	// XXX: assuming we're used on mainThreadID only! we should remove these checks and just use mainThreadID
-	curTid := windows.GetCurrentThreadId()
-	if curTid != mainThreadID {
-		logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
-	}
+		if !isConsole {
+			// Only attempt AttachThreadInput for normal GUI windows, else it will fail anyway.
 
-	/*
-		When you call AttachThreadInput, you aren't just giving yourself permission to move a window; you are literally merging the input message queues of the two threads.
+			/*
+				When you call AttachThreadInput, you aren't just giving yourself permission to move a window; you are literally merging the input message queues of the two threads.
 
-		As shown in the logic of Windows message queues, each thread usually has its own "mailbox." AttachThreadInput solders those two mailboxes together.
-		 If the target thread stops checking its mail, your thread's mail also piles up. By using the SendMessageTimeout "ping" first, you ensure that
-		 the other thread is currently checking its mailbox before you solder yours to it.
-	*/
-	// Use SendMessageTimeout to see if the window is alive
-	var result uintptr
-	res3 := procSendMessageTimeout.Call(
-		uintptr(target),
-		WM_NULL, // WM_NULL (harmless ping)
-		0,
-		0,
-		SMTO_ABORTIFHUNG,  //0x0002, // SMTO_ABORTIFHUNG
-		HungWindowTimeout, // 150ms timeout
-		uintptr(unsafe.Pointer(&result)),
-	)
+				As shown in the logic of Windows message queues, each thread usually has its own "mailbox." AttachThreadInput solders those two mailboxes together.
+				 If the target thread stops checking its mail, your thread's mail also piles up. By using the SendMessageTimeout "ping" first, you ensure that
+				 the other thread is currently checking its mailbox before you solder yours to it.
+			*/
 
-	//if err2 != nil || ret == 0 {
-	if res3.Failed() {
-		logf("Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
-		return false
-	}
+			var targetProcessID uint32
+			res2 := procGetWindowThreadProcessID.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessID)))
+			//if r1 == 0 {
+			if res2.Failed() {
+				logf("GetWindowThreadProcessId failed: %v", res2.Err)
+				return false
+			}
+			var targetThreadID uint32 = uint32(res2.R1)
 
-	// Only if the window responds do we proceed with the attachment
-	res4 := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(1))
-	// if attachRet == 0 {
-	if res4.Failed() {
-		logf("AttachThreadInput failed: %v", res4.Err)
-		return false
-	}
+			// XXX: assuming we're used on mainThreadID only! we should remove these checks and just use mainThreadID
+			curTid := windows.GetCurrentThreadId()
+			if curTid != mainThreadID {
+				logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
+			}
 
-	defer procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)) // Detach always
+			// Use SendMessageTimeout to see if the window is alive
+			var result uintptr
+			res3 := procSendMessageTimeout.Call(
+				uintptr(target),
+				WM_NULL, // WM_NULL (harmless ping)
+				0,
+				0,
+				SMTO_ABORTIFHUNG,  //0x0002, // SMTO_ABORTIFHUNG
+				HungWindowTimeout, // 150ms timeout
+				uintptr(unsafe.Pointer(&result)),
+			)
+
+			//if err2 != nil || ret == 0 {
+			if res3.Failed() {
+				logf("Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
+				return false
+			}
+
+			// Only if the window responds do we proceed with the attachment
+			res4 := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(1))
+			// if attachRet == 0 {
+			if res4.Failed() {
+				/*
+					The reality: Microsoft explicitly hardcodes AttachThreadInput to fail if the target thread belongs to a classic console window (conhost.exe or cmd.exe). Console windows do not have a standard USER32 message queue in the way GUI apps do; their input is managed by the Client/Server Runtime Subsystem (CSRSS) or the Conhost subsystem.
+					When you ask Windows to attach to a console thread, the OS rejects it and returns ERROR_INVALID_PARAMETER (87) — aka "The parameter is incorrect."
+						- Gemini 3.1 Pro
+				*/
+				logf("AttachThreadInput failed: %v", res4.Err)
+				return false
+			}
+
+			defer procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)) // Detach always
+		} //was not console
+	} // was useThreadAttachInputForFocus
+
+	// //FIXME: we should only do this if Start menu is actually open/focused, no?! actually doesn't work at all, bad Gemini suggestion!
+	// // Tap ALT to bypass Start Menu lock
+	// injectKeyTap(VK_MENU)
 
 	succeeded := focusThisHwnd(target) // still attached here.
 
@@ -3881,8 +3936,20 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				//logf("injecting LMB click")
 				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
-				//we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/initial window where gesture started upon.
+				//XXX: we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/initial window where gesture started upon.
 				injectLMBClickAtCoords(x, y)
+
+				//XXX: this is bad, it will sometimes move the window to these coords! sometimes it will fail completely because apparently window moved by some pixels down-right and thus it missed clicking it?!
+				// // Don't use the raw (x,y) from lParam which might be over a button.
+				// // Instead, get the target window's rect.
+				// var rect RECT
+				// procGetWindowRect.Call(uintptr(targetWindow), uintptr(unsafe.Pointer(&rect)))
+
+				// // Click 10 pixels right and 10 pixels down from the top-left corner (usually safe Title Bar space)
+				// safeX := rect.Left //+ 10
+				// safeY := rect.Top  //+ 10
+
+				// injectLMBClickAtCoords(safeX, safeY)
 			}
 			// // Non-attachment focus: Simulate safe click to focus, doesn't work due to focus stealing prevention (win11) and thus only flashes the taskbar button of the target window. Actually the flashing is due to the above focus try(via attach thread first) failing! This may or may not do it alone, unsure.
 			// ret, _, err := procPostMessage.Call(uintptr(targetWnd), WM_LBUTTONDOWN, 1, makeLParam(10, 10)) // MK_LBUTTON = 1, safe pos
@@ -3914,8 +3981,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			logf("popping tray menu")
 
-			focusText := mustUTF16("Activate window when moved if not in focus (uses thread-attaching focus method).")
-			bringToFrontOnDragText := mustUTF16("Bring window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
+			focusText := mustUTF16("Activate(aka focus) window when moved if not in focus.")
+			bringToFrontOnDragText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
+			useThreadAttachInputForFocusText := mustUTF16("Use AttachThreadInput before attempting any window focus (else focus stealing prevention might be in effect!)")
 			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
@@ -3939,11 +4007,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			exitText := mustUTF16("Exit")
 
-			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
-			if focusOnDrag.Load() {
-				actFlags |= MF_CHECKED
-			}
-
 			res1 := procCreatePopupMenu.Call()
 			if res1.Failed() {
 				logf("in wndProc, WM_MYSYSTRAY, failed to CreatePopupMenu, err=%v", res1.Err)
@@ -3951,8 +4014,29 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			hMenu := res1.R1
 
+			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
+			if focusOnDrag.Load() {
+				actFlags |= MF_CHECKED
+			}
 			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
 				uintptr(unsafe.Pointer(focusText)))
+
+			var bringToFrontOnDragFlags uintptr = MF_STRING
+			if bringToFrontOnDrag.Load() {
+				bringToFrontOnDragFlags |= MF_CHECKED
+			}
+			// if !focusOnDrag.Load() { //XXX:actually don't, because if it's focused, we can bring it to front
+			// 	bringToFrontOnDragFlags |= MF_DISABLED | MF_GRAYED
+			// }
+			procAppendMenu.Call(hMenu, bringToFrontOnDragFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG,
+				uintptr(unsafe.Pointer(bringToFrontOnDragText)))
+
+			var useThreadAttachInputForFocusFlags uintptr = MF_STRING
+			if useThreadAttachInputForFocus.Load() {
+				useThreadAttachInputForFocusFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, useThreadAttachInputForFocusFlags, MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS,
+				uintptr(unsafe.Pointer(useThreadAttachInputForFocusText)))
 
 			var lmbFlags uintptr = MF_STRING
 			if doLMBClick2FocusAsFallback.Load() {
@@ -4027,13 +4111,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			procAppendMenu.Call(hMenu, injectButtonUpFlags, MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY,
 				uintptr(unsafe.Pointer(injectButtonUpOnMissedGestureRecoveryText)))
-
-			var bringToFrontOnDragFlags uintptr = MF_STRING
-			if bringToFrontOnDrag.Load() {
-				bringToFrontOnDragFlags |= MF_CHECKED
-			}
-			procAppendMenu.Call(hMenu, bringToFrontOnDragFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG,
-				uintptr(unsafe.Pointer(bringToFrontOnDragText)))
 
 			var bypassWhenFullscreenFlags uintptr = MF_STRING
 			if bypassGesturesWhenFullscreen.Load() {
@@ -4154,6 +4231,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
 				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
+
+			case MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS:
+				useThreadAttachInputForFocus.Store(!useThreadAttachInputForFocus.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -4964,6 +5044,8 @@ func init() {
 	const bringToFrontByDefaultOnGesture = true
 	focusOnDrag.Store(bringToFrontByDefaultOnGesture)        // focus window when gesture applies on it, ie. on drag-Move (but TODO: ? this doesn't apply to on-resize hmm)
 	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture) // default to same as above ^ TODO: should I make this apply to resize as well?
+
+	useThreadAttachInputForFocus.Store(false) // default false because for some reason it doesn't seem needed right now 17 July 2026, for me, tho I coulda sworn it was, before!
 
 	//XXX: needed for cmd.exe running as Admin(because thread-attaching focus method fails!), not needed for task manager (thread-attaching method works!)
 	//also needed for focusing a target window while start menu is open already, because thread-attaching focus method fails.
