@@ -9,6 +9,13 @@ issues:
   max-issues-per-linter: 0
   max-same-issues: 0
   exclude-use-default: false
+  new: false
+  rules:
+    - linters:
+        - govet
+      text: "shadows declaration"
+      severity: error
+
 #  exclude-rules:
 #    - linters: [revive]
 #      text: "ALL_CAPS"
@@ -44,7 +51,7 @@ linters:
     - revive
     - misspell
     - unconvert
-    - whitespace
+    # - whitespace #no more: unnecessary trailing newline (whitespace)
 
     # --- unused / dead code ---
     - unused
@@ -96,9 +103,11 @@ linters:
         - name: var-naming
           disabled: true
         - name: early-return
+          disabled: true
         - name: error-strings
         - name: error-naming
         - name: exported
+          disabled: true #no more  exported: exported type FailoverSelector should have comment or be unexported (revive)
         - name: unexported-return
         - name: unused-parameter
         - name: empty-lines
@@ -112,11 +121,13 @@ linters:
         - performance
         - opinionated
       disabled-checks:
+        - emptyStringTest
         - unnamedResult       # you *intentionally* use named returns
         - ifElseChain
         - octalLiteral
         - hugeParam
         - commentFormatting #commentFormatting: put a space between `//` and comment text (gocritic)go-golangci-lint-v2
+        - commentedOutCode #no more  commentedOutCode: may want to remove commented-out code (gocritic) 
 
     gosec:
       severity: medium
