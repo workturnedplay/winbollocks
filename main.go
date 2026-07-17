@@ -3880,6 +3880,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			logf("popping tray menu")
 
 			focusText := mustUTF16("Activate window when moved if not in focus (uses thread-attaching focus method).")
+			bringToFrontOnDragText := mustUTF16("Bring window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
 			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
@@ -3899,7 +3900,6 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 
 			injectButtonUpOnMissedGestureRecoveryText := mustUTF16("(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)")
-			bringToFrontOnDragText := mustUTF16("Bring window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
 			bypassWhenFullscreenText := mustUTF16("Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)")
 
 			exitText := mustUTF16("Exit")
@@ -4926,7 +4926,9 @@ func init() {
 	isAdmin = token.IsElevated() // must init this before setting missedGestureRecoveryEnabled which depends on it, so either put it in same init() and do it first(like now), or put its init() before the init() of missedGestureRecoveryEnabled
 
 	//defaults:
-	focusOnDrag.Store(true)
+	const bringToFrontByDefaultOnGesture = true
+	focusOnDrag.Store(bringToFrontByDefaultOnGesture)        // focus window when gesture applies on it, ie. on drag-Move (but TODO: ? this doesn't apply to on-resize hmm)
+	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture) // default to same as above ^ TODO: should I make this apply to resize as well?
 
 	//XXX: needed for cmd.exe running as Admin(because thread-attaching focus method fails!), not needed for task manager (thread-attaching method works!)
 	//also needed for focusing a target window while start menu is open already, because thread-attaching focus method fails.
@@ -4946,7 +4948,6 @@ func init() {
 
 	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
 
-	bringToFrontOnDrag.Store(false)           // default off; opt-in
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
 	foregroundIsFullscreen.Store(false)       // seeded properly in initForegroundIntegrityState()
 
