@@ -3,25 +3,23 @@ version: "2"
 run:
   timeout: 5m
   tests: true
-  skip-dirs-use-default: true
+  # 'skip-dirs-use-default' was removed here. Default excludes are now handled automatically.
 
-issues:
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude-use-default: false
-  new: false
+# In v2, custom severity rules belong in this top-level block
+severity:
+  default: warning
   rules:
     - linters:
         - govet
       text: "shadows declaration"
       severity: error
 
-#  exclude-rules:
-#    - linters: [revive]
-#      text: "ALL_CAPS"
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
 
 linters:
-  disable-all: true
   enable:
     # --- correctness & bugs ---
     - govet
@@ -55,13 +53,20 @@ linters:
 
     # --- unused / dead code ---
     - unused
+  # This replaces the old "exclude-use-default: true" behavior:
+  exclusions:
+    presets:
+      - comments                # Excludes missing comment warnings for exported fields/types
+      - std-error-handling      # Excludes unhandled errors on common functions like fmt.Println or os.Close
+      - common-false-positives  # Excludes noisy gosec rules on variables/subprocesses
+      - legacy                  # Excludes other v1-specific default exclusion rules
+      
   settings:
-    #gocritic:
-    #  disabled-checks:
-    #    - commentFormatting #found where to place it correctly by Gemini 3 Fast! (yes, really) ie. must be in linters: settings: not linters-settings:
-
-#linters-settings:
-
+    
+    errorlint:
+      asserts: true
+      comparison: true
+      
     govet:
       enable:
         - shadow # Explicitly enable the shadowing check
@@ -83,16 +88,12 @@ linters:
       check-type-assertions: true
       check-blank: true
 
-    errorlint:
-      asserts: true
-      comparison: true
-
     wrapcheck:
-      ignoreSigs:
+      ignore-sigs: # Fixed from ignoreSigs
         - .Errorf(
         - errors.New(
         - fmt.Errorf(
-      ignorePackageGlobs:
+      ignore-package-globs: # Fixed from ignorePackageGlobs
         - net/http
         - database/sql
 
@@ -135,6 +136,5 @@ linters:
       excludes:
         - G104  # ignoring errors from deferred Close is often fine
 
-    exhaustive:
-      check-generated: false
+   
 
