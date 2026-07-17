@@ -639,7 +639,7 @@ func CheckWinResult(
 			// Local compile-time assertion trap(to avoid that inner 'if'):
 			type _ [0 - int(windows.ERROR_SUCCESS)]byte
 
-			// Compile-time assertion that ERROR_SUCCESS is 0.
+			// on-purpose-redundant Compile-time assertion that ERROR_SUCCESS is 0.
 			// If it is NOT 0, this evaluates to [-1]int, which causes a compiler error.
 			var _ [0 - int(windows.ERROR_SUCCESS)]int
 
@@ -1031,11 +1031,12 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 //
 // Returns a non-empty string and nil error on success, or an empty string with error on failure.
 func QueryFullProcessName(pid uint32) (string, error) {
-	h, err0 := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	hProc, err0 := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err0 != nil {
 		return "", fmt.Errorf("OpenProcess failedfor PID %d: %w", pid, err0)
 	}
-	defer windows.CloseHandle(h)
+	//defer windows.CloseHandle(hProc)
+	defer closeHandleLogged(hProc, "QueryFullProcessName:OpenProcess hProc")
 
 	// Start with MAX_PATH (260)
 	//Yes, size remains a uint32 on both x86 and x64. This is because the Windows API function QueryFullProcessImageNameW
@@ -1053,7 +1054,7 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		// on input, and returns the length WITHOUT the null terminator on success.
 
 		res1 := procQueryFullProcessName.Call(
-			uintptr(h),
+			uintptr(hProc),
 			0,
 			uintptr(unsafe.Pointer(&buf[0])),
 			uintptr(unsafe.Pointer(&size)),
@@ -1174,7 +1175,8 @@ func GetProcessName(pid uint32) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer windows.CloseHandle(snapshot)
+	//defer windows.CloseHandle(snapshot)
+	defer closeHandleLogged(snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
 
 	var entry windows.ProcessEntry32
 	entry.Size = uint32(unsafe.Sizeof(entry))
@@ -1291,7 +1293,11 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("OpenSCManager failed: %w", err)
 	}
-	defer windows.CloseServiceHandle(scm)
+	defer func() {
+		if xerr := windows.CloseServiceHandle(scm); xerr != nil {
+			Logger.Load().Debug("CloseServiceHandle failed in GetServiceNamesFromPIDUncached:OpenSCManager", slog.String("err", xerr.Error()))
+		}
+	}()
 
 	// We'll need these to persist across the closure calls
 	var servicesReturned uint32
@@ -2415,3 +2421,14 @@ var (
 	OsRemoveFunc    = os.Remove
 	ReplaceFileFunc = ReplaceFile
 )
+
+func closeHandleLogged(h windows.Handle, context string) {
+	if err := windows.CloseHandle(h); err != nil {
+		//Logged shouldn't ever be nil here due to init()
+		Logger.Load().Debug("CloseHandle failed.",
+			//"context", context, "err", err, //XXX: yeah this works, doesn't need slog.String("context", context) and the other for err! but I'm not gonna use this pattern!
+			slog.String("context", context),
+			SafeErr(err),
+		)
+	}
+}
