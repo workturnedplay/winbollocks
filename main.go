@@ -1439,14 +1439,16 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	if err != nil {
 		return 0, fmt.Errorf("OpenProcess failed: %w", err)
 	}
-	defer windows.CloseHandle(hProc)
+	//defer windows.CloseHandle(hProc)
+	defer closeHandleLogged(hProc, "processIntegrityLevel:OpenProcess hProc")
 
 	var token windows.Token
 	err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token)
 	if err != nil {
 		return 0, fmt.Errorf("OpenProcessToken failed: %w", err)
 	}
-	defer token.Close()
+	//defer token.Close()
+	defer closeHandleLogged(windows.Handle(token), "processIntegrityLevel:OpenProcessToken token")
 
 	var needed uint32
 	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
@@ -1524,7 +1526,7 @@ func initTray() error {
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 	//if ret1 == 0 {
 	if res2.Failed() {
-		logf("Failed to add tray icon (real error): '%v' (code %d)", res2.Err, res2.Err)
+		logf("Failed to add tray icon (real error): '%v'", res2.Err)
 		// You could exitf or fallback here, but for now just log
 	}
 
@@ -1532,7 +1534,7 @@ func initTray() error {
 	res3 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
 	//if ret2 == 0 {
 	if res3.Failed() {
-		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): '%v' (code %d)", res3.Err, res3.Err)
+		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): '%v'", res3.Err)
 		// You could exitf or fallback here, but for now just log
 	}
 
@@ -1582,17 +1584,20 @@ func showTrayInfo(title, msg string) {
 	trayIcon.UTimeoutOrVersion = 5000 //5sec, though Win11 ignores it and uses system accessibility settings)
 	copy(trayIcon.SzInfoTitle[:], windows.StringToUTF16(title))
 	copy(trayIcon.SzInfo[:], windows.StringToUTF16(msg))
-	procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon)))
+	if res1 := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon))); res1.Failed() {
+		logf("Failed to update tray icon info: %v", res1.Err)
+	}
 }
 
 /* ---------------- Drag Logic ---------------- */
 
-func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) {
+func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) bool {
 	var r RECT
-	procGetWindowRect.Call(
-		uintptr(hwnd),
-		uintptr(unsafe.Pointer(&r)),
-	)
+	res1 := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r)))
+	if res1.Failed() {
+		logf("GetWindowRect on target HWND=0x%X failed for move startup, err:%v", hwnd, res1.Err)
+		return false
+	}
 
 	// if mainMsgHwnd != 0 {
 	// 	procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0) // tell wndProc aka main thread to capture to your hidden window; it can only be done on same thread that made that hwnd
@@ -1614,6 +1619,7 @@ func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery boo
 
 	if cur := activeSession.Load(); cur != nil {
 		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
+		return false
 	}
 	activeSession.Store(&dragSession{
 		targetWnd:                hwnd,
@@ -1621,6 +1627,7 @@ func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery boo
 		state:                    dragState{startPt: pt, startRect: r},
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 	})
+	return true
 }
 
 func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) bool {
@@ -1643,8 +1650,7 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
 		//TODO: should I re-maximize if it was maximized, after drag/move is done?
 	}
-	startManualDrag(hwnd, pt, viaMissedGestureRecovery)
-	return true
+	return startManualDrag(hwnd, pt, viaMissedGestureRecovery)
 }
 
 // tryBeginMoveGestureAt is the shared "start (or restart) a window-move drag
@@ -1866,7 +1872,9 @@ func initOverlay() error {
 	wc.HInstance = windows.Handle(res1.R1 /*aka hinst*/)
 	// Add shadow/background if desired, but we'll paint it
 
-	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+	if res1b := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); res1b.Failed() {
+		return fmt.Errorf("RegisterClassEx failed in initOverlay(), err: %w", res1b.Err)
+	}
 
 	res2 := procCreateWindowEx.Call(
 		WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,
@@ -2062,12 +2070,13 @@ func isWindowForeground(hwnd windows.Handle) bool {
 	}
 	//To answer your performance and safety concerns: GetForegroundWindow and GetCursorPos are both "safe" to call within your mouseProc because they are simple getters
 	// that query the system's internal state without sending messages to other windows.
-	res1 := procGetForegroundWindow.Call()
-	if res1.R1 == 0 || res1.Failed() { //it's CheckNone so it never fails!
-		logf("in isWindowForeground, failed to GetForegroundWindow, err: %v callStatus: %v", res1.Err, res1.CallStatus)
+	fg := getForegroundWindow()
+	if fg == 0 {
+		logf("in isWindowForeground, failed to GetForegroundWindow, it returned hwnd 0x0")
 		return false
 	}
-	return windows.Handle(res1.R1) == hwnd
+
+	return fg == hwnd
 }
 
 func getForegroundWindow() windows.Handle {
@@ -2176,12 +2185,12 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	// The only reliable failure signal is GetLastError.
 	if ret == 0 {
 		// windows.GetLastError() is safer than trusting err blindly
-		lastErr := windows.GetLastError() //XXX: so, needed
+		lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far!
 		//if lastErr != windows.ERROR_SUCCESS {
 		if !errors.Is(lastErr, windows.ERROR_SUCCESS) {
-			//return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", lastErr)
-			//nolint:wrapcheck
-			return 0, lastErr
+			return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", lastErr)
+			// //nolint:wrapcheck
+			// return 0, lastErr
 		}
 	}
 
@@ -2397,17 +2406,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 	switch wParam {
 	case WM_LBUTTONDOWN: //LMB pressed aka LMBDown or LMB DOWN
 		// we don't want to trigger our drag gesture if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
-		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		var shiftDown bool = keyDown(VK_SHIFT)
-		var ctrlDown bool = keyDown(VK_CONTROL)
-		var altDown bool = keyDown(VK_MENU)
+		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
+		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		// var shiftDown bool = keyDown(VK_SHIFT)
+		// var ctrlDown bool = keyDown(VK_CONTROL)
+		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if !winGestureUsed.Load() { //wasn't set already
-				winGestureUsed.Store(true) // we used at least once of our gestures
-				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
-			}
+			markGestureUsedOnce()
 
-			tryBeginMoveGestureAt(info.Pt, false) // return value ignored: started, restarted, or ignored, we swallow LMB regardless.
+			if !tryBeginMoveGestureAt(info.Pt, false) {
+				logf("failed to begin Move gesture(the why should be above ^) on winkey+LMB pressed")
+			}
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter8 %d ns", nowDiff.Nanoseconds())
@@ -2437,10 +2446,7 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					if winDown && !shiftDown && !altDown && !ctrlDown {
 						switch {
 						case keyDown(VK_LBUTTON):
-							if !winGestureUsed.Load() {
-								winGestureUsed.Store(true)
-								injectShiftTapOnly()
-							}
+							markGestureUsedOnce()
 							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
 							if tryBeginMoveGestureAt(info.Pt, true) {
 								// The real LMB-down already reached the target window normally
@@ -2471,12 +2477,11 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 									logf("Injecting synthetic LMB-up for missed-gesture recovery drag (HWND=0x%X); note this will trigger an unintended click, especially if the initiating click landed on a button, or unwanted paste behavior in some console windows if RMB is used instead.", hwnd)
 									injectLMBUp()
 								}
+							} else {
+								logf("failed to begin Move gesture(the why should be above ^) while trying to start it as recovery")
 							}
 						case keyDown(VK_RBUTTON):
-							if !winGestureUsed.Load() {
-								winGestureUsed.Store(true)
-								injectShiftTapOnly()
-							}
+							markGestureUsedOnce()
 							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
 							if tryBeginResizeGestureAt(info.Pt, true) {
 								// See the identical comment in the LMB/ModeMove case above.
@@ -2491,6 +2496,8 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 									logf("Injecting synthetic RMB-up for missed-gesture recovery resize (HWND=0x%X); note in classic console windows (conhost) a bare RMB-up outside of an active selection triggers Paste, or pop the RMB menu in notepad.", hwnd)
 									injectRMBUp()
 								}
+							} else {
+								logf("Failed to begin Resize gesture (reason why should be above ^) while trying to start it as recovery.")
 							}
 						}
 						session = activeSession.Load() // may now be non-nil
@@ -2645,26 +2652,27 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					/* THE SELECT BLOCK:
 					   This is Go's magic for non-blocking communication.
 					*/
-					select {
-					case moveDataChan <- data:
-						// SUCCESS: The data was copied into the buffered channel.
-						// Now we ring the "Doorbell" to wake up the Main Thread.
-						// PostThreadMessage is an asynchronous "fire and forget" call.
-						//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
-						//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
-						res1 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
-						// if r == 0 {
-						if res1.Failed() {
-							logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", res1.Err)
-						}
+					enqueueMoveOrResize(data, "WM_MOUSEMOVE/ModeMove")
+					// select {
+					// case moveDataChan <- data:
+					// 	// SUCCESS: The data was copied into the buffered channel.
+					// 	// Now we ring the "Doorbell" to wake up the Main Thread.
+					// 	// PostThreadMessage is an asynchronous "fire and forget" call.
+					// 	//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					// 	//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
+					// 	res1 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
+					// 	// if r == 0 {
+					// 	if res1.Failed() {
+					// 		logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", res1.Err)
+					// 	}
 
-					default:
-						// FAIL: The channel (2048 slots) is completely full.
-						// This happens if the Main Thread is frozen (e.g., Admin console lag).
-						// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
-						// We just increment our "shame counter" and move on.
-						droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
-					}
+					// default:
+					// 	// FAIL: The channel (2048 slots) is completely full.
+					// 	// This happens if the Main Thread is frozen (e.g., Admin console lag).
+					// 	// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+					// 	// We just increment our "shame counter" and move on.
+					// 	droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+					// }
 
 					if ratelimitOnMove.Load() {
 						lastMovePostedTime.Store(int64(nowOffset))
@@ -2720,21 +2728,22 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				}
 
 				// Send to your mover channel
-				select {
-				case moveDataChan <- data:
-					// Trigger the move window
-					res1 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
-					// if r == 0 {
-					if res1.Failed() {
-						logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", res1.Err)
-					}
-				default:
-					// FAIL: The channel (2048 slots) is completely full.
-					// This happens if the Main Thread is frozen (e.g., Admin console lag).
-					// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
-					// We just increment our "shame counter" and move on.
-					droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
-				}
+				enqueueMoveOrResize(data, "WM_MOUSEMOVE/ModeResize")
+				// select {
+				// case moveDataChan <- data:
+				// 	// Trigger the move window
+				// 	res1 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
+				// 	// if r == 0 {
+				// 	if res1.Failed() {
+				// 		logf("PostMessage of WM_DO_SETWINDOWPOS for WM_MOUSEMOVE failed: %v", res1.Err)
+				// 	}
+				// default:
+				// 	// FAIL: The channel (2048 slots) is completely full.
+				// 	// This happens if the Main Thread is frozen (e.g., Admin console lag).
+				// 	// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+				// 	// We just increment our "shame counter" and move on.
+				// 	droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+				// }
 			} else //endif >=10ms, else drop it:
 			{
 				droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
@@ -2813,17 +2822,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		}
 
 	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
-		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		var shiftDown bool = keyDown(VK_SHIFT)
-		var ctrlDown bool = keyDown(VK_CONTROL)
-		var altDown bool = keyDown(VK_MENU)
+		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
+		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		// var shiftDown bool = keyDown(VK_SHIFT)
+		// var ctrlDown bool = keyDown(VK_CONTROL)
+		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if !winGestureUsed.Load() {
-				winGestureUsed.Store(true)
-				injectShiftTapOnly() // prevent releasing of winkey later from popping up Start menu!
-			}
+			markGestureUsedOnce()
 
-			tryBeginResizeGestureAt(info.Pt, false) // return value ignored: started, restarted, or ignored, we swallow RMB regardless.
+			if !tryBeginResizeGestureAt(info.Pt, false) {
+				logf("Failed to begin Resize gesture (reason why should be above ^) on winkey+RMB pressed")
+			}
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
@@ -2832,17 +2841,15 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		} //if
 
 	case WM_MBUTTONDOWN: //MMB pressed
-		var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		var shiftDown bool = keyDown(VK_SHIFT)
-		var ctrlDown bool = keyDown(VK_CONTROL)
-		var altDown bool = keyDown(VK_MENU)
+		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
+		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+		// var shiftDown bool = keyDown(VK_SHIFT)
+		// var ctrlDown bool = keyDown(VK_CONTROL)
+		// var altDown bool = keyDown(VK_MENU)
 
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
-			if !winGestureUsed.Load() { //wasn't set already
-				winGestureUsed.Store(true) // we used at least once of our gestures
-				injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
-			}
+			markGestureUsedOnce()
 
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
@@ -2898,25 +2905,27 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					// 	0,                             // unused, target is in the struct!
 					// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct, XXX: this was bad, it would get GC-ed, Grok figured it out after i was mid-refactoring via Gemini(which didn't)
 					// )
-					select {
-					case moveDataChan <- data:
-						// SUCCESS: The data was copied into the buffered channel.
-						// Now we ring the "Doorbell" to wake up the Main Thread.
-						// PostThreadMessage is an asynchronous "fire and forget" call.
-						//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
-						res2 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
-						// if r == 0 {
-						if res2.Failed() {
-							logf("PostMessage of WM_DO_SETWINDOWPOS for MMB failed: %v", res2.Err)
-						}
 
-					default:
-						// FAIL: The channel (2048 slots) is completely full.
-						// This happens if the Main Thread is frozen (e.g., Admin console lag).
-						// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
-						// We just increment our "shame counter" and move on.
-						droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
-					}
+					enqueueMoveOrResize(data, "WM_MBUTTONDOWN aka MMB")
+					// select {
+					// case moveDataChan <- data:
+					// 	// SUCCESS: The data was copied into the buffered channel.
+					// 	// Now we ring the "Doorbell" to wake up the Main Thread.
+					// 	// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
+					// 	//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
+					// 	res2 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
+					// 	// if r == 0 {
+					// 	if res2.Failed() {
+					// 		logf("PostMessage of WM_DO_SETWINDOWPOS for MMB failed: %v", res2.Err)
+					// 	}
+
+					// default:
+					// 	// FAIL: The channel (2048 slots) is completely full.
+					// 	// This happens if the Main Thread is frozen (e.g., Admin console lag).
+					// 	// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+					// 	// We just increment our "shame counter" and move on.
+					// 	droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+					// }
 				} else {
 					logf("hwnd == 0 for winkey+shift+MMB (bring focused window to front) thus nothing was done!")
 				}
@@ -2964,7 +2973,7 @@ func createMessageWindow() (windows.Handle, error) {
 	wc.LpszClassName = classNameUTF16
 	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
 	if res1.Failed() {
-		return 0, fmt.Errorf("GetModuleHandle(0) failed for class name %s, err: %w", className2, err)
+		return 0, fmt.Errorf("GetModuleHandle(0) failed for class name %s, err: %w", className2, res1.Err)
 	}
 	wc.HInstance = windows.Handle(res1.R1)
 
@@ -5786,7 +5795,7 @@ func setAndVerifyPriority() {
 	if res5.Succeeded() {
 		logf("Memory Priority set to %d where 5 is Normal", memPrio.MemoryPriority)
 	} else {
-		logf("Failed SetProcessInformation (Memory) to %d, r1: %v, err: %v, callStatus: %v", res5.R1, wantedMemPrio, res5.Err, res5.CallStatus)
+		logf("Failed SetProcessInformation (Memory) to %d, r1: %v, err: %v, callStatus: %v", wantedMemPrio, res5.R1, res5.Err, res5.CallStatus)
 	}
 
 	// --- I/O Priority (Using NTDLL) ---
@@ -6175,17 +6184,18 @@ func badprogramming(msg string) {
 
 func getProcessNameFast(pid uint32) string {
 	// PROCESS_QUERY_LIMITED_INFORMATION is very fast and doesn't require a snapshot
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return "<failed>"
 	}
-	defer windows.CloseHandle(h)
+	//defer windows.CloseHandle(hProc)
+	defer closeHandleLogged(hProc, "getProcessNameFast:OpenProcess hProc")
 
 	buf := make([]uint16, windows.MAX_PATH)
 	// #nosec G115 -- safe: buffer length is a small constant aka windows.MAX_PATH aka 260 which is well within uint32 bounds
 	size := uint32(len(buf))
 	// QueryFullProcessImageName is significantly faster than Toolhelp snapshots
-	err = windows.QueryFullProcessImageName(h, 0, &buf[0], &size)
+	err = windows.QueryFullProcessImageName(hProc, 0, &buf[0], &size)
 	if err != nil {
 		return "<not found>"
 	}
@@ -6352,3 +6362,46 @@ func initDarkMode() {
 const TPM_RETURNCMD = 0x0100
 
 var startupTerminalHwnd windows.Handle
+
+func closeHandleLogged(h windows.Handle, context string) {
+	if err := windows.CloseHandle(h); err != nil {
+		logf("CloseHandle failed for %s: %v", context, err)
+	}
+}
+
+func modifierKeyState() (winDown, shiftDown, ctrlDown, altDown bool) {
+	winDown = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	shiftDown = keyDown(VK_SHIFT)
+	ctrlDown = keyDown(VK_CONTROL)
+	altDown = keyDown(VK_MENU)
+	return
+}
+
+func markGestureUsedOnce() {
+	if !winGestureUsed.Load() { //wasn't set already
+		winGestureUsed.Store(true) // we used at least once of our gestures
+		injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
+	}
+}
+
+// enqueueMoveOrResize submits data to moveDataChan and wakes the main thread's
+// message loop to drain it. context is only used in the failure log.
+func enqueueMoveOrResize(data WindowMoveData, context string) {
+	// Send to your mover channel
+	select {
+	case moveDataChan <- data:
+		// SUCCESS: The data was copied into the buffered channel.
+		// Now we ring the "Doorbell" to wake up the Main Thread.
+		// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
+		//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
+		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
+			logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context, res.Err)
+		}
+	default:
+		// FAIL: The channel (2048 slots) is completely full.
+		// This happens if the Main Thread is frozen (e.g., Admin console lag).
+		// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
+		// We just increment our "shame counter" and move on.
+		droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+	}
+}
