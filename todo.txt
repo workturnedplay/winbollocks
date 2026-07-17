@@ -1,4 +1,6 @@
 todo:
+* bypassGesturesWhenFullscreen (the atomic bool) seems flakey or too later to be updated! and mouseProc's LMB/RMB down will check for it before it actually gets updated by wndProc, thus will trigger the gesture.
+* when resizing maximized window, the same concept from when moving a maximized window should be applied in terms of what happens to the window after restore, ie. it should be moved to where the cursor is, such that the cursor is relatively in the same spot in the now-restored windows as it were when the window was maximized, else the cursor appears to be outside the window at a distance while the resize gesture is happening, thus limiting the possible resize range as cursor reaches desktop edges.
 
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 * could maybe check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
