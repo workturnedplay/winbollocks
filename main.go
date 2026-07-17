@@ -549,6 +549,8 @@ const (
 	MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG          = 12
 	MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN = 13
 	MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS = 14
+	MENU_TOGGLE_ACTIVATE_RESIZE                 = 15
+	MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE        = 16
 
 	MF_STRING = 0x0000
 
@@ -856,12 +858,24 @@ var injectButtonUpOnMissedGestureRecovery atomic.Bool
 // to the back). Toggleable via systray.
 var bringToFrontOnDrag atomic.Bool
 
-// bypassGesturesWhenFullscreen, when true, suppresses all winkey+mouse
-// gestures while the foreground window covers its entire monitor (fullscreen
-// exclusive or borderless-fullscreen). foregroundIsFullscreen is the cached
-// result updated on each foreground change by winEventProc.
+// focusOnResize / bringToFrontOnResize are ModeResize's independent
+// counterparts to focusOnDrag / bringToFrontOnDrag above: whether to focus,
+// and/or bring to front, the target window the moment a resize gesture
+// starts. Kept as separate toggles (not shared with the move-gesture ones)
+// so the two modes can be configured independently. Toggleable via systray.
+var focusOnResize atomic.Bool
+var bringToFrontOnResize atomic.Bool
+
+// bypassGesturesWhenFullscreen, when true, suppresses winkey+mouse gestures
+// whose resolved target window is fullscreen (exclusive or
+// borderless-fullscreen) on its monitor. Checked live via
+// isWindowFullscreenOnMonitor against that specific target at gesture-start
+// time (see shouldBypassGestureNow) rather than against a cached
+// foreground-change snapshot, so toggling this setting or switching targets
+// mid-session is always reflected immediately instead of lagging behind the
+// last EVENT_SYSTEM_FOREGROUND WinEvent.
 var bypassGesturesWhenFullscreen atomic.Bool
-var foregroundIsFullscreen atomic.Bool
+
 var useThreadAttachInputForFocus atomic.Bool
 
 /* ---------------- Utilities ---------------- */
@@ -1620,7 +1634,7 @@ func showTrayInfo(title, msg string) {
 
 /* ---------------- Drag Logic ---------------- */
 
-func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool, wasMaximized bool, preRestoreRect RECT) bool {
+func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery, wasMaximized bool, preRestoreRect RECT) bool {
 	if cur := activeSession.Load(); cur != nil {
 		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
 		return false
@@ -1696,6 +1710,36 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, preRestoreRect)
 }
 
+// applyFocusAndBringToFrontOnGestureStart optionally brings targetWnd to the
+// front of the Z-order and/or focuses it, right after a move or resize
+// gesture has successfully started. bringToFront and focus are the
+// systray-toggleable settings for whichever gesture mode just started
+// (ModeMove passes &bringToFrontOnDrag/&focusOnDrag; ModeResize passes its
+// own independent &bringToFrontOnResize/&focusOnResize), so the two modes
+// remain fully independently configurable rather than sharing state.
+// callerName is only used to identify the caller in the WM_BRING_TO_FRONT
+// failure log.
+func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt POINT, bringToFront, focus *atomic.Bool, callerName string) {
+	if bringToFront.Load() {
+		// Post a dedicated bring-to-front message rather than routing through
+		// the move channel, which would be coalesced away by move events for
+		// the same HWND.
+		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
+			logf("%s: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", callerName, targetWnd, res.Err)
+		}
+	}
+	if focus.Load() && !isWindowForeground(targetWnd) { //TODO: should I move this in startDrag?
+		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
+
+		procPostMessage.Call(
+			uintptr(mainMsgHwnd),
+			WM_FOCUS_TARGET_WINDOW_SOMEHOW,
+			uintptr(targetWnd),     // wParam
+			makeLParam(pt.X, pt.Y), // lParam contains X and Y
+		)
+	}
+}
+
 // tryBeginMoveGestureAt is the shared "start (or restart) a window-move drag
 // targeting whatever window is under pt" logic. Used both by the real
 // WM_LBUTTONDOWN handler (pt = actual click point) and by the missed-gesture
@@ -1714,27 +1758,38 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 //     ModeResize/RMB path, which already did this correctly.
 //
 // If a ModeResize session is active instead, this is a no-op (finish the
-// resize first), matching prior behavior. Returns false if there's no
-// window under pt, or a resize is already running.
+// resize first), matching prior behavior.
+//
+// Returns (started, bypassed). bypassed is true only when the target window
+// under pt is fullscreen and bypassGesturesWhenFullscreen is enabled (see
+// shouldBypassGestureNow); callers must treat that case as "let the
+// originating input event pass through unswallowed" rather than as an
+// ordinary failure. started is false for any other reason nothing began (no
+// window under pt, a resize is already running, startDrag failed, etc.) —
+// callers should still swallow the originating input in that case.
 //
 // viaMissedGestureRecovery must be true only when called from the
 // missed-gesture recovery path (we never saw/swallowed the real LMB-down),
 // and false when called from the real WM_LBUTTONDOWN handler (we did). It's
 // stored on the resulting dragSession — see dragSession.viaMissedGestureRecover
-func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
+func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) (started, bypassed bool) {
 	wantTargetWnd := windowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window, window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)")
-		return false
+		return false, false
+	}
+
+	if shouldBypassGestureNow(wantTargetWnd) {
+		return false, true
 	}
 
 	if session := activeSession.Load(); session != nil {
 		if session.mode != ModeMove {
 			logf("Warning: Ignoring new move gesture because %v mode is already running on HWND=0x%X", session.mode, session.targetWnd)
-			return false
+			return false, false
 		}
 
-		//XXX: happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
+		//XXX: (might be obsolete comment:)happens when winkey+LMB then winkey+L to lock, release all, unlock, (now if u move mouse it no longer drags but)
 		// if you now start to hold winkey(it will drag if you move mouse) and then press(or hold) LMB (you're here) and
 		// move mouse while LMB is held it continues to drag/move that same window. Also covers a genuine doubled/duplicate
 		// LMB-down event for the SAME in-progress drag (ie. for wtw reasons!) - restarting fresh from the current pt/rect
@@ -1768,55 +1823,42 @@ func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	}
 	//FIXME: so we start the drag before doing the focus(which is below via WM_FOCUS_TARGET_WINDOW_SOMEHOW), works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)?!
 	if !startDrag(wantTargetWnd, pt, viaMissedGestureRecovery) {
-		return false
+		return false, false
 	}
 	//so startDrag succeeded if we're here
 	session := activeSession.Load()
 	if session == nil {
 		panic("bad coding: nil session after startDrag returned true")
 	}
-	if bringToFrontOnDrag.Load() {
-		// Post a dedicated bring-to-front message rather than routing through
-		// the move channel, which would be coalesced away by move events for
-		// the same HWND.
-		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(session.targetWnd), 0); res.Failed() {
-			logf("tryBeginMoveGestureAt: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", session.targetWnd, res.Err)
-		}
-	}
-	if focusOnDrag.Load() && !isWindowForeground(session.targetWnd) { //TODO: should I move this in startDrag?
-		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
-
-		procPostMessage.Call(
-			uintptr(mainMsgHwnd),
-			WM_FOCUS_TARGET_WINDOW_SOMEHOW,
-			uintptr(session.targetWnd), // wParam
-			makeLParam(pt.X, pt.Y),     // lParam contains X and Y
-		)
-	}
-	return true
+	applyFocusAndBringToFrontOnGestureStart(session.targetWnd, pt, &bringToFrontOnDrag, &focusOnDrag, "tryBeginMoveGestureAt")
+	return true, false
 }
 
 // tryBeginResizeGestureAt is tryBeginMoveGestureAt's ModeResize counterpart,
 // used by both the real WM_RBUTTONDOWN handler and the missed-gesture
-// recovery path from WM_MOUSEMOVE.
-func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
+// recovery path from WM_MOUSEMOVE. See tryBeginMoveGestureAt's doc comment
+// for the (started, bypassed) return-value contract.
+func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) (started, bypassed bool) {
 	wantTargetWnd := windowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window, window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)")
-		return false
+		return false, false
+	}
+
+	if shouldBypassGestureNow(wantTargetWnd) {
+		return false, true
 	}
 
 	if session := activeSession.Load(); session != nil {
 		if session.mode != ModeResize {
 			logf("Warning: Ignoring new resize gesture because %v mode is already running on HWND=0x%X", session.mode, session.targetWnd)
-			return false
+			return false, false
 		}
 
 		logf("already resizing a window, likely due to a Win+L lock interruption, rapid click overlay, or a duplicate RMB-down event.")
 		if session.targetWnd == 0 {
 			panic("impossible state: logic error: session is ModeResize but targetWnd is 0!")
 		}
-
 		// now, check if it's a new window or the same old one we were resizing
 		if session.targetWnd == wantTargetWnd {
 			// Same window case
@@ -1853,7 +1895,7 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	res1 := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r)))
 	if res1.Failed() {
 		logf("GetWindowRect on target HWND=0x%X failed(ret is 0) for resize startup, err:%v", wantTargetWnd, res1.Err)
-		return false
+		return false, false
 	}
 
 	// Reposition the restored window under the cursor BEFORE setting up the resize session
@@ -1880,7 +1922,7 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	h := r.Bottom - r.Top
 	if w <= 0 || h <= 0 {
 		logf("Refusing resize start: invalid window size %dx%d gotten for target HWND=0x%X", w, h, wantTargetWnd)
-		return false
+		return false, false
 	}
 	activeSession.Store(&dragSession{
 		targetWnd: wantTargetWnd,
@@ -1891,7 +1933,96 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 		initialAspectRatio:       float64(w) / float64(h),
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 	})
-	return true
+	session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
+	if session == nil {
+		panic("bad coding: nil session after storing new resize session")
+	}
+	applyFocusAndBringToFrontOnGestureStart(session.targetWnd, pt, &bringToFrontOnResize, &focusOnResize, "tryBeginResizeGestureAt")
+	return true, false
+}
+
+// tryPerformMMBGestureAt is MMB's counterpart to tryBeginMoveGestureAt /
+// tryBeginResizeGestureAt: resolves the window a winkey+MMB (shiftDown=false,
+// send-to-back) or winkey+shift+MMB (shiftDown=true, bring-to-front) gesture
+// would act on, applies the same live fullscreen-bypass check (see
+// shouldBypassGestureNow) against that resolved window, and if not bypassed
+// submits the Z-order change (throttled the same way the real-time handler
+// always was). Used by both the real WM_MBUTTONDOWN handler and the
+// missed-gesture recovery path in WM_MOUSEMOVE, so winkey+MMB now recovers
+// from a higher-UIPI foreground window the same way winkey+LMB/RMB already
+// did.
+//
+// Unlike the move/resize gestures, MMB has no persistent dragSession — it's
+// a single, immediate Z-order change — so there's no activeSession
+// interaction here.
+//
+// Returns (started, bypassed) with the same contract as
+// tryBeginMoveGestureAt: bypassed means "let the originating input event
+// pass through unswallowed"; started is false for any other reason nothing
+// was done (no resolvable target window) and callers should still swallow
+// the input, same as before this function existed. A throttled/dropped
+// attempt (see ShouldThrottle) still counts as started=true, matching the
+// original handler's silent-drop behavior (no failure is logged for it).
+func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
+	var hwnd windows.Handle
+	if !shiftDown {
+		// winkey + MMB -> send window under cursor to bottom of Z-order
+		hwnd = windowFromPoint(pt) // window under cursor
+	} else {
+		// winkey + shift + MMB -> bring currently focused window to top
+		res1 := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
+		if res1.Failed() {
+			logf("Couldn't get currently focused window for the purposes of bringing it to front for winkey+shift+MMB gesture ergo aborting attempt, err=%v callStatus=%v r1=%v", res1.Err, res1.CallStatus, res1.R1)
+			return false, false
+		}
+		hwnd = windows.Handle(res1.R1)
+	}
+
+	if hwnd == 0 {
+		if !shiftDown {
+			logf("hwnd == 0 for winkey+MMB (send to back) thus nothing was done!")
+		} else {
+			logf("hwnd == 0 for winkey+shift+MMB (bring focused window to front) thus nothing was done!")
+		}
+		return false, false
+	}
+
+	if shouldBypassGestureNow(hwnd) {
+		return false, true // foreground is fullscreen; let event through
+	}
+
+	if !ShouldThrottle() {
+		//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
+		var data WindowMoveData // stack allocated — zero cost
+		if !shiftDown {
+			// winkey + MMB → send active window to bottom
+
+			// Send to back, no activation
+			// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
+
+			// winkey_DOWN but no other modifiers(including shift) is down
+			// and LMB is down, ofc, then we start move window gesture:
+			data.InsertAfter = HWND_BOTTOM
+			data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+		} else {
+			// winkey + shift + MMB → bring focused window to top
+
+			// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
+			// but no other modifiers like ctrl or alt are down
+			// then we start the bring focused window to front gesture:
+			data.InsertAfter = HWND_TOP
+			data.Flags = SWP_NOMOVE | SWP_NOSIZE
+			// Bring to front, no activation, works only for the currently focused window which was sent to back before
+		}
+		data.Hwnd = hwnd // window under cursor
+		data.X = 0       // int32, full range
+		data.Y = 0
+		enqueueMoveOrResize(data, "MMB gesture (winkey+MMB or winkey+shift+MMB, direct or recovered)")
+	} else { // endif every 10ms or more, else drop it
+		droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+	}
+
+	return true, false
 }
 
 func keyDown(vk uintptr) bool {
@@ -2152,13 +2283,25 @@ func hideOverlay() {
 	}
 }
 
-// shouldBypassGestureNow returns true when gesture processing should be
-// skipped entirely because the foreground window is fullscreen and the
-// bypass feature is enabled. Extracted so the identical check isn't
-// copy-pasted across WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN.
-// NOTE: cannot use a bare 'break' inside this; callers must do that themselves.
-func shouldBypassGestureNow() bool {
-	should := bypassGesturesWhenFullscreen.Load() && foregroundIsFullscreen.Load()
+// shouldBypassGestureNow returns true when gesture processing for hwnd (the
+// window the gesture would actually target) should be skipped because it's
+// fullscreen (exclusive or borderless) on its monitor and the bypass feature
+// is enabled. The check is done live via isWindowFullscreenOnMonitor against
+// that specific hwnd, rather than against a foreground-change WinEvent
+// cache, since such a cache only refreshes on foreground transitions and can
+// lag behind whichever window a gesture is actually about to act on.
+//
+// Callers that can distinguish "bypassed" from "failed for another reason"
+// (tryBeginMoveGestureAt, tryBeginResizeGestureAt, tryPerformMMBGestureAt)
+// must propagate that distinction back up to mouseProc's switch, since only
+// a bypass should let the originating mouse event pass through unswallowed —
+// any other failure still swallows it, matching each gesture's prior
+// behavior before this bypass feature existed.
+func shouldBypassGestureNow(hwnd windows.Handle) bool {
+	if !bypassGesturesWhenFullscreen.Load() {
+		return false
+	}
+	should := isWindowFullscreenOnMonitor(hwnd)
 	if should {
 		logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)")
 	}
@@ -2635,12 +2778,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if shouldBypassGestureNow() {
-				break // foreground is fullscreen; let event through
+			started, bypassed := tryBeginMoveGestureAt(info.Pt, false)
+			if bypassed {
+				break // target is fullscreen; let event through
 			}
 			markGestureUsedOnce()
 
-			if !tryBeginMoveGestureAt(info.Pt, false) {
+			if !started {
 				logf("failed to begin Move gesture(the why should be above ^) on winkey+LMB pressed")
 			}
 
@@ -2665,20 +2809,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			// recovery attempt - never on ordinary moves - keeping this cheap.
 			if checkForMissedGestureOnNextMove.CompareAndSwap(true, false) {
 				if missedGestureRecoveryEnabled.Load() {
-					winDown := keyDown(VK_LWIN) || keyDown(VK_RWIN)
-					shiftDown := keyDown(VK_SHIFT)
-					ctrlDown := keyDown(VK_CONTROL)
-					altDown := keyDown(VK_MENU)
-					if winDown && !shiftDown && !altDown && !ctrlDown {
-						//doneFIXME: don't I need this here also? Claude Sonnet 4.6 High Thinking missed it!
-						if shouldBypassGestureNow() {
-							break // foreground is fullscreen; let event through
-						}
+					winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
+					if winDown && !ctrlDown && !altDown {
 						switch {
-						case keyDown(VK_LBUTTON):
+						case !shiftDown && keyDown(VK_LBUTTON):
+							started, bypassed := tryBeginMoveGestureAt(info.Pt, true)
+							if bypassed {
+								break // target is fullscreen; nothing to recover this time
+							}
 							markGestureUsedOnce()
 							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
-							if tryBeginMoveGestureAt(info.Pt, true) {
+							if started {
 								// The real LMB-down already reached the target window normally
 								// (our hook was blind to it), so if it's something like a
 								// console, it's genuinely mid its own click-drag (e.g. extending
@@ -2710,10 +2851,14 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 							} else {
 								logf("failed to begin Move gesture(the why should be above ^) while trying to start it as recovery")
 							}
-						case keyDown(VK_RBUTTON):
+						case !shiftDown && keyDown(VK_RBUTTON):
+							started, bypassed := tryBeginResizeGestureAt(info.Pt, true)
+							if bypassed {
+								break // target is fullscreen; nothing to recover this time
+							}
 							markGestureUsedOnce()
 							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
-							if tryBeginResizeGestureAt(info.Pt, true) {
+							if started {
 								// See the identical comment in the LMB/ModeMove case above.
 								if injectButtonUpOnMissedGestureRecovery.Load() {
 									session2 := activeSession.Load() // it's updated in the above try
@@ -2729,8 +2874,22 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 							} else {
 								logf("Failed to begin Resize gesture (reason why should be above ^) while trying to start it as recovery.")
 							}
+						case keyDown(VK_MBUTTON): //this doesn't get hit, doh! unless you hold it during mouse move, which is unlikely for you to do!
+							started, bypassed := tryPerformMMBGestureAt(info.Pt, shiftDown)
+							if bypassed {
+								break // target is fullscreen; nothing to recover this time
+							}
+							markGestureUsedOnce()
+							if shiftDown {
+								logf("Recovering a missed winkey+shift+MMB (bring-to-front) gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
+							} else {
+								logf("Recovering a missed winkey+MMB (send-to-back) gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
+							}
+							if !started {
+								logf("Failed to recover winkey+MMB gesture (reason why should be above ^)")
+							}
 						}
-						session = activeSession.Load() // may now be non-nil
+						session = activeSession.Load() // may now be non-nil (LMB/RMB recovery only; MMB never touches activeSession)
 					}
 				}
 			}
@@ -3058,12 +3217,13 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			if shouldBypassGestureNow() {
-				break // foreground is fullscreen; let event through
+			started, bypassed := tryBeginResizeGestureAt(info.Pt, false)
+			if bypassed {
+				break // target is fullscreen; let event through
 			}
 			markGestureUsedOnce()
 
-			if !tryBeginResizeGestureAt(info.Pt, false) {
+			if !started {
 				logf("Failed to begin Resize gesture (reason why should be above ^) on winkey+RMB pressed")
 			}
 
@@ -3075,99 +3235,17 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 	case WM_MBUTTONDOWN: //MMB pressed
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
-		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-		// var shiftDown bool = keyDown(VK_SHIFT)
-		// var ctrlDown bool = keyDown(VK_CONTROL)
-		// var altDown bool = keyDown(VK_MENU)
 
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
-			if shouldBypassGestureNow() {
-				break // foreground is fullscreen; let event through
+			started, bypassed := tryPerformMMBGestureAt(info.Pt, shiftDown)
+			if bypassed {
+				break // target is fullscreen; let event through
 			}
 			markGestureUsedOnce()
 
-			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
-			if !ShouldThrottle() {
-				//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
-				var data WindowMoveData // stack allocated — zero cost
-
-				var hwnd windows.Handle
-				if !shiftDown {
-					// winkey + MMB → send active window to bottom
-
-					// winkey_DOWN but no other modifiers(including shift) is down
-					// and LMB is down, ofc, then we start move window gesture:
-
-					data.InsertAfter = HWND_BOTTOM
-					data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-					hwnd = windowFromPoint(info.Pt) // window under cursor
-				} else {
-					// winkey + shift + MMB → bring focused window to top
-
-					// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
-					// but no other modifiers like ctrl or alt are down
-					// then we start the bring focused window to front gesture:
-					data.InsertAfter = HWND_TOP
-					data.Flags = SWP_NOMOVE | SWP_NOSIZE   //|SWP_NOACTIVATE,
-					res1 := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
-					if res1.Failed() {
-						logf("Couldn't get currently focused window for the purposes to bringing it to front for winkey+shift+MMB gesture ergo aborting attempt, err=%v callStatus=%v r1=%v", res1.Err, res1.CallStatus, res1.R1)
-						return 1 // swallow MMB
-					}
-					hwnd = windows.Handle(res1.R1) // ← explicit cast
-					// Bring to front, no activation, works only for the currently focused window which was sent to back before
-					//had no effect because AI gave me the wrong constant value for HWND_TOP ! thanks chatgpt 5.2 !
-				} // else
-
-				if hwnd != 0 {
-					// Send to back, no activation
-					// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
-					// procSetWindowPos.Call(
-					// 	uintptr(hwnd),
-					// 	HWND_BOTTOM,
-					// 	0, 0, 0, 0,
-					// 	SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
-					// )
-
-					data.Hwnd = hwnd
-					data.X = 0 // int32, full range
-					data.Y = 0
-
-					// Post the move request instead of doing the windows move/drag motion here
-					// procPostMessage.Call(
-					// 	uintptr(mainMsgHwnd),
-					// 	WM_DO_SETWINDOWPOS,
-					// 	0,                             // unused, target is in the struct!
-					// 	uintptr(unsafe.Pointer(data)), // lParam = pointer to struct, XXX: this was bad, it would get GC-ed, Grok figured it out after i was mid-refactoring via Gemini(which didn't)
-					// )
-
-					enqueueMoveOrResize(data, "WM_MBUTTONDOWN aka MMB")
-					// select {
-					// case moveDataChan <- data:
-					// 	// SUCCESS: The data was copied into the buffered channel.
-					// 	// Now we ring the "Doorbell" to wake up the Main Thread.
-					// 	// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
-					// 	//procPostThreadMessage.Call(uintptr(mainThreadId), WM_DO_SETWINDOWPOS, 0, 0)
-					// 	res2 := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0)
-					// 	// if r == 0 {
-					// 	if res2.Failed() {
-					// 		logf("PostMessage of WM_DO_SETWINDOWPOS for MMB failed: %v", res2.Err)
-					// 	}
-
-					// default:
-					// 	// FAIL: The channel (2048 slots) is completely full.
-					// 	// This happens if the Main Thread is frozen (e.g., Admin console lag).
-					// 	// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
-					// 	// We just increment our "shame counter" and move on.
-					// 	droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
-					// }
-				} else {
-					logf("hwnd == 0 for winkey+shift+MMB (bring focused window to front) thus nothing was done!")
-				}
-			} else // endif every 10ms or more, else drop it
-			{
-				droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			if !started {
+				logf("Failed to perform winkey+MMB gesture (reason why should be above ^, if any)")
 			}
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
@@ -3983,6 +4061,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			focusText := mustUTF16("Activate(aka focus) window when moved if not in focus.")
 			bringToFrontOnDragText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
+			focusResizeText := mustUTF16("Activate(aka focus) window when a resize gesture starts if not already in focus.")
+			bringToFrontOnResizeText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a resize gesture (independent of the same option for drag/move above)")
 			useThreadAttachInputForFocusText := mustUTF16("(dontuse)Use AttachThreadInput before attempting any window focus (else focus stealing prevention might happen)")
 			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
@@ -4031,6 +4111,20 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			procAppendMenu.Call(hMenu, bringToFrontOnDragFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG,
 				uintptr(unsafe.Pointer(bringToFrontOnDragText)))
 
+			var actResizeFlags uintptr = MF_STRING
+			if focusOnResize.Load() {
+				actResizeFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, actResizeFlags, MENU_TOGGLE_ACTIVATE_RESIZE,
+				uintptr(unsafe.Pointer(focusResizeText)))
+
+			var bringToFrontOnResizeFlags uintptr = MF_STRING
+			if bringToFrontOnResize.Load() {
+				bringToFrontOnResizeFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, bringToFrontOnResizeFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE,
+				uintptr(unsafe.Pointer(bringToFrontOnResizeText)))
+
 			var useThreadAttachInputForFocusFlags uintptr = MF_STRING
 			if useThreadAttachInputForFocus.Load() {
 				useThreadAttachInputForFocusFlags |= MF_CHECKED
@@ -4042,7 +4136,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			if doLMBClick2FocusAsFallback.Load() {
 				lmbFlags |= MF_CHECKED
 			}
-			if !focusOnDrag.Load() {
+			if !focusOnDrag.Load() && !focusOnResize.Load() {
 				lmbFlags |= MF_DISABLED | MF_GRAYED
 			}
 			procAppendMenu.Call(hMenu, lmbFlags, MENU_USE_LMB_TO_FOCUS_AS_FALLBACK,
@@ -4228,6 +4322,12 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG:
 				bringToFrontOnDrag.Store(!bringToFrontOnDrag.Load())
+
+			case MENU_TOGGLE_ACTIVATE_RESIZE:
+				focusOnResize.Store(!focusOnResize.Load())
+
+			case MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE:
+				bringToFrontOnResize.Store(!bringToFrontOnResize.Load())
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
 				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
@@ -5044,6 +5144,8 @@ func init() {
 	const bringToFrontByDefaultOnGesture = true
 	focusOnDrag.Store(bringToFrontByDefaultOnGesture)        // focus window when gesture applies on it, ie. on drag-Move (but TODO: ? this doesn't apply to on-resize hmm)
 	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture) // default to same as above ^ TODO: should I make this apply to resize as well?
+	focusOnResize.Store(bringToFrontByDefaultOnGesture)
+	bringToFrontOnResize.Store(bringToFrontByDefaultOnGesture)
 
 	useThreadAttachInputForFocus.Store(false) // default false because for some reason it doesn't seem needed right now 17 July 2026, for me, tho I coulda sworn it was, before!
 
@@ -5066,7 +5168,6 @@ func init() {
 	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
 
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
-	foregroundIsFullscreen.Store(false)       // seeded properly in initForegroundIntegrityState()
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -5965,11 +6066,11 @@ const (
 	THREAD_PRIORITY_TIME_CRITICAL int32 = 15
 )
 
-// GetCurrentProcess returns a valid pseudo-handle which happens to be -1.
+// CURRENT_PROCESS_PSEUDO_HANDLE is what GetCurrentProcess returns a valid pseudo-handle which happens to be -1.
 // In Go, ^uintptr(0) (all bits set) is the numeric representation of -1
 const CURRENT_PROCESS_PSEUDO_HANDLE = ^uintptr(0) // All bits set to 1
 
-// In uintptr fashion (64-bit), -2 is: 0xFFFFFFFFFFFFFFFE aka ^uintptr(1)
+// CURRENT_THREAD_PSEUDO_HANDLE is what GetCurrentThread returns, a valid pseudo-handle, in uintptr fashion (64-bit), -2 is: 0xFFFFFFFFFFFFFFFE aka ^uintptr(1)
 const CURRENT_THREAD_PSEUDO_HANDLE uintptr = ^uintptr(1)
 
 const (
@@ -6286,7 +6387,11 @@ If you had written it as a standard assignment (eventCount++), a recursive inter
 
 By treating them as atomic assignments, you effectively forced the CPU to perform the increment as an indivisible operation at the hardware level, preventing recursion from causing corrupted calculations.
 */
-func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject int32, idChild int32, dwEventThread uint32, dwmsEventTime uint32) uintptr {
+func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handle, idObject, idChild int32, dwEventThread, dwmsEventTime uint32) uintptr {
+	_ = hWinEventHook //don't warn me it's unused!
+	_ = dwEventThread //don't warn me it's unused!
+	_ = dwmsEventTime //don't warn me it's unused!
+
 	// ONLY process if it's the actual window, not a sub-control/caret/item
 	if idObject != OBJID_WINDOW { // 0 is OBJID_WINDOW
 		return 0 // WinEvent callbacks return 0 (no chaining)
@@ -6445,12 +6550,6 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			badprogramming("pid is 0 here, code logic was changed!")
 		}
 
-		// Always refresh the fullscreen cache on every foreground change so
-		// shouldBypassGestureNow() is accurate even if the setting is toggled
-		// mid-session. Done before the integrity check so it's also current
-		// when the high-IL path runs softReset.
-		foregroundIsFullscreen.Store(isWindowFullscreenOnMonitor(targetHwnd))
-
 		targetIL, err := processIntegrityLevel(pid)
 
 		if err == nil && targetIL > selfIntegrityLevel {
@@ -6589,10 +6688,6 @@ func initForegroundIntegrityState() {
 		return // no foreground window right now; nothing to seed
 	}
 
-	// Seed the fullscreen state for the current foreground window so the
-	// bypassGesturesWhenFullscreen feature works immediately on first launch.
-	foregroundIsFullscreen.Store(isWindowFullscreenOnMonitor(hwnd))
-
 	pid := getWindowPID(hwnd)
 	if pid == 0 {
 		logf("initForegroundIntegrityState: couldn't get PID for current foreground HWND=0x%X", hwnd)
@@ -6680,9 +6775,9 @@ const TPM_RETURNCMD = 0x0100
 
 var startupTerminalHwnd windows.Handle
 
-func closeHandleLogged(h windows.Handle, context string) {
+func closeHandleLogged(h windows.Handle, context2 string) {
 	if err := windows.CloseHandle(h); err != nil {
-		logf("CloseHandle failed for %s: %v", context, err)
+		logf("CloseHandle failed for %s: %v", context2, err)
 	}
 }
 
@@ -6703,7 +6798,7 @@ func markGestureUsedOnce() {
 
 // enqueueMoveOrResize submits data to moveDataChan and wakes the main thread's
 // message loop to drain it. context is only used in the failure log.
-func enqueueMoveOrResize(data WindowMoveData, context string) {
+func enqueueMoveOrResize(data WindowMoveData, context3 string) {
 	// Send to your mover channel
 	select {
 	case moveDataChan <- data:
@@ -6712,7 +6807,7 @@ func enqueueMoveOrResize(data WindowMoveData, context string) {
 		// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
 		//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
 		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
-			logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context, res.Err)
+			logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
 		}
 	default:
 		// FAIL: The channel (2048 slots) is completely full.
