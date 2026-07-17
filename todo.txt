@@ -1,8 +1,6 @@
 todo:
-
 * other gestures like at least winkey+MMB should work when coming from higher UIPI and doing the MMB on the lower/normal UIPI window, currently only winkey+LMB and winkey+RMB have this feature.
-* make focusOnDrag and bringToFrontOnDrag apply to the ModeResize gesture as well! then rename them appropriately.
-  * old related todo: add option whether to focus window while the resize is happening/started
+* add option whether to focus window while the resize is happening/started, same 2 that move has: focusOnDrag and bringToFrontOnDrag, but don't merge them! they've to be independent/4 of them.
 * bypassGesturesWhenFullscreen (the atomic bool) seems flakey or laggy or too late to be updated! and mouseProc's LMB/RMB down will check for its value before it actually gets updated by wndProc, thus will trigger the gesture anyway even if fullscreen window. Didn't test this, just based on theoretical. One fix seems to be to use isWindowFullscreenOnMonitor() directly in tryBeginMoveGestureAt and tryBeginResizeGestureAt, "While you generally want to avoid heavy API calls inside a low-level hook, doing this only on WM_LBUTTONDOWN and WM_RBUTTONDOWN is perfectly fine. You are only incurring that ~1ms penalty once per click, not on every single mouse movement.", as per the suggestion in: https://gemini.google.com/app/d04c99222a90158d But I'd also need to do it in WM_MOUSEMOVE:checkForMissedGestureOnNextMove:missedGestureRecoveryEnabled in VK_LBUTTON and VK_RBUTTON, oh wait, no I don't because they both use tryBeginMoveGestureAt respectively tryBeginResizeGestureAt. Well, looking at this myself, i just have to modify shouldBypassGestureNow() to use isWindowFullscreenOnMonitor(wantTargetWnd) directly instead (and ofc. it needs a hwnd arg)! and don't modify anything else, well ok, can't because hwnd is detected inside the tryBegin*() functions!!
 
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
@@ -16,6 +14,7 @@ notmybug:
 
 dontdothis:
 * do winkey+shift+MMB over the non-focused window bring it into focus and thus to top, just like it does for the currently focused window currently, but now we can use the thread-attach method of focusing a window (and maybe use the LMB click fallback here too?) and thus can bring it to zorder top afterwards! So then it removes bring only currently focused window to top which was on same key combo. I dno about this.
+* make focusOnDrag and bringToFrontOnDrag apply to the ModeResize gesture as well! then rename them appropriately.
 
 
 done:
