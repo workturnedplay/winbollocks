@@ -730,25 +730,10 @@ type MSG struct {
 /* ---------------- Globals ---------------- */
 
 var (
-	// winDown   atomic.Bool
-	// shiftDown atomic.Bool
-	// ctrlDown  atomic.Bool
-	// altDown   atomic.Bool
-
 	//The Problem: winGestureUsed, capturing, and resizing manage your state machine. They are flipped by keyboardProc/mouseProc but cleared by hardReset/softReset (which can be triggered by the Main Thread via winEventProc).
-	// used exclusively to know when to inject shift key tap (shiftdown+shiftUP) at the point when physical winkeyUP aka winUP is detected //TODO: maybe remove because we do it(shifttap) now at gesture start
-	winGestureUsed atomic.Bool /*= func() atomic.Bool {
-		var b atomic.Bool
-		b.Store(false)
-		return b       //XXX: "return copies lock value: sync/atomic.Bool contains sync/atomic.noCopy copylocks"
-		//avoiding this copylocks means do it as a pointer *atomic.Bool (syntax doesn't change tho) or via init() below, i picked the latter.
-	}()*/
+	// used exclusively to know when to inject shift key tap (shiftdown+shiftUP) at the point when physical winkeyUP aka winUP is detected //noTODO: maybe remove because we do it(shifttap) now at gesture start
+	winGestureUsed atomic.Bool
 )
-
-func init() {
-	// Initialize it here. It's clean, idiomatic, and performance-optimal.
-	winGestureUsed.Store(false) //false initially, but done this way in case you wanna set it to 'true' later on!
-}
 
 var (
 	mouseHook windows.Handle
@@ -3989,9 +3974,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 const WM_QUIT = 0x0012
 
+// runs only on main() never from any other threads!
 func deinit() {
 	deinitThreadID := windows.GetCurrentThreadId()
 	hardReset(false)
+
+	if timer := memoryVerifyTimer.Load(); timer != nil {
+		timer.Stop() // best-effort; harmless no-op if it already fired or was never scheduled
+	}
+
 	if hookThreadID != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
 		procPostThreadMessage.Call(uintptr(hookThreadID), WM_QUIT, 0, 0)
@@ -4232,15 +4223,46 @@ var (
 	logChanSize   uint64 = 4096
 	logChan              = make(chan string, logChanSize) // Buffer of this many log messages
 	logWorkerDone        = make(chan struct{})            // The "I'm finished" signal
+
+	// logQuit is closed exactly once (guarded by logQuitClosed) to ask
+	// logWorker to stop waiting on logChan and drain whatever's left. We
+	// deliberately never close logChan itself: logf() is called from
+	// asynchronous, uncoordinated sources (WinEvent callbacks, the 30s
+	// verifyMemoryIsLocked timer scheduled by lockRAM(), hookWorker's own
+	// panic-bridge path, etc.) that can outlive closeAndFlushLog(), and a
+	// send to a closed channel panics even via select/default. Signaling
+	// shutdown through this separate channel means any post-shutdown
+	// logf() call harmlessly buffers into (or is counted as dropped from,
+	// once full) a channel nobody reads from anymore, instead of crashing
+	// the process on exit.
+	logQuit       = make(chan struct{})
+	logQuitClosed atomic.Bool
 )
 
 const attemptAtomicSwapThisManyTimes uint = 100
 
-func logf(format string, args ...any) {
+// formatLogMessage renders a log line the way both logf() and
+// directLoggerf() need it: a fixed-format timestamp prefix, the caller's
+// formatted message, and a trailing newline. Extracted so the two — and
+// logf()'s post-shutdown fallback path below — build the string identically
+// and only differ in how they dispatch it (via logChan vs. straight to
+// internalLogger).
+func formatLogMessage(format string, args ...any) string {
 	s := fmt.Sprintf(format, args...)
 	now := time.Now().Format("Mon Jan 2 15:04:05.000000000 MST 2006") // these values must be used exactly, they're like specific % placeholders.
 	//now := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
-	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
+	return fmt.Sprintf("[%s] %s\n", now, s)
+}
+
+func logf(format string, args ...any) {
+	// See the identical up-front check's doc comment in the pre-send branch
+	// below; this one covers the (rarer) case where shutdown was already
+	// signaled before we even got here.
+	finalMsg := formatLogMessage(format, args...)
+	if logQuitClosed.Load() {
+		internalLogger(finalMsg)
+		return
+	}
 
 	// Check the current pressure on the pipe
 	//len() - It never returns a negative value — for all supported kinds (arrays, slices, maps, strings, channels) the result is >= 0 (and for nil slices/maps/channels it’s 0).
@@ -4267,12 +4289,33 @@ func logf(format string, args ...any) {
 	}
 
 	// select with default makes this NON-BLOCKING
+	sent := false
 	select {
 	case logChan <- finalMsg:
 		// Message sent to the background worker
+		sent = true
 	default:
 		// If the buffer is full, we drop the log so we don't lag the mouse
 		droppedLogEvents.Add(1)
+	}
+
+	// Re-check logQuitClosed AFTER attempting the send. The initial check
+	// above and this send are not atomic with respect to closeAndFlushLog()
+	// signaling shutdown, so there's a narrow window where: (a) we read
+	// logQuitClosed as false, (b) closeAndFlushLog() runs and logWorker
+	// finishes its final drain (see drainRemainingLogChanMessages) and
+	// exits, then (c) our send above lands in logChan anyway — into a
+	// channel nobody will ever read from again. Re-checking here catches
+	// that window: if shutdown is now signaled, we ALSO emit directly via
+	// internalLogger, deliberately accepting a possible duplicate printed
+	// line (if logWorker's drain actually raced past this message rather
+	// than truly finishing before it arrived) in exchange for never
+	// silently losing a message during shutdown. A duplicate line is a
+	// trivial cosmetic cost; a lost log line during shutdown/crash
+	// diagnostics is not. This check is lock-free — just an atomic load,
+	// no contention with the hot mouse/keyboard-hook logf() callers.
+	if sent && logQuitClosed.Load() {
+		internalLogger(finalMsg)
 	}
 
 	// 2. Note the problem if we exhausted the 100 tries
@@ -4914,19 +4957,34 @@ func logWorker() {
 	var counter uint32 = 0
 	const MaxBeforeReset uint32 = 4_294_967_295 - 10_000_000
 	const modVal = 50
-	for msg := range logChan {
-		counter++
-		internalLogger(msg) // good call here
-		if counter%modVal == 0 {
-			verifyMemoryIsLocked() // can logf itself! so modVal must be > than how many msgs it can log worst case(currently 1) else i will infinite loop here.
-			//time.Sleep(10 * time.Second) //FIXME: temp, remove this!
-			if counter > MaxBeforeReset {
-				counter = 0
+loggingLoop:
+	for {
+		select {
+		case msg := <-logChan:
+			counter++
+			internalLogger(msg) // good call here
+			if counter%modVal == 0 {
+				verifyMemoryIsLocked() // can logf itself! so modVal must be > than how many msgs it can log worst case(currently 1) else i will infinite loop here.
+				//time.Sleep(10 * time.Second) //FIXME: temp, remove this!
+				if counter > MaxBeforeReset {
+					counter = 0
+				}
 			}
+			// if counter%5 == 0 {
+			// 	runtime.GC() // garbage collect, no apparent effect!
+			// }
+		case <-logQuit:
+			// Shutdown requested. Drain whatever's already buffered in
+			// logChan (non-blockingly) so we don't lose messages enqueued
+			// right before shutdown, then fall through to report final
+			// stats and exit. Deliberately skip the counter/modVal/
+			// verifyMemoryIsLocked bookkeeping here — verifyMemoryIsLocked
+			// itself calls logf(), and anything it enqueued at this point
+			// would never be read (nothing will call logWorker again), so
+			// doing that work now would be pure waste.
+			drainRemainingLogChanMessages()
+			break loggingLoop
 		}
-		// if counter%5 == 0 {
-		// 	runtime.GC() // garbage collect, no apparent effect!
-		// }
 	}
 	drops := droppedLogEvents.Load()
 	if drops > 0 {
@@ -4944,12 +5002,28 @@ func logWorker() {
 	}
 } //logWorker
 
+// drainRemainingLogChanMessages performs a final, non-blocking sweep of
+// logChan during logWorker shutdown, flushing any messages that were
+// enqueued right before closeAndFlushLog() signaled logQuit. logChan is
+// never closed (see logQuit's doc comment), so this relies on the channel
+// being momentarily empty rather than on a close+range-drain pattern.
+func drainRemainingLogChanMessages() {
+	for {
+		select {
+		case msg := <-logChan:
+			internalLogger(msg)
+		default:
+			return
+		}
+	}
+}
+
 func directLoggerf(format string, args ...any) {
-	s := fmt.Sprintf(format, args...)
-	now := time.Now().Format("Mon Jan 2 15:04:05.000000000 MST 2006") // these values must be used exactly, they're like specific % placeholders.
-	//now := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
-	finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
-	internalLogger(finalMsg) // good call here
+	// s := fmt.Sprintf(format, args...)
+	// now := time.Now().Format("Mon Jan 2 15:04:05.000000000 MST 2006") // these values must be used exactly, they're like specific % placeholders.
+	// //now := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+	// finalMsg := fmt.Sprintf("[%s] %s\n", now, s)
+	internalLogger(formatLogMessage(format, args...)) // good call here
 }
 
 // never call this directly, instead call directLoggerf()
@@ -4989,10 +5063,18 @@ func internalLogger(finalMsg string) {
 }
 
 func closeAndFlushLog() {
-	// 1. Close the channel to tell the worker "no more logs are coming"
-	close(logChan) // Yes — the worker will drain everything that was already queued before close.
-	// 2. Wait for the worker to finish printing the backlog
-	// XXX: This blocks until close(logWorkerDone) happens in the worker
+	// 1. Signal the worker "no more logs are coming", exactly once. We
+	// close logQuit rather than logChan — see logQuit's doc comment for
+	// why closing logChan directly is unsafe here. The CompareAndSwap
+	// guards against closeAndFlushLog() being invoked more than once (e.g.
+	// primary_defer() plus, on a genuine secondary panic, secondary_defer()
+	// or hookWorkerSecondaryDefer()) or concurrently from different threads.
+	if logQuitClosed.CompareAndSwap(false, true) {
+		close(logQuit)
+	}
+	// 2. Wait for the worker to finish draining and printing the backlog.
+	// XXX: This blocks until close(logWorkerDone) happens in the worker.
+	// Safe for multiple callers to receive from a closed channel.
 	<-logWorkerDone
 }
 
@@ -5021,6 +5103,7 @@ func secondary_defer() {
 }
 
 // a placeholder for graceful exit
+// runs only on main() never in any other threads!
 func primary_defer() { //primary defer
 	// SIGNAL THE WATCHDOG:
 	// Closing this channel releases the hookWorker from its 2s timer.
@@ -5443,6 +5526,14 @@ type TOKEN_PRIVILEGES struct {
 	Privileges     [1]LUID_AND_ATTRIBUTES
 }
 
+// memoryVerifyTimer holds the *time.Timer scheduled by lockRAM() for its
+// delayed post-trim verification check, so deinit() can Stop() it during
+// shutdown instead of leaving it dangling. Stored via atomic.Pointer for
+// defense-in-depth consistency with this file's other globals; in practice
+// lockRAM() (called once from runApplication) and deinit() (called once
+// from primary_defer(), always the main thread) don't race on it.
+var memoryVerifyTimer atomic.Pointer[time.Timer]
+
 func lockRAM() {
 	//Warning for Defensive Coding: SetProcessWorkingSetSize can fail if the values you provide are too high or if the user doesn't have the
 	// SE_INC_WORKING_SET_NAME privilege (though for small amounts like 10–50MB, Windows usually grants it to "High" priority processes without drama).
@@ -5508,9 +5599,15 @@ func lockRAM() {
 
 	// 2. Schedule the "Heisenberg-proof" check
 	// We wait 30 seconds to let Windows try to 'trim' our RAM.
-	time.AfterFunc(30*time.Second, func() {
+	timer := time.AfterFunc(30*time.Second, func() {
 		verifyMemoryIsLocked()
 	})
+	// Stored so deinit() can Stop() it. Without this, a short-lived run (or
+	// one where wincoe.WaitAnyKey() in a devbuild console takes a while)
+	// leaves this goroutine dangling until it either fires — harmless
+	// post-fix-#1, but still pointless work mid-shutdown — or the process
+	// exits and takes it down anyway.
+	memoryVerifyTimer.Store(timer)
 }
 
 func humanBytes(bytes uint64) string {
