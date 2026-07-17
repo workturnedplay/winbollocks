@@ -6154,13 +6154,9 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 				if missedGestureRecoveryEnabled.Load() {
 					checkForMissedGestureOnNextMove.Store(true)
 
-					// reason := "EVENT_SYSTEM_FOREGROUND"
-					// if forceReconcile && event != EVENT_SYSTEM_FOREGROUND {
-					// 	reason = fmt.Sprintf("reconciliation via %s", eventName)
-					// }
-					reason := eventName
+					reason := eventName //it's EVENT_SYSTEM_FOREGROUND
 					if forceReconcile {
-						reason = "reconciliation via " + reason
+						reason = "reconciliation via " + reason + "(should only happen once, the first time after just started winbollocks)" //TODO: track if this happens more than once and warn in red color or something somehow notify me the dev, maybe write into a new file about it, or I guess the log is enough since it's always append
 					}
 
 					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) [%s] after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", targetHwnd, pid, targetIL, reason)
