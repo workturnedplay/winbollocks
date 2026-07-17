@@ -2294,17 +2294,17 @@ func isInSameThreadID(hwnd windows.Handle) bool {
 	return uint32(res1.R1 /*aka tid aka thread id*/) == windows.GetCurrentThreadId()
 }
 
-// requires: procAttachThreadInput to have been done first, to work. XXX: apparently, 17 July 2026, it doesn't require this anymore!!?! maybe I changed something via w11privacy ?! as it used to require it or it would focus-steal prevent it from getting focused!
+// focusThisHwnd requires: procAttachThreadInput to have been done first, to work. XXX: apparently, 17 July 2026, it doesn't require this anymore!!?! maybe I changed something via w11privacy ?! as it used to require it or it would focus-steal prevent it from getting focused! It's for sure the vkE8 tap that happens before this! aka injectShiftTap()
 /*
 Why your app (winbollocks) doesn't need AttachThreadInput
 
 Windows explicitly outlines the rules for when a process is allowed to call SetForegroundWindow successfully. An app is granted focus privileges if:
 
-    It is already the foreground process.
+    It is already the foreground process. (nope it's not!)
 
-    It received the last input event.
+    It received the last input event. (maybe? but more likely because I inject RShift tap before gesture start? it's vkE8 now btw, not Shift, function still named the same tho)
 
-    It is handling a window hook.
+    It is handling a window hook. (true)
 
 Because your app operates via low-level global hooks (WH_MOUSE_LL and WH_KEYBOARD_LL), you are intercepting physical hardware events (Winkey + LMB) in real-time. The OS recognizes that your application is directly tied to the user's active, physical input. Therefore, Windows automatically grants your process the privilege to change the foreground window.
 
@@ -3983,7 +3983,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			focusText := mustUTF16("Activate(aka focus) window when moved if not in focus.")
 			bringToFrontOnDragText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
-			useThreadAttachInputForFocusText := mustUTF16("Use AttachThreadInput before attempting any window focus (else focus stealing prevention might be in effect!)")
+			useThreadAttachInputForFocusText := mustUTF16("(dontuse)Use AttachThreadInput before attempting any window focus (else focus stealing prevention might happen)")
 			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
 			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
 			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
@@ -6697,7 +6697,7 @@ func modifierKeyState() (winDown, shiftDown, ctrlDown, altDown bool) {
 func markGestureUsedOnce() {
 	if !winGestureUsed.Load() { //wasn't set already
 		winGestureUsed.Store(true) // we used at least once of our gestures
-		injectShiftTapOnly()       // prevent releasing of winkey later from popping up Start menu!
+		injectShiftTapOnly()       // has dual benefits: 1. prevent releasing of winkey later from popping up Start menu! AND 2. allows focusing target window to not be prevented by win11's focus stealing prevention!
 	}
 }
 
