@@ -368,6 +368,9 @@ var (
 
 	procWTSRegisterSessionNotification   = wincoe.NewBoundProc(wtsapi32, "WTSRegisterSessionNotification", wincoe.CheckBool)
 	procWTSUnRegisterSessionNotification = wincoe.NewBoundProc(wtsapi32, "WTSUnRegisterSessionNotification", wincoe.CheckBool)
+
+	procMonitorFromWindow = wincoe.NewBoundProc(user32, "MonitorFromWindow", wincoe.CheckNone) // returns HMONITOR; 0 means no monitor
+	procGetMonitorInfo    = wincoe.NewBoundProc(user32, "GetMonitorInfoW", wincoe.CheckBool)
 )
 
 /* ---------------- Constants ---------------- */
@@ -527,21 +530,24 @@ const (
 	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = WM_USER + 205
+	WM_BRING_TO_FRONT              = WM_USER + 206
 	// WM_DO_SET_CAPTURE              = WM_USER + 210
 	WM_DO_RELEASE_CAPTURE = WM_USER + 215
 )
 const (
-	MENU_EXIT                                = 1
-	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK        = 2
-	MENU_ACTIVATE_MOVE                       = 3
-	MENU_RATELIMIT_MOVES                     = 4
-	MENU_LOG_RATE_OF_MOVES                   = 5
-	MENU_TOGGLE_ASYNC_RESIZE                 = 6
-	MENU_TOGGLE_REQUIRE_WINDOWN              = 7
-	MENU_TOGGLE_COALESCE_EVENTS              = 8
-	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT    = 9
-	MENU_TOGGLE_MISSED_GESTURE_RECOVERY      = 10
-	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY = 11
+	MENU_EXIT                                   = 1
+	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK           = 2
+	MENU_ACTIVATE_MOVE                          = 3
+	MENU_RATELIMIT_MOVES                        = 4
+	MENU_LOG_RATE_OF_MOVES                      = 5
+	MENU_TOGGLE_ASYNC_RESIZE                    = 6
+	MENU_TOGGLE_REQUIRE_WINDOWN                 = 7
+	MENU_TOGGLE_COALESCE_EVENTS                 = 8
+	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT       = 9
+	MENU_TOGGLE_MISSED_GESTURE_RECOVERY         = 10
+	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY    = 11
+	MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG          = 12
+	MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN = 13
 
 	MF_STRING = 0x0000
 
@@ -549,6 +555,8 @@ const (
 	MF_DISABLED = 0x00000002
 	MF_CHECKED  = 0x00000008
 )
+
+const MONITOR_DEFAULTTONEAREST uintptr = 2
 
 const (
 	WM_KEYDOWN    = 0x0100
@@ -702,6 +710,13 @@ type dragState struct {
 	startRect RECT
 }
 
+type MONITORINFO struct {
+	CbSize    uint32
+	RcMonitor RECT
+	RcWork    RECT
+	DwFlags   uint32
+}
+
 type NOTIFYICONDATA struct {
 	CbSize            uint32
 	HWnd              windows.Handle // hold handle to my hidden message window aka self.
@@ -834,6 +849,18 @@ var missedGestureRecoveryEnabled atomic.Bool
 // and a click on a push-button rather than a text area could fire that
 // control's action a little early. Toggleable via systray.
 var injectButtonUpOnMissedGestureRecovery atomic.Bool
+
+// bringToFrontOnDrag, when true, brings the drag target to the front of the
+// Z-order at the moment a move gesture starts (useful after winkey+MMB sent it
+// to the back). Toggleable via systray.
+var bringToFrontOnDrag atomic.Bool
+
+// bypassGesturesWhenFullscreen, when true, suppresses all winkey+mouse
+// gestures while the foreground window covers its entire monitor (fullscreen
+// exclusive or borderless-fullscreen). foregroundIsFullscreen is the cached
+// result updated on each foreground change by winEventProc.
+var bypassGesturesWhenFullscreen atomic.Bool
+var foregroundIsFullscreen atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -1591,7 +1618,12 @@ func showTrayInfo(title, msg string) {
 
 /* ---------------- Drag Logic ---------------- */
 
-func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) bool {
+func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool, wasMaximized bool, preRestoreRect RECT) bool {
+	if cur := activeSession.Load(); cur != nil {
+		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
+		return false
+	}
+
 	var r RECT
 	res1 := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r)))
 	if res1.Failed() {
@@ -1599,28 +1631,31 @@ func startManualDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery boo
 		return false
 	}
 
-	// if mainMsgHwnd != 0 {
-	// 	procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SET_CAPTURE, uintptr(mainMsgHwnd), 0) // tell wndProc aka main thread to capture to your hidden window; it can only be done on same thread that made that hwnd
-	// } else {
-	// 	logf("mainMsgHwnd is 0 in startManualDrag!")
-	// }
-	// // _ = procSetCapture.Call(uintptr(mainMsgHwnd)) // Capture to your hidden window: doneFIXME: window was made by another thread!
-	// // // Now verify on the SAME thread that should own it
-	// // res2 := procGetCapture.Call()
-	// // if windows.Handle(res2.R1) != mainMsgHwnd {
-	// // 	logf("in startManualDrag, SetCapture FAILED or wrong thread ownership! Expected 0x%X, got 0x%X ; err=%v, callStatus=%v", mainMsgHwnd, res2.R1, res2.Err, res2.CallStatus)
-	// // 	// handle recovery (e.g. post message to main thread to retry)
-	// // }
-
-	// // This ensures:
-	// //mouse capture is owned by your thread
-	// //capture is released cleanly
-	// //no weird input edge cases
-
-	if cur := activeSession.Load(); cur != nil {
-		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
-		return false
+	if wasMaximized {
+		// Compute a top-left so the cursor sits at the same proportional
+		// position within the restored window as it had within the maximized one.
+		r = alignRestoredWindowToCursor(pt, preRestoreRect, r)
+		// Reposition immediately, before the first WM_MOUSEMOVE arrives.
+		if res := procSetWindowPos.Call(
+			uintptr(hwnd),
+			0, // ignored due to SWP_NOZORDER
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(r.Left),
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(r.Top),
+			0, 0, // ignored due to SWP_NOSIZE
+			SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
+		); res.Failed() {
+			logf("SetWindowPos (post-restore alignment) on HWND=0x%X failed: %v; re-reading rect for consistent drag origin", hwnd, res.Err)
+			// Re-read the rect so startPt arithmetic stays consistent with
+			// wherever the window actually landed.
+			if res2 := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r))); res2.Failed() {
+				logf("GetWindowRect (post-SetWindowPos failure) on HWND=0x%X also failed: %v", hwnd, res2.Err)
+				// r is still the aligned value; better than nothing.
+			}
+		}
 	}
+
 	activeSession.Store(&dragSession{
 		targetWnd:                hwnd,
 		mode:                     ModeMove,
@@ -1641,16 +1676,22 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 		return false
 	}
 	if e1 != nil {
-		logf("e1: %v", e1)
+		logf("startDrag:processIntegrityLevel failed, but continuing, err was: %v", e1)
 	}
 
-	//logf("Target PID: %d, targetIL: %d, selfIL: %d", pid, targetIL, selfIL)
-	if isMaximized(hwnd) {
-		//windows.ShowWindow(hwnd, windows.SW_RESTORE)
+	var preRestoreRect RECT
+	wasMaximized := isMaximized(hwnd)
+	if wasMaximized {
+		// Capture the maximized rect before restoring so alignRestoredWindowToCursor
+		// can compute the proportional cursor position within the restored window.
+		if res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&preRestoreRect))); res.Failed() {
+			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", hwnd, res.Err)
+			wasMaximized = false // skip alignment rather than use a zero rect
+		}
 		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
-		//TODO: should I re-maximize if it was maximized, after drag/move is done?
+		//TODO: should I re-maximize if it was maximized, after drag/move is done? probably not!
 	}
-	return startManualDrag(hwnd, pt, viaMissedGestureRecovery)
+	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, preRestoreRect)
 }
 
 // tryBeginMoveGestureAt is the shared "start (or restart) a window-move drag
@@ -1723,7 +1764,7 @@ func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 		}
 		softReset(true)
 	}
-	//FIXME: so we start the drag before doing the focus, works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)!
+	//FIXME: so we start the drag before doing the focus(which is below via WM_FOCUS_TARGET_WINDOW_SOMEHOW), works but seems off this way, not visually tho! but might be needed so we can setcapture to self else target might have/set capture(unsure)?!
 	if !startDrag(wantTargetWnd, pt, viaMissedGestureRecovery) {
 		return false
 	}
@@ -1731,6 +1772,14 @@ func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 	session := activeSession.Load()
 	if session == nil {
 		panic("bad coding: nil session after startDrag returned true")
+	}
+	if bringToFrontOnDrag.Load() {
+		// Post a dedicated bring-to-front message rather than routing through
+		// the move channel, which would be coalesced away by move events for
+		// the same HWND.
+		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(session.targetWnd), 0); res.Failed() {
+			logf("tryBeginMoveGestureAt: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", session.targetWnd, res.Err)
+		}
 	}
 	if focusOnDrag.Load() && !isWindowForeground(session.targetWnd) { //TODO: should I move this in startDrag?
 		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
@@ -1779,6 +1828,13 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) bool {
 			// Let it fall through to initialize a brand new resize session for 'wantTargetWnd'
 		}
 		softReset(true)
+	}
+
+	// Restore the window first so the resize starts from, and is measured
+	// against, the non-maximized rect. Without this the OS leaves the window
+	// in a mixed state (visually resized but still flagged as maximized).
+	if isMaximized(wantTargetWnd) {
+		procShowWindow.Call(uintptr(wantTargetWnd), SW_RESTORE)
 	}
 
 	var r RECT
@@ -2061,6 +2117,83 @@ func hideOverlay() {
 	if overlayHwnd != 0 {
 		procShowWindow.Call(uintptr(overlayHwnd), SW_HIDE)
 	}
+}
+
+// shouldBypassGestureNow returns true when gesture processing should be
+// skipped entirely because the foreground window is fullscreen and the
+// bypass feature is enabled. Extracted so the identical check isn't
+// copy-pasted across WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN.
+// NOTE: cannot use a bare 'break' inside this; callers must do that themselves.
+func shouldBypassGestureNow() bool {
+	return bypassGesturesWhenFullscreen.Load() && foregroundIsFullscreen.Load()
+}
+
+// alignRestoredWindowToCursor repositions the restored-window rect so the
+// cursor sits at the same proportional position it held within the maximized
+// window. normRect supplies the post-restore dimensions; only Left/Top (and
+// therefore Right/Bottom) are adjusted — the size is preserved unchanged.
+func alignRestoredWindowToCursor(cursorPt POINT, maxRect, normRect RECT) RECT {
+	maxW := maxRect.Right - maxRect.Left
+	maxH := maxRect.Bottom - maxRect.Top
+	normW := normRect.Right - normRect.Left
+	normH := normRect.Bottom - normRect.Top
+
+	// Degenerate rects — return the restored rect as-is.
+	if maxW <= 0 || maxH <= 0 || normW <= 0 || normH <= 0 {
+		return normRect
+	}
+
+	// Cursor's fractional position within the maximized window (0..1).
+	relX := float64(cursorPt.X-maxRect.Left) / float64(maxW)
+	relY := float64(cursorPt.Y-maxRect.Top) / float64(maxH)
+
+	// Clamp to [0,1] so a cursor outside the window edge doesn't flip the rect.
+	if relX < 0 {
+		relX = 0
+	} else if relX > 1 {
+		relX = 1
+	}
+	if relY < 0 {
+		relY = 0
+	} else if relY > 1 {
+		relY = 1
+	}
+
+	newLeft := cursorPt.X - int32(float64(normW)*relX)
+	newTop := cursorPt.Y - int32(float64(normH)*relY)
+	return RECT{
+		Left:   newLeft,
+		Top:    newTop,
+		Right:  newLeft + normW,
+		Bottom: newTop + normH,
+	}
+}
+
+// isWindowFullscreenOnMonitor returns true if hwnd's bounding rect covers the
+// entire area of the monitor it occupies (catches both exclusive fullscreen and
+// borderless-fullscreen). Returns false on any API failure.
+func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return false
+	}
+	var r RECT
+	if res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r))); res.Failed() {
+		return false
+	}
+	res := procMonitorFromWindow.Call(uintptr(hwnd), MONITOR_DEFAULTTONEAREST)
+	hMon := res.R1
+	if hMon == 0 {
+		return false
+	}
+	var mi MONITORINFO
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	if res2 := procGetMonitorInfo.Call(hMon, uintptr(unsafe.Pointer(&mi))); res2.Failed() {
+		return false
+	}
+	return r.Left <= mi.RcMonitor.Left &&
+		r.Top <= mi.RcMonitor.Top &&
+		r.Right >= mi.RcMonitor.Right &&
+		r.Bottom >= mi.RcMonitor.Bottom
 }
 
 func isWindowForeground(hwnd windows.Handle) bool {
@@ -2412,6 +2545,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
+			if shouldBypassGestureNow() {
+				break // foreground is fullscreen; let event through
+			}
 			markGestureUsedOnce()
 
 			if !tryBeginMoveGestureAt(info.Pt, false) {
@@ -2444,6 +2580,10 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 					ctrlDown := keyDown(VK_CONTROL)
 					altDown := keyDown(VK_MENU)
 					if winDown && !shiftDown && !altDown && !ctrlDown {
+						//doneFIXME: don't I need this here also? Claude Sonnet 4.6 High Thinking missed it!
+						if shouldBypassGestureNow() {
+							break // foreground is fullscreen; let event through
+						}
 						switch {
 						case keyDown(VK_LBUTTON):
 							markGestureUsedOnce()
@@ -2828,6 +2968,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
+			if shouldBypassGestureNow() {
+				break // foreground is fullscreen; let event through
+			}
 			markGestureUsedOnce()
 
 			if !tryBeginResizeGestureAt(info.Pt, false) {
@@ -2849,6 +2992,9 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
+			if shouldBypassGestureNow() {
+				break // foreground is fullscreen; let event through
+			}
 			markGestureUsedOnce()
 
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
@@ -3560,6 +3706,22 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		hideOverlay()
 		return 0
 
+	case WM_BRING_TO_FRONT:
+		target := windows.Handle(wParam)
+		if target == 0 {
+			logf("WM_BRING_TO_FRONT: received with zero HWND; ignoring")
+			return 0
+		}
+		if res := procSetWindowPos.Call(
+			uintptr(target),
+			uintptr(HWND_TOP),
+			0, 0, 0, 0,
+			SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+		); res.Failed() {
+			logf("WM_BRING_TO_FRONT: SetWindowPos(HWND_TOP) on HWND=0x%X failed: %v", target, res.Err)
+		}
+		return 0
+
 	// case WM_DO_SET_CAPTURE:
 	// 	target := windows.Handle(wParam)
 	// 	if target == 0 {
@@ -3737,6 +3899,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 
 			injectButtonUpOnMissedGestureRecoveryText := mustUTF16("(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)")
+			bringToFrontOnDragText := mustUTF16("Bring window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
+			bypassWhenFullscreenText := mustUTF16("Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)")
 
 			exitText := mustUTF16("Exit")
 
@@ -3828,6 +3992,20 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			procAppendMenu.Call(hMenu, injectButtonUpFlags, MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY,
 				uintptr(unsafe.Pointer(injectButtonUpOnMissedGestureRecoveryText)))
+
+			var bringToFrontOnDragFlags uintptr = MF_STRING
+			if bringToFrontOnDrag.Load() {
+				bringToFrontOnDragFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, bringToFrontOnDragFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG,
+				uintptr(unsafe.Pointer(bringToFrontOnDragText)))
+
+			var bypassWhenFullscreenFlags uintptr = MF_STRING
+			if bypassGesturesWhenFullscreen.Load() {
+				bypassWhenFullscreenFlags |= MF_CHECKED
+			}
+			procAppendMenu.Call(hMenu, bypassWhenFullscreenFlags, MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN,
+				uintptr(unsafe.Pointer(bypassWhenFullscreenText)))
 
 			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
 
@@ -3935,6 +4113,12 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY:
 				injectButtonUpOnMissedGestureRecovery.Store(!injectButtonUpOnMissedGestureRecovery.Load())
+
+			case MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG:
+				bringToFrontOnDrag.Store(!bringToFrontOnDrag.Load())
+
+			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
+				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -4761,6 +4945,10 @@ func init() {
 	missedGestureRecoveryEnabled.Store(!isAdmin) // default on if not admin
 
 	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
+
+	bringToFrontOnDrag.Store(false)           // default off; opt-in
+	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
+	foregroundIsFullscreen.Store(false)       // seeded properly in initForegroundIntegrityState()
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -6138,6 +6326,13 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		if pid == 0 {
 			badprogramming("pid is 0 here, code logic was changed!")
 		}
+
+		// Always refresh the fullscreen cache on every foreground change so
+		// shouldBypassGestureNow() is accurate even if the setting is toggled
+		// mid-session. Done before the integrity check so it's also current
+		// when the high-IL path runs softReset.
+		foregroundIsFullscreen.Store(isWindowFullscreenOnMonitor(targetHwnd))
+
 		targetIL, err := processIntegrityLevel(pid)
 
 		if err == nil && targetIL > selfIntegrityLevel {
@@ -6275,6 +6470,10 @@ func initForegroundIntegrityState() {
 	if hwnd == 0 {
 		return // no foreground window right now; nothing to seed
 	}
+
+	// Seed the fullscreen state for the current foreground window so the
+	// bypassGesturesWhenFullscreen feature works immediately on first launch.
+	foregroundIsFullscreen.Store(isWindowFullscreenOnMonitor(hwnd))
 
 	pid := getWindowPID(hwnd)
 	if pid == 0 {
