@@ -3661,7 +3661,6 @@ func hookWorker() {
 	} else {
 		kbdHook = windows.Handle(res2.R1)
 		defer func() {
-			procUnhookWindowsHookEx.Call(uintptr(kbdHook))
 			if res := procUnhookWindowsHookEx.Call(uintptr(kbdHook)); res.Failed() {
 				logf("failed to unhook kbdHook: %v", res.Err)
 			} else {
@@ -4559,7 +4558,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		return 0
 
 	case WM_DESTROY:
-		procPostQuitMessage.Call(0)
+		_ = procPostQuitMessage.Call(0)
 		return 0
 
 	case WM_EXIT_VIA_CTRL_C:
@@ -4609,19 +4608,6 @@ func deinit() {
 	}
 	if deinitThreadID == htidcached {
 		logf("BUG: deinit() should never run from hook thread!")
-
-		//XXX:The rule is: The thread that calls SetWindowsHookEx MUST be the thread that calls UnhookWindowsHookEx.
-		//noFIXME: won't the above run the below as defer-ers and thus race ? actually can I even unhook those from this diff. thread?! it won't because those are in defer-ers too, so deferers are serialized.
-		if mouseHook != 0 {
-			procUnhookWindowsHookEx.Call(uintptr(mouseHook))
-			mouseHook = 0
-			logf("cleaned mouseHook from deinit()")
-		}
-		if kbdHook != 0 {
-			procUnhookWindowsHookEx.Call(uintptr(kbdHook))
-			kbdHook = 0
-			logf("cleaned kbdHook from deinit()")
-		}
 	}
 
 	cleanupTray()
@@ -4632,7 +4618,7 @@ func deinit() {
 	deinitOverlayClass()
 
 	//This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
-	procPostQuitMessage.Call(0)
+	_ = procPostQuitMessage.Call(0)
 	/*
 		PostThreadMessage(id, WM_QUIT, ...) literally pushes a message into the queue.
 
