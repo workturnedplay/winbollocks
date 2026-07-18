@@ -90,7 +90,10 @@ echo GORACE is '%GORACE%'
 
 echo Running command^(in current dir^): "!exe_name!"
 rem start "" /wait "!exe_name!"
-"!exe_name!"
+rem "!exe_name!"
+rem to handle ctrl+c without asking me "Terminate batch job (Y/N)?", we use powershell to run the .exe as follows // didn't work, doh!
+rem powershell -NoProfile -Command "& { & '!exe_name!' }"
+"!exe_name!" & set "ec=!ERRORLEVEL!" & call :ignoreCtrlC
 set "ec=%ERRORLEVEL%"
 
 if "!ec!"=="130" (
@@ -111,3 +114,10 @@ if "!ec!"=="0" (
     )
 )
 pause
+
+rem Prevents falling into the subroutine during a normal sequential run
+goto :eof
+
+:ignoreCtrlC
+exit /b
+
