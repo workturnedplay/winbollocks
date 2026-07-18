@@ -579,7 +579,7 @@ type WinResult struct {
 	// additional success information (e.g. ERROR_ALREADY_EXISTS).
 	CallStatus error
 
-	Err error // normalized according to the Check* function
+	Err error // normalized according to the Check*() function that NewBoundProc() got as the last arg!
 }
 
 func (r WinResult) Failed() bool {
@@ -590,10 +590,28 @@ func (r WinResult) Succeeded() bool {
 	return r.Err == nil
 }
 
+// ErrIs reports whether Err matches a particular failure value.
+//
+// Successful calls are represented by Err == nil, so passing
+// windows.ERROR_SUCCESS will always return false.
 func (r WinResult) ErrIs(target error) bool {
+	if target == nil || target == error(windows.ERROR_SUCCESS) { //nolint:errorlint //we're checking for exactly this, not for one of the wrapped ones being ERROR_SUCCESS! aka // exact sentinel check; wrapped errors are intentionally not matched.
+		GetBugLogger().Error(
+			"BUG: WinResult.ErrIs() cannot be used to test for success; either use WinResult.Succeeded() first then WinResult.ErrIs(target_error) (aka this) to check for exact error, or use WinResult.CallStatusIs(target_error) which allows checking for windows.ERROR_SUCCESS! So, dev. needs to change the callsite!",
+		)
+	}
 	return errors.Is(r.Err, target)
 }
 
+// CallStatusIs reports whether the raw call status returned by LazyProc.Call
+// matches target.
+//
+// Unlike Err, CallStatus is not normalized and may contain additional
+// information even when the call succeeded. For example, some Win32 APIs
+// report ERROR_ALREADY_EXISTS on successful calls.
+//
+// Use this only for APIs whose documentation defines meaningful success
+// status codes beyond simple success/failure.
 func (r WinResult) CallStatusIs(target error) bool {
 	return errors.Is(r.CallStatus, target)
 }
