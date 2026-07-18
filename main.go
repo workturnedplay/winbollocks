@@ -4605,7 +4605,7 @@ func deinit() {
 	if htidcached != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
 		procPostThreadMessage.Call(uintptr(htidcached), WM_QUIT, 0, 0)
-		//FIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho)
+		//itwasdoneFIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho) | we're waiting for it in caller of deinit() which is primary_defer()
 	}
 	if deinitThreadID == htidcached {
 		logf("BUG: deinit() should never run from hook thread!")
