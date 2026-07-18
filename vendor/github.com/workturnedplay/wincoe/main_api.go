@@ -349,6 +349,9 @@ func WithConsoleEventRaw(fn func()) {
 
 	var oldMode uint32
 	if err := windows.GetConsoleMode(h, &oldMode); err != nil {
+		log := Logger.Load() // safe atomic read
+		log.Warn("WithConsoleEventRaw: GetConsoleMode failed; NOT running fn() without raw-mode toggling", SafeErr(err))
+		// fn()
 		return
 	}
 
@@ -360,14 +363,14 @@ func WithConsoleEventRaw(fn func()) {
 
 	if err := windows.SetConsoleMode(h, newMode); err != nil {
 		log := Logger.Load() // safe atomic read
-		log.Warn("WithConsoleEventRaw: SetConsoleMode failed to enter raw mode", SafeErr(err))
-		// still proceed — we want to run fn() even if mode change is partial
+		log.Warn("WithConsoleEventRaw: SetConsoleMode failed to enter raw mode, NOT running fn() without raw-mode toggling", SafeErr(err))
+		return
 	}
 	defer func() {
 		log := Logger.Load() // safe atomic read
 		err2 := windows.SetConsoleMode(h, oldMode)
 		if err2 != nil {
-			log.Warn("WithConsoleEventRaw: SetConsoleMode failed to restore old mode", SafeErr(err2))
+			log.Warn("WithConsoleEventRaw: SetConsoleMode failed to restore old mode, ignoring", SafeErr(err2))
 		}
 	}()
 
@@ -1175,6 +1178,23 @@ func GetLoggerOrFallback(ptr *atomic.Pointer[slog.Logger], ownerDesc string) *sl
 	return log
 }
 
+// resolveExeName resolves the executable name/path for owningPid, trying the
+// fast path (ExePathFromPID, via QueryFullProcessImageNameW) first and
+// falling back to GetProcessName (a Toolhelp32 snapshot walk) if that fails.
+// remoteAddrStr is purely diagnostic context folded into the returned error
+// if both lookups fail (the remote UDP/TCP address that triggered the pid lookup).
+func resolveExeName(owningPid uint32, remoteAddrStr string) (string, error) {
+	exe, err2 := ExePathFromPID(owningPid)
+	if err2 == nil {
+		return exe, nil
+	}
+	exe, err3 := GetProcessName(owningPid)
+	if err3 != nil {
+		return "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, remoteAddrStr, err2, err3)
+	}
+	return exe, nil
+}
+
 // ExePathFromPID returns process image path for pid or an error.
 // Uses QueryFullProcessImageNameW. May fail if insufficient privilege.
 //
@@ -1470,13 +1490,9 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 			entryIP := net.IPv4(ipb[0], ipb[1], ipb[2], ipb[3])
 
 			if localPort == port && (entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip.To4())) { // treat 0.0.0.0 as wildcard match
-				exe, err2 := ExePathFromPID(owningPid)
+				exe, err2 := resolveExeName(owningPid, clientAddr.String())
 				if err2 != nil {
-					var err3 error
-					exe, err3 = GetProcessName(owningPid)
-					if err3 != nil {
-						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, clientAddr.String(), err2, err3)
-					}
+					return 0, "", err2
 				}
 				return owningPid, exe, nil
 			}
@@ -1504,13 +1520,9 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 			entryIP := net.IP(localIPBytes)
 
 			if localPort == port && (entryIP.Equal(net.IPv6zero) || entryIP.Equal(ip)) {
-				exe, err2 := ExePathFromPID(owningPid)
+				exe, err2 := resolveExeName(owningPid, clientAddr.String())
 				if err2 != nil {
-					var err3 error
-					exe, err3 = GetProcessName(owningPid)
-					if err3 != nil {
-						return 0, "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, clientAddr.String(), err2, err3)
-					}
+					return 0, "", err2
 				}
 				return owningPid, exe, nil
 			}
@@ -1594,13 +1606,9 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 				)
 				// Match logic (Wildcard 0.0.0.0 or specific IP)
 				if entryIP.Equal(net.IPv4zero) || entryIP.Equal(ip.To4()) {
-					exe, err2 := ExePathFromPID(owningPid)
+					exe, err2 := resolveExeName(owningPid, clientAddr.String())
 					if err2 != nil {
-						var err3 error
-						exe, err3 = GetProcessName(owningPid)
-						if err3 != nil {
-							return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err3)
-						}
+						return 0, "", err2
 					}
 					return owningPid, exe, nil
 				}
@@ -1628,13 +1636,9 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 				entryIP := net.IP(localIPBytes)
 
 				if entryIP.Equal(net.IPv6zero) || entryIP.Equal(ip) {
-					exe, err2 := ExePathFromPID(owningPid)
+					exe, err2 := resolveExeName(owningPid, clientAddr.String())
 					if err2 != nil {
-						var err3 error
-						exe, err3 = GetProcessName(owningPid)
-						if err3 != nil {
-							return 0, "", fmt.Errorf("pid %d found but exe lookup failed: %w", owningPid, err3)
-						}
+						return 0, "", err2
 					}
 					return owningPid, exe, nil
 				}
