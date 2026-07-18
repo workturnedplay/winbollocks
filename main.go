@@ -2391,11 +2391,14 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 		}
 	}
 
+	// 1. Get the Window dimensions first
 	var r RECT
 	if res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r))); res.Failed() {
 		logf("isWindowFullscreenOnMonitor:GetWindowRect failed, err:%v", res.Err)
 		return false
 	}
+
+	// 2. Get the Monitor information
 	res := procMonitorFromWindow.Call(uintptr(hwnd), MONITOR_DEFAULTTONEAREST)
 	hMon := res.R1
 	if hMon == 0 {
@@ -2408,10 +2411,34 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 		logf("isWindowFullscreenOnMonitor:GetMonitorInfo failed, err:%v", res2.Err)
 		return false
 	}
-	return r.Left <= mi.RcMonitor.Left &&
+
+	// 3. GEOMETRY FIRST: Does it engulf the entire monitor?
+	isSpanningMonitor := r.Left <= mi.RcMonitor.Left &&
 		r.Top <= mi.RcMonitor.Top &&
 		r.Right >= mi.RcMonitor.Right &&
 		r.Bottom >= mi.RcMonitor.Bottom
+
+	// If it doesn't even fill the screen (like your mini borderless window),
+	// it is definitively NOT fullscreen. Return false immediately.
+	if !isSpanningMonitor {
+		return false
+	}
+
+	// 4. STYLE TIE-BREAKER: It fills the screen, but is it just a maximized window?
+	if style, err := getWindowLongPtr(hwnd, GWL_STYLE); err != nil {
+		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
+		// Fallback: if style check fails but it fills the screen, err on the side of caution
+		return true
+	} else {
+		// If it fills the screen AND has a caption, it's just a normal maximized window
+		// (likely bleeding over the edges due to an auto-hidden taskbar).
+		if (style & WS_CAPTION) == WS_CAPTION {
+			return false
+		}
+	}
+
+	// It fills the screen and does NOT have a caption (Chrome, Firefox F11, Games, etc.)
+	return true
 }
 
 func isWindowForeground(hwnd windows.Handle) bool {
