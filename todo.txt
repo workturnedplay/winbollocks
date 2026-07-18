@@ -1,4 +1,6 @@
 todo:
+* two loglines at least, are clobbering the "Press any key" message, seen when already running! That's why i need a way to sync the logger lines that were sent thus far, before the wincoe.WaitAnyKey() is reached! Then make this be via logf: directLoggerf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
+
 * time logFile.Sync() and note in the logFile (but without sync-ing again) and on StdErr that the time it took to sync was higher than... use a number that makes sense here!
 
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
