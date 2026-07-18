@@ -238,13 +238,19 @@ func ClearStdinIfTermIsNOTRaw() (hadInput bool) {
 		return false
 	}
 
-	_ = windows.FlushConsoleInputBuffer(h)
+	if flushErr := windows.FlushConsoleInputBuffer(h); flushErr != nil {
+		log := Logger.Load() // safe atomic read
+		log.Debug("ClearStdinIfTermIsNOTRaw: FlushConsoleInputBuffer failed", SafeErr(flushErr))
+	}
 	return true
 }
 
 func ReadKeySequence() {
 	var b [1]byte
-	_, _ = os.Stdin.Read(b[:])
+	if _, err := os.Stdin.Read(b[:]); err != nil {
+		log := Logger.Load() // safe atomic read
+		log.Debug("ReadKeySequence: os.Stdin.Read failed", SafeErr(err))
+	}
 }
 
 // Minimal local copies of the Win32 structs we need.
@@ -2208,7 +2214,7 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 		// scenario and the target is missing, we bypass ReplaceFileW and perform a clean rename.
 		if _, statErr := OsStatFunc(filename); os.IsNotExist(statErr) {
 			log.Info("Windows FileWriter: Destination file does not exist, committing via initial rename", slog.String("path", filename))
-			
+
 			renameErr := OsRenameFunc(tmpName, filename)
 			if renameErr == nil {
 				return nil // Done with first-boot save
