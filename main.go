@@ -2025,12 +2025,30 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 	return true, false
 }
 
-func keyDown(vk uintptr) bool {
+// this is the heap-allocation one, presumably - says Gemini 3.1 Pro
+func keyDown1(vk uintptr) bool {
 	res1 := procGetAsyncKeyState.Call(vk)
-	if res1.Failed() {
-		logf("keyDown: procGetAsyncKeyState failed for vk:%v", vk)
-	}
+	// if res1.R1==0 { //|| res1.Failed() { it's CheckNone so Failed has no meaning here! actually not sure if R1==0 makes any sense as a failure, seems to mean they're all UP
+	// 	logf("keyDown: procGetAsyncKeyState failed for vk:%v", vk)
+	// }
 	return (res1.R1 & 0x8000) != 0
+}
+
+// Add this raw proc near your other globals
+var rawGetAsyncKeyState = user32.NewProc("GetAsyncKeyState")
+
+// this is the non-heap allocating one as per Gemini 3.1 Pro
+func keyDown(vk uintptr) bool {
+	// By calling rawGetAsyncKeyState.Call directly, we bypass the LazyProcish
+	// interface in BoundProc. The Go compiler's special magic kicks in,
+	// the args stay on the stack, and we drop thousands of heap allocations to ZERO.
+	ret, _, _ := rawGetAsyncKeyState.Call(vk) //nolint:errcheck // it's void-like?! TODO: double-check
+	_ = ret
+
+	// if ret == 0 {//XXX: actually not sure if R1==0 makes any sense as a failure, seems to mean they're all UP
+	// 	logf("keyDown: rawGetAsyncKeyState failed for vk:%v", vk)
+	// }
+	return (ret & 0x8000) != 0
 }
 
 func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
