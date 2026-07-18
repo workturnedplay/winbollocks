@@ -1,4 +1,0 @@
-todo:
-* DRY: GenericSafeFileWriter.SafeWriteFile and win11SafeFileWriter.SafeWriteFile share large near-identical blocks (staging-file write-with-retry, "can't delete → truncate to zero → panic" escalation ladder, panic message templates). Not a quick single-line fix, but worth extracting a shared writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration) error and a shared neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration, log *slog.Logger, deleteErr error) helper, since both writers' escalation logic is functionally identical.
-
-done:
