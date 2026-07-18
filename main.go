@@ -3483,7 +3483,8 @@ func createMessageWindow() (windows.Handle, error) {
 }
 
 var (
-	hookThreadID, mainThreadID uint32
+	hookThreadID atomic.Uint32
+	mainThreadID uint32 // this one's guaranteed orderly set/read, as the code stands currently!
 	// Optional: prepare a mutex for later when we secure 'currentDrag'
 	// dragStateMutex sync.RWMutex
 )
@@ -3617,11 +3618,13 @@ func hookWorker() {
 	}() // defer
 
 	// 2. Save the OS Thread ID so our main thread can talk to it later
-	hookThreadID = windows.GetCurrentThreadId()
-	if mainThreadID == hookThreadID { //FIXME: temp, should be == here!
-		exitf(1, "main loop msg and hooks are NOT on two different threads, this will never happen unless code logic is broken!")
+	//hookThreadID = windows.GetCurrentThreadId()
+	hookThreadID.Store(windows.GetCurrentThreadId())
+	htidcached := hookThreadID.Load()
+	if mainThreadID == htidcached {
+		exitf(1, "main loop msg and hooks are NOT on two different threads(but same 0x%X tid), this will never happen unless code logic is broken!", htidcached)
 	}
-	logf("Hook worker thread started. ThreadID: %d", hookThreadID)
+	logf("Hook worker thread started. ThreadID: %d", htidcached)
 
 	setAndVerifyPriority()
 
@@ -4598,12 +4601,13 @@ func deinit() {
 		timer.Stop() // best-effort; harmless no-op if it already fired or was never scheduled
 	}
 
-	if hookThreadID != 0 {
+	htidcached := hookThreadID.Load()
+	if htidcached != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
-		procPostThreadMessage.Call(uintptr(hookThreadID), WM_QUIT, 0, 0)
+		procPostThreadMessage.Call(uintptr(htidcached), WM_QUIT, 0, 0)
 		//FIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho)
 	}
-	if deinitThreadID == hookThreadID {
+	if deinitThreadID == htidcached {
 		logf("BUG: deinit() should never run from hook thread!")
 
 		//XXX:The rule is: The thread that calls SetWindowsHookEx MUST be the thread that calls UnhookWindowsHookEx.
@@ -5803,7 +5807,7 @@ func primary_defer() { //primary defer
 	// Skipped if hookWorker was never started. Bounded by a timeout since a
 	// panicking hook thread never closes this channel (see its panic path
 	// above) — that's an already-handled, expected case, not a bug.
-	if hookThreadID != 0 {
+	if hookThreadID.Load() != 0 {
 		const hookWorkerExitTimeout = 2 * time.Second
 		select {
 		case <-hookWorkerDone: // Check if closed
