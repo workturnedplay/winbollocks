@@ -6355,26 +6355,44 @@ func drainMoveChannel() {
 // 	// clear(latest) // Go 1.21+
 // }
 
-// drainMoveChannelCoalesced implements event coalescing (latest-wins per window)
-// while preserving approximate inter-window ordering using a first-seen slice.
-// This directly addresses the rubber-banding issue described.
-func drainMoveChannelCoalesced() {
+// Allocate these once globally. They are only ever accessed by the Main Thread.
+var (
 	// latest holds only the most recent state for each window
-	latest := make(map[windows.Handle]WindowMoveData, 8)
+	coalesceMap = make(map[windows.Handle]WindowMoveData, 8)
 
 	// order records the first-seen order of windows in this drain batch.
 	// This gives us stable FIFO-like behavior across different windows
 	// without sacrificing per-window coalescing.
-	order := make([]windows.Handle, 0, 8)
+	coalesceOrder = make([]windows.Handle, 0, 8)
+)
+
+// drainMoveChannelCoalesced implements event coalescing (latest-wins per window)
+// while preserving approximate inter-window ordering using a first-seen slice.
+// This directly addresses the rubber-banding issue described.
+func drainMoveChannelCoalesced() {
+	// // latest holds only the most recent state for each window
+	//coalesceMap := make(map[windows.Handle]WindowMoveData, 8)
+
+	// // order records the first-seen order of windows in this drain batch.
+	// // This gives us stable FIFO-like behavior across different windows
+	// // without sacrificing per-window coalescing.
+	// coalesceOrder := make([]windows.Handle, 0, 8)
+
+	//By reusing the same underlying memory for the map and the slice, Go no longer creates garbage during a window drag. Even if the GC is totally starved by your TIME_CRITICAL thread, memory will not grow because nothing new is being allocated.
+	// 0. Clear the map and slice from the previous run WITHOUT reallocating
+	for k := range coalesceMap {
+		delete(coalesceMap, k)
+	}
+	coalesceOrder = coalesceOrder[:0]
 
 	// 1. Non-blocking full drain of the channel
 	for {
 		select {
 		case data := <-moveDataChan:
-			if _, exists := latest[data.Hwnd]; !exists {
-				order = append(order, data.Hwnd) // record first appearance order
+			if _, exists := coalesceMap[data.Hwnd]; !exists {
+				coalesceOrder = append(coalesceOrder, data.Hwnd) // record first appearance order
 			}
-			latest[data.Hwnd] = data // always overwrite with newest state
+			coalesceMap[data.Hwnd] = data // always overwrite with newest state
 		default:
 			// Channel is empty → proceed to batch apply
 			goto applyBatch
@@ -6383,8 +6401,8 @@ func drainMoveChannelCoalesced() {
 
 applyBatch:
 	// 2. Batch apply in first-seen order
-	for _, hwnd := range order {
-		data, ok := latest[hwnd]
+	for _, hwnd := range coalesceOrder {
+		data, ok := coalesceMap[hwnd]
 		if !ok || hwnd == 0 {
 			continue
 		}
@@ -6392,15 +6410,6 @@ applyBatch:
 		if !isWindowValid(hwnd) {
 			continue
 		}
-
-		// // IMPORTANT: Throttle handling for multi-window batches
-		// // The global throttle (ShouldThrottle) is intentionally kept
-		// // to protect the mouse hook from overload. However, in a coalesced
-		// // batch we still want to apply the *latest* state even if some
-		// // earlier windows in the batch triggered the throttle.
-		// if ShouldThrottle() {
-		// 	logf("Throttle active during coalesced batch for hwnd=0x%X (FIXME: must still be applying latest state)", hwnd)
-		// }
 
 		// We bypass the execution throttle here. Coalescing guarantees we only
 		// apply once per window per batch, and we absolutely MUST NOT drop
