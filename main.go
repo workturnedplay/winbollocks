@@ -120,6 +120,18 @@ func init() {
 	*/
 }
 
+var selfHInstance windows.Handle
+
+func init() {
+	//GetModuleHandle(0): it returns the base address of your own .exe module, which is a constant value for the entire lifetime of your process.
+	// Because you pass 0 (NULL), it does not increment a reference count, so it never requires CloseHandle or FreeLibrary.
+	res := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
+	if res.Failed() {
+		panic(fmt.Sprintf("CRITICAL: GetModuleHandle(0) failed for self instance: %v", res.Err))
+	}
+	selfHInstance = windows.Handle(res.R1)
+}
+
 /* ---------------- DLLs & Procs ---------------- */
 
 // var shellHook windows.Handle
@@ -2131,11 +2143,7 @@ func initOverlay() error {
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = windows.NewCallback(overlayWndProc)
 	wc.LpszClassName = className
-	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
-	if res1.Failed() {
-		return fmt.Errorf("failed GetModuleHandle(0) in initOverlay(), err: %w", res1.Err)
-	}
-	wc.HInstance = windows.Handle(res1.R1 /*aka hinst*/)
+	wc.HInstance = selfHInstance
 	// Add shadow/background if desired, but we'll paint it
 
 	if res1b := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); res1b.Failed() {
@@ -3405,11 +3413,7 @@ func createMessageWindow() (windows.Handle, error) {
 	wc.CbSize = uint32(unsafe.Sizeof(wc))
 	wc.LpfnWndProc = wndProc
 	wc.LpszClassName = classNameUTF16
-	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
-	if res1.Failed() {
-		return 0, fmt.Errorf("GetModuleHandle(0) failed for class name %s, err: %w", winbollocksHiddenClassName, res1.Err)
-	}
-	wc.HInstance = windows.Handle(res1.R1)
+	wc.HInstance = selfHInstance
 
 	procSetLastError.Call(0)
 	// Register class — check return value
@@ -4629,11 +4633,7 @@ func deinitOverlayClass() {
 		blackBrush = 0
 	}
 
-	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
-	if res1.Failed() {
-		logf("in deinitOverlayClass, failed to GetModuleHandle(0) aka own self .exe handle, err=%v", res1.Err)
-	}
-	instance := res1.R1
+	instance := uintptr(selfHInstance)
 	classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
 	if res2 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res2.Failed() {
 		logf("deinitOverlayClass: UnregisterClassW failed for overlay class: %v", res2.Err)
@@ -4650,11 +4650,7 @@ func deinitMainMsgHwnd() {
 		mainMsgHwnd = 0
 	}
 
-	res2 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
-	if res2.Failed() {
-		logf("in deinitMainMsgHwnd, failed to GetModuleHandle(0) aka own self .exe handle, err=%v", res2.Err)
-	}
-	instance := res2.R1
+	instance := uintptr(selfHInstance)
 	classNamePtr := mustUTF16(winbollocksHiddenClassName)
 	if res3 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res3.Failed() {
 		logf("deinitMainMsgHwnd: UnregisterClassW failed for winbollocksHidden class: %v", res3.Err)

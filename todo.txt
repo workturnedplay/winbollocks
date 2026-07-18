@@ -1,5 +1,5 @@
 todo:
-* DRY the procGetModuleHandle() calls, maybe keeping a global for it? since I presume the return can't ever change during runtime! but, can the same return be used in multiple places? presumablu it's just a value not an instance of sorts(so not a pointer or a handle needing Close!)
+* no need for //go:uintptrescapes  because "Passing integers to a function never triggers a heap allocation."
 * DRY procSetForegroundWindow.Call() but somehow keep the specific log msgs.
 * make hookThreadID be atomic.Uint32
 
@@ -19,6 +19,7 @@ dontdothis:
 
 
 done:
+//* DRY the procGetModuleHandle() calls, maybe keeping a global for it? since I presume the return can't ever change during runtime! but, can the same return be used in multiple places? presumablu it's just a value not an instance of sorts(so not a pointer or a handle needing Close!)
 //* fullscreen firefox aka F11 key isn't detected as fullscreen or anything, so gesture works but shouldn't. My bad, setting was off by default! so ofc it wouldn't prevent the gesture! when on tho, it works: prevents it, even F11 of vscode!
 //untestedyet//* don't spam this "Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)", say it only once per window maybe? or once per second, in case 30mins pass and user just tried it again looking for debug/err msgs as to why it doesn't work and sees none because maybe it's same window, that's why maybe 1 per sec is better?! 
 //* need to make this log line be before the "Press..." one because they look mixed: "Press any key to exit...[Sat Jul 18 01:46:45.732790500 CEST 2026] Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x1504A0" and the next line is the "(clrbuf)..." from the "Press..."
