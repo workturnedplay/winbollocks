@@ -1564,8 +1564,6 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 
 // appendMenuChecked wraps AppendMenuW with logging on failure; label is only
 // used in the log message to identify which menu item failed.
-//
-//go:uintptrescapes
 func appendMenuChecked(hMenu, flags, id uintptr, textStr string) {
 	text := mustUTF16(textStr)
 	if res := procAppendMenu.Call(hMenu, flags, id, uintptr(unsafe.Pointer(text))); res.Failed() {
@@ -2083,6 +2081,66 @@ func keyDown(vk uintptr) bool {
 	return (ret & 0x8000) != 0
 }
 
+/* so keyDown1 vs keyDown now: (unsure what to believe)
+You are 100% right to call me out on that! You've got a very sharp eye. It *is* variadic, and normally, any variadic call `f(a, b)` gets rewritten by the compiler into a slice allocation: `f([]uintptr{a, b})`.
+
+So if both functions take a variadic slice, why does yours hit the heap while Go's standard library stays on the stack?
+
+It comes down to **how the compiler handles that exact directive at the immediate call site**, and why your wrapper architecture inadvertently breaks it.
+
+---
+
+### 1. How the `//go:uintptrescapes` Magic Handles Slices
+
+When the Go compiler's escape analysis engine encounters a regular variadic function, it has to evaluate whether the resulting slice escapes.
+
+However, when it sees a function marked with `//go:uintptrescapes` (like `LazyProc.Call`), the compiler activates a highly specialized, hardcoded behavior:
+
+* Instead of treating `a ...uintptr` as a standard slice that could go anywhere, the compiler looks at the call site (`rawGetAsyncKeyState.Call(vk)`) and says: *"I know this function. It's a low-level syscall hook. It is guaranteed to read these arguments instantly and never store this slice context."*
+* Because of this guarantee, the compiler **explicitly stack-allocates the hidden backing array for that variadic slice** right in the caller's stack frame.
+
+So yes, a slice is created, but it is created directly on the stack and disappears the moment `keyDown` returns. Zero heap allocations.
+
+---
+
+### 2. Why the Magic Breaks in Your Wrapper
+
+If you were to just put `//go:uintptrescapes` on your custom `BoundProc.Call`, it still wouldn't work. The compiler's magic optimization breaks for two reasons in your architecture:
+
+#### Reason A: The Interface Boundary
+
+Your wrapper uses an interface (`LazyProcish`). The Go compiler performs escape analysis during compilation. When it looks at your wrapper call site:
+
+```go
+func (b *BoundProc) Call(args ...uintptr) WinResult {
+    return WinCall(b.Proc, b.Check, args...) // b.Proc is an interface!
+}
+
+```
+
+The compiler doesn't know *which* concrete struct is behind `b.Proc` at compile time. Because it can't guarantee that the underlying method down the road will respect the stack layout, it plays it safe, gives up, and pushes the variadic slice to the heap.
+
+#### Reason B: The Double-Forwarding Trap
+
+The `//go:uintptrescapes` directive **is not transitive**. It only optimizes the *immediate* call site where the pointer/integer conversion or slice creation happens.
+
+In your code, you have a multi-level chain:
+
+1. `keyDown1` calls `procGetAsyncKeyState.Call(vk)` -> **Level 1: Slice created.**
+2. `BoundProc.Call` receives it and calls `WinCall(..., args...)` -> **Level 2: Slice forwarded.**
+
+The moment a variadic slice is passed down through multiple layers of user functions like a hot potato, the escape analysis engine loses track of the stack boundaries and forces it onto the heap.
+
+---
+
+### The Bottom Line
+
+By bypassing the interface and the wrapper functions, and calling `rawGetAsyncKeyState.Call(vk)` directly inside `keyDown`, you bring the call site **directly face-to-face** with the compiler's `//go:uintptrescapes` directive.
+
+The compiler instantly recognizes it, creates the variadic backing array right on the stack, and your ghost allocations completely vanish!
+- Gemini 3.5 Thinking
+*/
+
 func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(well no, because it also resets winGestureUsed!) because it now handles the case when Shift tap needs to be inserted if winGestureUsed !
 	//do this first
 	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
@@ -2577,16 +2635,7 @@ Because your app operates via low-level global hooks (WH_MOUSE_LL and WH_KEYBOAR
 So, in the scenarios where SetForegroundWindow works, it works entirely on its own. In the scenarios where it gets blocked by the Shell, AttachThreadInput was failing or doing nothing anyway.
 */
 func focusThisHwnd(target windows.Handle) (gotFocused bool) {
-	res1 := procSetForegroundWindow.Call(uintptr(target))
-	//if fgRet != 1 { // this was wrong
-	if res1.Failed() {
-		//lastErr := windows.GetLastError()
-		// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
-		//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-		logf("failed SetForegroundWindow ret=%d(0 is false) err='%v' callErr:'%v'", res1.R1, res1.Err, res1.CallStatus)
-		return false
-	}
-	return true
+	return setForegroundWindow(target, "failed SetForegroundWindow")
 }
 
 const (
@@ -2734,32 +2783,22 @@ func forceForeground(target windows.Handle) bool {
 				logf("attempting to focus own window in same thread, sure.")
 				//this will make the systray popup menu disappear and spam these: SetWindowPos failed(from within main message loop): hwnd=0x802d6 error=0
 				// unless we skip tool windows above!
-				res1 := procSetForegroundWindow.Call(uintptr(target))
-				//if fgRet != 1 {
-				if res1.Failed() {
-					//lastErr := windows.GetLastError()
-					// ie. not "SetForegroundWindow ret=1 err=The operation completed successfully."
-					//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
-					/*
-						The SetForegroundWindow Silent Failure
-						The Culprit: The Windows 10/11 Start Menu (Focus Stealing Prevention).
-						When the Start Menu is open, the Windows Shell (StartMenuExperienceHost.exe) aggressively locks the foreground. Windows actively blocks background applications from stealing focus to prevent malicious pop-ups from hijacking your keystrokes while you're trying to search or launch an app.
-						When your code calls SetForegroundWindow while Start is open:
-						    It returns 0 (Failure).
-						    GetLastError() returns 0 ("The operation completed successfully").
-						This isn't a bug in Go or your code; this is Windows politely saying, "I heard your request perfectly, and the answer is absolutely not."
-							- Gemini 3.1 Pro
-						so since we swallow the LMB click when gesture triggers for ModeMove, and we instead try to basically steal the focus from Start Menu, win11 disallows this. If LMB were allowed then it woulda worked, which is why the fallback synthetic/injected LMB click works and will focus it.
+				return setForegroundWindow(target, "failed to SetForegroundWindow for own window in same thread(w/o thread attach) (this usually happens because Start menu was open, as: ret==0 and callErr is success)")
+				//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
+				/*
+					The SetForegroundWindow Silent Failure
+					The Culprit: The Windows 10/11 Start Menu (Focus Stealing Prevention).
+					When the Start Menu is open, the Windows Shell (StartMenuExperienceHost.exe) aggressively locks the foreground. Windows actively blocks background applications from stealing focus to prevent malicious pop-ups from hijacking your keystrokes while you're trying to search or launch an app.
+					When your code calls SetForegroundWindow while Start is open:
+					    It returns 0 (Failure).
+					    GetLastError() returns 0 ("The operation completed successfully").
+					This isn't a bug in Go or your code; this is Windows politely saying, "I heard your request perfectly, and the answer is absolutely not."
+						- Gemini 3.1 Pro
+					so since we swallow the LMB click when gesture triggers for ModeMove, and we instead try to basically steal the focus from Start Menu, win11 disallows this. If LMB were allowed then it woulda worked, which is why the fallback synthetic/injected LMB click works and will focus it.
 
-						So the error below is:
-						"failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=0 err='"SetForegroundWindow" windows call reported failure (ret=0) but no usable error was provided' callErr:'The operation completed successfully.'"
-					*/
-					logf("failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=%d err='%v' callErr:'%v' (this usually happens because Start menu was open, as: ret==0 and callErr is success)", res1.R1, res1.Err, res1.CallStatus)
-					return false
-				} else {
-					return true
-				}
-				//focusThisHwnd(target)
+					So the error below is:
+					"failed to SetForegroundWindow for own window in same thread(w/o thread attach) ret=0 err='"SetForegroundWindow" windows call reported failure (ret=0) but no usable error was provided' callErr:'The operation completed successfully.'"
+				*/
 			} else {
 				//reason = "is own window on diff. thread which might have own msg. loop"
 				logf("attempting to focus own window, but it's on a diff. thread in own process, will pretend it's focused(to avoid the LMB-click-to-focus-it workaround next) without actually focusing it tho.")
@@ -4411,9 +4450,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// 	}
 			// }
 
-			if res := procSetForegroundWindow.Call(hwnd); res.Failed() {
-				logf("WM_MYSYSTRAY: SetForegroundWindow(self) failed: %v", res.Err)
-			}
+			setForegroundWindow(windows.Handle(hwnd), "WM_MYSYSTRAY: SetForegroundWindow(self) failed")
 			// logf("Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
 
 			res2 := procTrackPopupMenu.Call(
@@ -7036,4 +7073,15 @@ func enqueueMoveOrResize(data WindowMoveData, context3 string) {
 		// We just increment our "shame counter" and move on.
 		droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
 	}
+}
+
+// setForegroundWindow calls SetForegroundWindow and handles the boilerplate logging if it fails.
+func setForegroundWindow(hwnd windows.Handle, failLogPrefix string) bool {
+	res := procSetForegroundWindow.Call(uintptr(hwnd))
+	if res.Failed() {
+		//XXX: you get ret=0 aka res.Err=0 with "err=The operation completed successfully." when Start menu was already open
+		logf("%s ret=%d err='%v' callStatus='%v'", failLogPrefix, res.R1, res.Err, res.CallStatus)
+		return false
+	}
+	return true
 }

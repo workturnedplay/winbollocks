@@ -1,6 +1,4 @@
 todo:
-* no need for //go:uintptrescapes  because "Passing integers to a function never triggers a heap allocation."
-* DRY procSetForegroundWindow.Call() but somehow keep the specific log msgs.
 * make hookThreadID be atomic.Uint32
 
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
@@ -19,6 +17,8 @@ dontdothis:
 
 
 done:
+//* DRY procSetForegroundWindow.Call() but somehow keep the specific log msgs.
+//* no need for //go:uintptrescapes  because "Passing integers to a function never triggers a heap allocation.", so it's for Go pointers only that get cast as uintptr.
 //* DRY the procGetModuleHandle() calls, maybe keeping a global for it? since I presume the return can't ever change during runtime! but, can the same return be used in multiple places? presumablu it's just a value not an instance of sorts(so not a pointer or a handle needing Close!)
 //* fullscreen firefox aka F11 key isn't detected as fullscreen or anything, so gesture works but shouldn't. My bad, setting was off by default! so ofc it wouldn't prevent the gesture! when on tho, it works: prevents it, even F11 of vscode!
 //untestedyet//* don't spam this "Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)", say it only once per window maybe? or once per second, in case 30mins pass and user just tried it again looking for debug/err msgs as to why it doesn't work and sees none because maybe it's same window, that's why maybe 1 per sec is better?! 
