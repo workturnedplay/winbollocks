@@ -2303,10 +2303,20 @@ func shouldBypassGestureNow(hwnd windows.Handle) bool {
 	}
 	should := isWindowFullscreenOnMonitor(hwnd)
 	if should {
-		logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)")
+		//logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)")
+		now := time.Now().UnixNano()
+		last := lastFullscreenLogTime.Load()
+		const everyXSeconds = 1
+		// Only log if 1 second (1,000,000,000 nanoseconds) has passed
+		if now-last > int64(everyXSeconds*time.Second) {
+			lastFullscreenLogTime.Store(now)
+			logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray) (this logline is rate-limited to 1 per %d second(s))", everyXSeconds)
+		}
 	}
 	return should
 }
+
+var lastFullscreenLogTime atomic.Int64 // Add this with your other globals
 
 // alignRestoredWindowToCursor repositions the restored-window rect so the
 // cursor sits at the same proportional position it held within the maximized
@@ -2548,7 +2558,7 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 		// windows.GetLastError() is safer than trusting err blindly
 		lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far!
 		//if lastErr != windows.ERROR_SUCCESS {
-		if !errors.Is(lastErr, windows.ERROR_SUCCESS) {
+		if lastErr != nil && !errors.Is(lastErr, windows.ERROR_SUCCESS) {
 			return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", lastErr)
 			// //nolint:wrapcheck
 			// return 0, lastErr
@@ -5593,10 +5603,13 @@ func primary_defer() { //primary defer
 
 		if startupTerminalHwnd != 0 {
 			//this isn't reached if compiled with 'go build -ldflags="-H=windowsgui" ' because it's 0
-			logf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
+			//using direct instead of logf to avoid the intermixing of this msg and the "Press any key" one!
+			directLoggerf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
 			// Use your existing thread-attaching focus method to bypass UIPI/Focus Stealing Prevention
 			forceForeground(startupTerminalHwnd)
 		}
+
+		//TODO: sync the logf here but don't kill/close it! to ensure no queued messages get printed while "Press any key" message is shown, else they get appended to the line because it lacks a "\n" on purpose!
 
 		// focusedNow := getForegroundWindow()
 		// logf("Currently focused window is 0x%X", focusedNow) //before the above fix, this is 0x0 (tho no error happened), or it's explorer.exe's window if restoreForegroundAfterTrayMenu() was allowed to run.
@@ -6786,14 +6799,32 @@ func initDarkMode() {
 	const AllowDark uintptr = 1
 	const wanted = AllowDark
 
+	// Quick string mapper
+	modeStr := func(m uintptr) string {
+		switch m {
+		case 0:
+			return "Default"
+		case 1:
+			return "AllowDark"
+		case 2:
+			return "ForceDark"
+		case 3:
+			return "ForceLight"
+		case 4:
+			return "Max"
+		default:
+			return fmt.Sprintf("Unknown(%d)", m)
+		}
+	}
+
 	// Ordinal 135: SetPreferredAppMode (Windows 10 1903+) / AllowDarkModeForApp (Windows 10 1809)
 	if procSetPreferredAppMode, err := windows.GetProcAddressByOrdinal(windows.Handle(uxtheme.Handle()), 135); err == nil {
 		r1, _, errno := syscall.SyscallN(procSetPreferredAppMode, wanted)
 		if errno != 0 {
 			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) returned errno: %v", errno)
 		} else {
-			// SetPreferredAppMode usually returns the previous state as r1.
-			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, current mode: %d, prev mode: %d", wanted, r1) //prev was 0
+			// SetPreferredAppMode returns the previous state as r1.
+			logf("initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, current mode: %s, prev mode: %s", modeStr(wanted), modeStr(r1))
 		}
 	} else {
 		logf("initDarkMode: Failed to find uxtheme ordinal 135: %v", err)
