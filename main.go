@@ -4852,6 +4852,7 @@ var (
 	logChanSize   uint64 = 4096
 	logChan              = make(chan string, logChanSize) // Buffer of this many log messages
 	logWorkerDone        = make(chan struct{})            // The "I'm finished" signal
+	logFlushChan         = make(chan chan struct{})
 
 	// logQuit is closed exactly once (guarded by logQuitClosed) to ask
 	// logWorker to stop waiting on logChan and drain whatever's left. We
@@ -5593,7 +5594,7 @@ func logWorker() {
 	// keeps spinning at 100% speed on its own CPU core.
 	var counter uint32 = 0
 	const MaxBeforeReset uint32 = 4_294_967_295 - 10_000_000
-	const modVal = 50
+	const modVal = 50 //must be more than 1, else infinite loop below
 loggingLoop:
 	for {
 		select {
@@ -5602,14 +5603,21 @@ loggingLoop:
 			internalLogger(msg) // good call here
 			if counter%modVal == 0 {
 				verifyMemoryIsLocked() // can logf itself! so modVal must be > than how many msgs it can log worst case(currently 1) else i will infinite loop here.
-				//time.Sleep(10 * time.Second) //FIXME: temp, remove this!
+			}
+			if counter > MaxBeforeReset {
+				counter = 0
+			}
+		case ack := <-logFlushChan:
+			// Drain all currently queued messages
+			for len(logChan) > 0 {
+				msg := <-logChan
+				counter++
 				if counter > MaxBeforeReset {
 					counter = 0
 				}
+				internalLogger(msg)
 			}
-			// if counter%5 == 0 {
-			// 	runtime.GC() // garbage collect, no apparent effect!
-			// }
+			close(ack) // Signal back to FlushLogs() that we are done
 		case <-logQuit:
 			// Shutdown requested. Drain whatever's already buffered in
 			// logChan (non-blockingly) so we don't lose messages enqueued
@@ -5693,9 +5701,29 @@ func internalLogger(finalMsg string) {
 	if err != nil && canUseConsoleStderr {
 		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't write to logFile %q the logline: %s", err, logFile.Name(), finalMsg)
 	}
+	// --- START SYNC TIMING ---
+	syncStart := time.Now()
 	err2 := logFile.Sync()
+	syncDur := time.Since(syncStart)
+	// --- END SYNC TIMING ---
 	if err2 != nil && canUseConsoleStderr {
 		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't sync logFile %q after writing to it this logline: %s", err2, logFile.Name(), finalMsg)
+	}
+	// Check if the sync took an unusually long time
+	const slowSyncThreshold = 1 * time.Second
+	if syncDur > slowSyncThreshold {
+		warnMsg := formatLogMessage("LOG SYNC LAG DETECTED: fsync took %v (threshold: %v)", syncDur, slowSyncThreshold)
+
+		// Print to stderr if available
+		if canUseConsoleStderr {
+			fmt.Fprintf(os.Stderr, "!!! %s", warnMsg)
+		}
+
+		// Write to the log file WITHOUT calling Sync() again
+		_, err3 := fmt.Fprintf(logFile, "%s", warnMsg)
+		if err3 != nil {
+			fmt.Fprintf(os.Stderr, "!!! failed to write to logFile %q too (err:%v) the warn msg: %q", logFile.Name(), err3, warnMsg)
+		}
 	}
 }
 
@@ -5786,16 +5814,18 @@ func primary_defer() { //primary defer
 		if startupTerminalHwnd != 0 {
 			//this isn't reached if compiled with 'go build -ldflags="-H=windowsgui" ' because it's 0
 			//using direct instead of logf to avoid the intermixing of this msg and the "Press any key" one!
-			directLoggerf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
+			logf("Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x%X", startupTerminalHwnd)
 			// Use your existing thread-attaching focus method to bypass UIPI/Focus Stealing Prevention
 			forceForeground(startupTerminalHwnd)
 		}
 
-		//TODO: sync the logf here but don't kill/close it! to ensure no queued messages get printed while "Press any key" message is shown, else they get appended to the line because it lacks a "\n" on purpose!
-
 		// focusedNow := getForegroundWindow()
 		// logf("Currently focused window is 0x%X", focusedNow) //before the above fix, this is 0x0 (tho no error happened), or it's explorer.exe's window if restoreForegroundAfterTrayMenu() was allowed to run.
-		wincoe.WaitAnyKey()
+
+		//doneTODO: sync the logf here but don't kill/close it! to ensure no queued messages get printed while "Press any key" message is shown, else they get appended to the line because it lacks a "\n" on purpose!
+		// Flush all pending logs before printing the prompt!
+		FlushLogs()
+		wincoe.WaitAnyKey() // Press any key
 	} else {
 		logf("Didn't wait for keypress due to not an interactive/terminal.")
 	}
@@ -7088,4 +7118,18 @@ func setForegroundWindow(hwnd windows.Handle, failLogPrefix string) bool {
 		return false
 	}
 	return true
+}
+
+// FlushLogs blocks until the logWorker has written all currently queued messages.
+func FlushLogs() {
+	if logQuitClosed.Load() {
+		return // Worker is already dead/dying
+	}
+	ack := make(chan struct{})
+	select {
+	case logFlushChan <- ack:
+		<-ack // Wait for logWorker to finish draining
+	case <-logWorkerDone:
+		// Worker exited before it could process
+	}
 }
