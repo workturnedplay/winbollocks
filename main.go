@@ -253,6 +253,7 @@ var (
 	procAppendMenu      = wincoe.NewBoundProc(user32, "AppendMenuW", wincoe.CheckBool)
 	//"This API returns BOOL only if TPM_RETURNCMD is specified. Otherwise it returns nonzero merely because the menu was displayed.If you don't always pass TPM_RETURNCMD, CheckBool is fine. If you do always pass TPM_RETURNCMD, then returning 0 may simply mean the user dismissed the menu without choosing anything." - chatgpt 5.5
 	procTrackPopupMenu = wincoe.NewBoundProc(user32, "TrackPopupMenu", wincoe.CheckNone)
+	procDestroyMenu    = wincoe.NewBoundProc(user32, "DestroyMenu", wincoe.CheckBool)
 	procGetCursorPos   = wincoe.NewBoundProc(user32, "GetCursorPos", wincoe.CheckBool)
 
 	// procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
@@ -4182,6 +4183,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				return 0 // Handled
 			}
 			hMenu := res1.R1
+			defer func() {
+				if res := procDestroyMenu.Call(hMenu); res.Failed() {
+					logf("in wndProc, WM_MYSYSTRAY, failed to DestroyMenu, err=%v", res.Err)
+				}
+			}()
 
 			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
 			if focusOnDrag.Load() {
