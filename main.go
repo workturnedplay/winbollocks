@@ -1452,10 +1452,13 @@ func windowFromPoint(pt POINT) windows.Handle {
 
 func getWindowPID(hwnd windows.Handle) uint32 {
 	var pid uint32
-	procGetWindowThreadProcessID.Call(
+	res1 := procGetWindowThreadProcessID.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&pid)),
 	)
+	if res1.Failed() {
+		logf("getWindowPID: GetWindowThreadProcessId failed for HWND=0x%X, err: %v", hwnd, res1.Err)
+	}
 
 	return pid
 }
@@ -1536,6 +1539,9 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	//ridPtr := (*uint32)(unsafe.Pointer(subAuthBase + ridOffset))
 	//ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[headerSize])) + 8 + (uintptr(subCount-1) * 4))) //this is fine
 	offset := uintptr(8 + (subCount-1)*4)
+	if requiredLen := headerSize + int(offset) + 4; requiredLen > lenb {
+		return 0, fmt.Errorf("SID subauthority count %d would read past end of token-information buffer (need %d bytes, have %d)", subCount, requiredLen, lenb)
+	}
 	ridPtr := (*uint32)(unsafe.Add(unsafe.Pointer(&buf[headerSize]), offset))
 	rid := *ridPtr
 
@@ -1543,6 +1549,17 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 }
 
 /* ---------------- Tray ---------------- */
+
+// appendMenuChecked wraps AppendMenuW with logging on failure; label is only
+// used in the log message to identify which menu item failed.
+//
+//go:uintptrescapes
+func appendMenuChecked(hMenu, flags, id uintptr, textStr string) {
+	text := mustUTF16(textStr)
+	if res := procAppendMenu.Call(hMenu, flags, id, uintptr(unsafe.Pointer(text))); res.Failed() {
+		logf("WM_MYSYSTRAY: AppendMenu failed for item with text %q, err=%v", textStr, res.Err)
+	}
+}
 
 func initTray() error {
 	if mainMsgHwnd == 0 {
@@ -1732,12 +1749,14 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt POINT,
 	if focus.Load() && !isWindowForeground(targetWnd) { //TODO: should I move this in startDrag?
 		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
 
-		procPostMessage.Call(
+		if res := procPostMessage.Call(
 			uintptr(mainMsgHwnd),
 			WM_FOCUS_TARGET_WINDOW_SOMEHOW,
 			uintptr(targetWnd),     // wParam
 			makeLParam(pt.X, pt.Y), // lParam contains X and Y
-		)
+		); res.Failed() {
+			logf("%s: PostMessage WM_FOCUS_TARGET_WINDOW_SOMEHOW for HWND=0x%X failed: %v", callerName, targetWnd, res.Err)
+		}
 	}
 }
 
@@ -2066,10 +2085,15 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	*/
 	if releaseCapture {
 		if mainMsgHwnd != 0 {
-			procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_RELEASE_CAPTURE, 0, 0)
+			if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_RELEASE_CAPTURE, 0, 0); res.Failed() {
+				logf("softReset: PostMessage WM_DO_RELEASE_CAPTURE failed: %v", res.Err)
+			}
 		} else {
+			// fallback, but should rarely hit
 			logf("mainMsgHwnd is 0 in softReset when trying to send a WM_DO_RELEASE_CAPTURE, falling back to calling ReleaseCapture now!")
-			procReleaseCapture.Call() // fallback, but should rarely hit
+			if res := procReleaseCapture.Call(); res.Failed() {
+				logf("softReset: fallback ReleaseCapture failed: %v", res.Err)
+			}
 		}
 	}
 
@@ -2077,7 +2101,9 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	// Instead of calling hideOverlay() synchronously on the hook thread,
 	// post it asynchronously to your main thread's message window loop.
 	if mainMsgHwnd != 0 {
-		procPostMessage.Call(uintptr(mainMsgHwnd), WM_HIDE_OVERLAY, 0, 0)
+		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_HIDE_OVERLAY, 0, 0); res.Failed() {
+			logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
+		}
 	} else {
 		logf("unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
 	}
@@ -2095,6 +2121,7 @@ func hardReset(releaseCapture bool) {
 
 // Define the overlay window class name as a constant
 const winbollocksResizingOverlayClassName = "winbollocksResizingOverlayClass" //TODO: see if underscores work in this!
+const winbollocksHiddenClassName = "winbollocksHidden"
 
 func initOverlay() error {
 	className := mustUTF16(winbollocksResizingOverlayClassName)
@@ -2662,7 +2689,7 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 
 	// Explicit no-activate → DO NOT TOUCH
 	if ex&WS_EX_NOACTIVATE != 0 {
-		reason = "is no WS_EX_NOACTIVATE"
+		reason = "has WS_EX_NOACTIVATE (explicit no-activate)"
 		return
 	}
 
@@ -2796,7 +2823,11 @@ func forceForeground(target windows.Handle) bool {
 				return false
 			}
 
-			defer procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)) // Detach always
+			defer func() {
+				if res := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)); res.Failed() {
+					logf("forceForeground: AttachThreadInput detach failed for threadIDs %d/%d: %v", curTid, targetThreadID, res.Err)
+				}
+			}() // Detach always
 		} //was not console
 	} // was useThreadAttachInputForFocus
 
@@ -3365,10 +3396,9 @@ func createMessageWindow() (windows.Handle, error) {
 	if curThreadID := windows.GetCurrentThreadId(); mainThreadID != curThreadID {
 		exitf(1, "unexpected: main loop thread and wndProc are on different threads mainThreadID: %d, curThreadID: %d", mainThreadID, curThreadID)
 	}
-	const className2 = "winbollocksHidden"
-	classNameUTF16, err := windows.UTF16PtrFromString(className2)
+	classNameUTF16, err := windows.UTF16PtrFromString(winbollocksHiddenClassName)
 	if err != nil {
-		return 0, fmt.Errorf("UTF16PtrFromString failed for class name %s, err: %w", className2, err)
+		return 0, fmt.Errorf("UTF16PtrFromString failed for class name %s, err: %w", winbollocksHiddenClassName, err)
 	}
 
 	var wc WNDCLASSEX
@@ -3377,7 +3407,7 @@ func createMessageWindow() (windows.Handle, error) {
 	wc.LpszClassName = classNameUTF16
 	res1 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
 	if res1.Failed() {
-		return 0, fmt.Errorf("GetModuleHandle(0) failed for class name %s, err: %w", className2, res1.Err)
+		return 0, fmt.Errorf("GetModuleHandle(0) failed for class name %s, err: %w", winbollocksHiddenClassName, res1.Err)
 	}
 	wc.HInstance = windows.Handle(res1.R1)
 
@@ -3562,9 +3592,12 @@ func hookWorker() {
 	} else {
 		mouseHook = windows.Handle(res1.R1)
 		defer func() {
-			procUnhookWindowsHookEx.Call(uintptr(mouseHook))
+			if res := procUnhookWindowsHookEx.Call(uintptr(mouseHook)); res.Failed() {
+				logf("failed to unhook mouseHook: %v", res.Err)
+			} else {
+				logf("unhooked mouseHook")
+			}
 			mouseHook = 0
-			logf("unhooked mouseHook")
 		}()
 	}
 
@@ -3583,8 +3616,12 @@ func hookWorker() {
 		kbdHook = windows.Handle(res2.R1)
 		defer func() {
 			procUnhookWindowsHookEx.Call(uintptr(kbdHook))
+			if res := procUnhookWindowsHookEx.Call(uintptr(kbdHook)); res.Failed() {
+				logf("failed to unhook kbdHook: %v", res.Err)
+			} else {
+				logf("unhooked kbdHook")
+			}
 			kbdHook = 0
-			logf("unhooked kbdHook")
 		}()
 	}
 
@@ -4145,37 +4182,11 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			*/
 			// Get mouse position early (always do this manually — wParam/lParam don't carry it reliably) - Grok
 			var pt POINT
-			procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-
-			logf("popping tray menu")
-
-			focusText := mustUTF16("Activate(aka focus) window when moved if not in focus.")
-			bringToFrontOnDragText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)")
-			focusResizeText := mustUTF16("Activate(aka focus) window when a resize gesture starts if not already in focus.")
-			bringToFrontOnResizeText := mustUTF16("Bring already-focused(!) window to front of Z-order when starting a resize gesture (independent of the same option for drag/move above)")
-			useThreadAttachInputForFocusText := mustUTF16("(dontuse)Use AttachThreadInput before attempting any window focus (else focus stealing prevention might happen)")
-			doLMBClick2FocusAsFallbackText := mustUTF16("Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements).")
-			ratelimitText := mustUTF16("Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)")
-			sldrText := mustUTF16("Log rate of moves(only if rate-limit above is enabled)")
-			asyncText := mustUTF16("Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)")
-			reqWinDownText := mustUTF16("Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases") //such as(not anymore this): if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false); actually not anymore now that I got lock/unlock hooks and I reset when winkey+L locks !
-			coalesceEventsText := mustUTF16("Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps")
-			immediateOverlayRepaintText := mustUTF16("Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints")
-			var missedGestureRecoveryText *uint16
-			if isAdmin {
-				// Ordinary windows can no longer outrank us once elevated (High IL), so
-				// this now only matters for the rarer System-integrity foreground
-				// windows. Not greyed out: that edge case is uncommon but real, and the
-				// IL comparison in winEventProc already makes this a no-op otherwise.
-				missedGestureRecoveryText = mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (you're elevated, so this now only matters for rarer System-integrity windows)")
-			} else {
-				missedGestureRecoveryText = mustUTF16("Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (e.g. Task Manager) (you're not elevated)")
+			if res := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt))); res.Failed() {
+				logf("WM_MYSYSTRAY: GetCursorPos failed, menu will appear at (0,0): %v", res.Err)
 			}
 
-			injectButtonUpOnMissedGestureRecoveryText := mustUTF16("(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)")
-			bypassWhenFullscreenText := mustUTF16("Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)")
-
-			exitText := mustUTF16("Exit")
+			logf("popping tray menu")
 
 			res1 := procCreatePopupMenu.Call()
 			if res1.Failed() {
@@ -4189,126 +4200,184 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				}
 			}()
 
-			var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
-			if focusOnDrag.Load() {
-				actFlags |= MF_CHECKED
-			}
-			procAppendMenu.Call(hMenu, actFlags, MENU_ACTIVATE_MOVE,
-				uintptr(unsafe.Pointer(focusText)))
-
-			var bringToFrontOnDragFlags uintptr = MF_STRING
-			if bringToFrontOnDrag.Load() {
-				bringToFrontOnDragFlags |= MF_CHECKED
-			}
-			// if !focusOnDrag.Load() { //XXX:actually don't, because if it's focused, we can bring it to front
-			// 	bringToFrontOnDragFlags |= MF_DISABLED | MF_GRAYED
-			// }
-			procAppendMenu.Call(hMenu, bringToFrontOnDragFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG,
-				uintptr(unsafe.Pointer(bringToFrontOnDragText)))
-
-			var actResizeFlags uintptr = MF_STRING
-			if focusOnResize.Load() {
-				actResizeFlags |= MF_CHECKED
-			}
-			procAppendMenu.Call(hMenu, actResizeFlags, MENU_TOGGLE_ACTIVATE_RESIZE,
-				uintptr(unsafe.Pointer(focusResizeText)))
-
-			var bringToFrontOnResizeFlags uintptr = MF_STRING
-			if bringToFrontOnResize.Load() {
-				bringToFrontOnResizeFlags |= MF_CHECKED
-			}
-			procAppendMenu.Call(hMenu, bringToFrontOnResizeFlags, MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE,
-				uintptr(unsafe.Pointer(bringToFrontOnResizeText)))
-
-			var useThreadAttachInputForFocusFlags uintptr = MF_STRING
-			if useThreadAttachInputForFocus.Load() {
-				useThreadAttachInputForFocusFlags |= MF_CHECKED
-			}
-			procAppendMenu.Call(hMenu, useThreadAttachInputForFocusFlags, MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS,
-				uintptr(unsafe.Pointer(useThreadAttachInputForFocusText)))
-
-			var lmbFlags uintptr = MF_STRING
-			if doLMBClick2FocusAsFallback.Load() {
-				lmbFlags |= MF_CHECKED
-			}
-			if !focusOnDrag.Load() && !focusOnResize.Load() {
-				lmbFlags |= MF_DISABLED | MF_GRAYED
-			}
-			procAppendMenu.Call(hMenu, lmbFlags, MENU_USE_LMB_TO_FOCUS_AS_FALLBACK,
-				uintptr(unsafe.Pointer(doLMBClick2FocusAsFallbackText)))
-
-			var rlFlags uintptr = MF_STRING
-			if ratelimitOnMove.Load() {
-				rlFlags |= MF_CHECKED
+			{
+				var actFlags uintptr = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
+				if focusOnDrag.Load() {
+					actFlags |= MF_CHECKED
+				}
+				focusText := "Activate(aka focus) window when moved if not in focus."
+				appendMenuChecked(hMenu, actFlags, MENU_ACTIVATE_MOVE, focusText)
 			}
 
-			procAppendMenu.Call(hMenu, rlFlags, MENU_RATELIMIT_MOVES,
-				uintptr(unsafe.Pointer(ratelimitText)))
+			{
+				var bringToFrontOnDragFlags uintptr = MF_STRING
+				if bringToFrontOnDrag.Load() {
+					bringToFrontOnDragFlags |= MF_CHECKED
+				}
+				// if !focusOnDrag.Load() { //XXX:actually don't, because if it's focused, we can bring it to front
+				// 	bringToFrontOnDragFlags |= MF_DISABLED | MF_GRAYED
+				// }
+				bringToFrontOnDragText := "Bring already-focused(!) window to front of Z-order when starting a drag/move gesture (useful after winkey+MMB sent it to back)"
+				appendMenuChecked(hMenu, bringToFrontOnDragFlags,
+					MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG, bringToFrontOnDragText)
+			}
 
-			var sldrFlags uintptr = MF_STRING
-			if shouldLogDragRate.Load() {
-				sldrFlags |= MF_CHECKED
+			{
+				var actResizeFlags uintptr = MF_STRING
+				if focusOnResize.Load() {
+					actResizeFlags |= MF_CHECKED
+				}
+				focusResizeText := "Activate(aka focus) window when a resize gesture starts if not already in focus."
+				appendMenuChecked(hMenu, actResizeFlags,
+					MENU_TOGGLE_ACTIVATE_RESIZE, focusResizeText)
 			}
-			// Disable (grey) the "Log rate of moves" item when rate-limit is off
-			if !ratelimitOnMove.Load() {
-				sldrFlags |= MF_DISABLED | MF_GRAYED
-			}
-			procAppendMenu.Call(hMenu, sldrFlags, MENU_LOG_RATE_OF_MOVES,
-				uintptr(unsafe.Pointer(sldrText)))
 
-			var asyncFlags uintptr = MF_STRING
-			if asyncResize.Load() {
-				asyncFlags |= MF_CHECKED
+			{
+				var bringToFrontOnResizeFlags uintptr = MF_STRING
+				if bringToFrontOnResize.Load() {
+					bringToFrontOnResizeFlags |= MF_CHECKED
+				}
+				bringToFrontOnResizeText := "Bring already-focused(!) window to front of Z-order when starting a resize gesture (independent of the same option for drag/move above)"
+				appendMenuChecked(hMenu, bringToFrontOnResizeFlags,
+					MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE, bringToFrontOnResizeText)
 			}
-			procAppendMenu.Call(hMenu, asyncFlags, MENU_TOGGLE_ASYNC_RESIZE,
-				uintptr(unsafe.Pointer(asyncText)))
 
-			var reqWinDownFlags uintptr = MF_STRING
-			if requireWinDownHeldDuringGesture.Load() {
-				reqWinDownFlags |= MF_CHECKED
+			{
+				var useThreadAttachInputForFocusFlags uintptr = MF_STRING
+				if useThreadAttachInputForFocus.Load() {
+					useThreadAttachInputForFocusFlags |= MF_CHECKED
+				}
+				useThreadAttachInputForFocusText := "(dontuse)Use AttachThreadInput before attempting any window focus (else focus stealing prevention might happen)"
+				appendMenuChecked(hMenu, useThreadAttachInputForFocusFlags,
+					MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS, useThreadAttachInputForFocusText)
 			}
-			procAppendMenu.Call(hMenu, reqWinDownFlags, MENU_TOGGLE_REQUIRE_WINDOWN,
-				uintptr(unsafe.Pointer(reqWinDownText)))
 
-			var coalesceEventsFlags uintptr = MF_STRING
-			if coalesceMoveResizeEvents.Load() {
-				coalesceEventsFlags |= MF_CHECKED
+			{
+				var lmbFlags uintptr = MF_STRING
+				if doLMBClick2FocusAsFallback.Load() {
+					lmbFlags |= MF_CHECKED
+				}
+				if !focusOnDrag.Load() && !focusOnResize.Load() {
+					lmbFlags |= MF_DISABLED | MF_GRAYED
+				}
+				doLMBClick2FocusAsFallbackText := "Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements)."
+				appendMenuChecked(hMenu, lmbFlags,
+					MENU_USE_LMB_TO_FOCUS_AS_FALLBACK, doLMBClick2FocusAsFallbackText)
 			}
-			procAppendMenu.Call(hMenu, coalesceEventsFlags, MENU_TOGGLE_COALESCE_EVENTS,
-				uintptr(unsafe.Pointer(coalesceEventsText)))
 
-			var immediateOverlayRepaintFlags uintptr = MF_STRING
-			if immediateOverlayRepaint.Load() {
-				immediateOverlayRepaintFlags |= MF_CHECKED
+			{
+				var rlFlags uintptr = MF_STRING
+				if ratelimitOnMove.Load() {
+					rlFlags |= MF_CHECKED
+				}
+				ratelimitText := "Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)"
+				appendMenuChecked(hMenu, rlFlags,
+					MENU_RATELIMIT_MOVES, ratelimitText)
 			}
-			procAppendMenu.Call(hMenu, immediateOverlayRepaintFlags, MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT,
-				uintptr(unsafe.Pointer(immediateOverlayRepaintText)))
 
-			var missedGestureRecoveryFlags uintptr = MF_STRING
-			if missedGestureRecoveryEnabled.Load() {
-				missedGestureRecoveryFlags |= MF_CHECKED
+			{
+				var sldrFlags uintptr = MF_STRING
+				if shouldLogDragRate.Load() {
+					sldrFlags |= MF_CHECKED
+				}
+				// Disable (grey) the "Log rate of moves" item when rate-limit is off
+				if !ratelimitOnMove.Load() {
+					sldrFlags |= MF_DISABLED | MF_GRAYED
+				}
+				sldrText := "Log rate of moves(only if rate-limit above is enabled)"
+				appendMenuChecked(hMenu, sldrFlags,
+					MENU_LOG_RATE_OF_MOVES, sldrText)
 			}
-			procAppendMenu.Call(hMenu, missedGestureRecoveryFlags, MENU_TOGGLE_MISSED_GESTURE_RECOVERY,
-				uintptr(unsafe.Pointer(missedGestureRecoveryText)))
 
-			var injectButtonUpFlags uintptr = MF_STRING
-			if injectButtonUpOnMissedGestureRecovery.Load() {
-				injectButtonUpFlags |= MF_CHECKED
+			{
+				var asyncFlags uintptr = MF_STRING
+				if asyncResize.Load() {
+					asyncFlags |= MF_CHECKED
+				}
+				asyncText := "Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)"
+				appendMenuChecked(hMenu, asyncFlags,
+					MENU_TOGGLE_ASYNC_RESIZE, asyncText)
 			}
-			if !missedGestureRecoveryEnabled.Load() {
-				injectButtonUpFlags |= MF_DISABLED | MF_GRAYED
-			}
-			procAppendMenu.Call(hMenu, injectButtonUpFlags, MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY,
-				uintptr(unsafe.Pointer(injectButtonUpOnMissedGestureRecoveryText)))
 
-			var bypassWhenFullscreenFlags uintptr = MF_STRING
-			if bypassGesturesWhenFullscreen.Load() {
-				bypassWhenFullscreenFlags |= MF_CHECKED
+			{
+				var reqWinDownFlags uintptr = MF_STRING
+				if requireWinDownHeldDuringGesture.Load() {
+					reqWinDownFlags |= MF_CHECKED
+				}
+				reqWinDownText := "Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases" //such as(not anymore this): if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false); actually not anymore now that I got lock/unlock hooks and I reset when winkey+L locks !
+				appendMenuChecked(hMenu, reqWinDownFlags,
+					MENU_TOGGLE_REQUIRE_WINDOWN, reqWinDownText)
 			}
-			procAppendMenu.Call(hMenu, bypassWhenFullscreenFlags, MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN,
-				uintptr(unsafe.Pointer(bypassWhenFullscreenText)))
 
-			procAppendMenu.Call(hMenu, MF_STRING, MENU_EXIT, uintptr(unsafe.Pointer(exitText)))
+			{
+				var coalesceEventsFlags uintptr = MF_STRING
+				if coalesceMoveResizeEvents.Load() {
+					coalesceEventsFlags |= MF_CHECKED
+				}
+				coalesceEventsText := "Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps"
+				appendMenuChecked(hMenu, coalesceEventsFlags,
+					MENU_TOGGLE_COALESCE_EVENTS, coalesceEventsText)
+			}
+
+			{
+				var immediateOverlayRepaintFlags uintptr = MF_STRING
+				if immediateOverlayRepaint.Load() {
+					immediateOverlayRepaintFlags |= MF_CHECKED
+				}
+				immediateOverlayRepaintText := "Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints"
+				appendMenuChecked(hMenu, immediateOverlayRepaintFlags,
+					MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT, immediateOverlayRepaintText)
+
+			}
+
+			{
+				var missedGestureRecoveryFlags uintptr = MF_STRING
+				if missedGestureRecoveryEnabled.Load() {
+					missedGestureRecoveryFlags |= MF_CHECKED
+				}
+				var missedGestureRecoveryText string
+				if isAdmin {
+					// Ordinary windows can no longer outrank us once elevated (High IL), so
+					// this now only matters for the rarer System-integrity foreground
+					// windows. Not greyed out: that edge case is uncommon but real, and the
+					// IL comparison in winEventProc already makes this a no-op otherwise.
+					missedGestureRecoveryText = "Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (you're elevated, so this now only matters for rarer System-integrity windows)"
+				} else {
+					missedGestureRecoveryText = "Recover winkey+LMB/RMB gestures missed while switching focus from a higher-integrity window (e.g. Task Manager) (you're not elevated)"
+				}
+				appendMenuChecked(hMenu, missedGestureRecoveryFlags,
+					MENU_TOGGLE_MISSED_GESTURE_RECOVERY, missedGestureRecoveryText)
+
+			}
+
+			{
+				var injectButtonUpFlags uintptr = MF_STRING
+				if injectButtonUpOnMissedGestureRecovery.Load() {
+					injectButtonUpFlags |= MF_CHECKED
+				}
+				if !missedGestureRecoveryEnabled.Load() {
+					injectButtonUpFlags |= MF_DISABLED | MF_GRAYED
+				}
+				injectButtonUpOnMissedGestureRecoveryText := "(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)"
+				appendMenuChecked(hMenu, injectButtonUpFlags,
+					MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY, injectButtonUpOnMissedGestureRecoveryText)
+			}
+
+			{
+				var bypassWhenFullscreenFlags uintptr = MF_STRING
+				if bypassGesturesWhenFullscreen.Load() {
+					bypassWhenFullscreenFlags |= MF_CHECKED
+				}
+				bypassWhenFullscreenText := "Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)"
+
+				appendMenuChecked(hMenu, bypassWhenFullscreenFlags,
+					MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN, bypassWhenFullscreenText)
+			}
+
+			{
+				exitText := "Exit"
+				appendMenuChecked(hMenu, MF_STRING, MENU_EXIT, exitText)
+			}
 
 			// var pt POINT
 			// procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
@@ -4338,7 +4407,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// 	}
 			// }
 
-			procSetForegroundWindow.Call(hwnd)
+			if res := procSetForegroundWindow.Call(hwnd); res.Failed() {
+				logf("WM_MYSYSTRAY: SetForegroundWindow(self) failed: %v", res.Err)
+			}
 			// logf("Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
 
 			res2 := procTrackPopupMenu.Call(
@@ -4539,16 +4610,22 @@ func deinit() {
 func deinitOverlayClass() {
 	if overlayHwnd != 0 {
 		// Destroy the overlay window
-		procDestroyWindow.Call(uintptr(overlayHwnd))
+		if res := procDestroyWindow.Call(uintptr(overlayHwnd)); res.Failed() {
+			logf("deinitOverlayClass: DestroyWindow failed for overlayHwnd=0x%X: %v", overlayHwnd, res.Err)
+		}
 		overlayHwnd = 0
 	}
 
 	if magentaBrush != 0 {
-		procGdiDeleteObject.Call(uintptr(magentaBrush))
+		if res := procGdiDeleteObject.Call(uintptr(magentaBrush)); res.Failed() {
+			logf("deinitOverlayClass: DeleteObject failed for magentaBrush=0x%X: %v", magentaBrush, res.Err)
+		}
 		magentaBrush = 0
 	}
 	if blackBrush != 0 {
-		procGdiDeleteObject.Call(uintptr(blackBrush))
+		if res := procGdiDeleteObject.Call(uintptr(blackBrush)); res.Failed() {
+			logf("deinitOverlayClass: DeleteObject failed for blackBrush=0x%X: %v", blackBrush, res.Err)
+		}
 		blackBrush = 0
 	}
 
@@ -4558,7 +4635,9 @@ func deinitOverlayClass() {
 	}
 	instance := res1.R1
 	classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
-	procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance)
+	if res2 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res2.Failed() {
+		logf("deinitOverlayClass: UnregisterClassW failed for overlay class: %v", res2.Err)
+	}
 }
 
 func deinitMainMsgHwnd() {
@@ -4569,6 +4648,16 @@ func deinitMainMsgHwnd() {
 			logf("DestroyWindow failed of HWND=0x%X: %v (probably already destroyed or invalid)", mainMsgHwnd, res1.Err)
 		}
 		mainMsgHwnd = 0
+	}
+
+	res2 := procGetModuleHandle.Call(0) // "If this parameter is NULL, GetModuleHandle returns a handle to the file used to create the calling process (.exe file)."
+	if res2.Failed() {
+		logf("in deinitMainMsgHwnd, failed to GetModuleHandle(0) aka own self .exe handle, err=%v", res2.Err)
+	}
+	instance := res2.R1
+	classNamePtr := mustUTF16(winbollocksHiddenClassName)
+	if res3 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res3.Failed() {
+		logf("deinitMainMsgHwnd: UnregisterClassW failed for winbollocksHidden class: %v", res3.Err)
 	}
 }
 
