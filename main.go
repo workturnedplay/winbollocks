@@ -29,7 +29,7 @@ package main
 
 import (
 	"context"
-	"errors"
+	//"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -2542,7 +2542,7 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	_ = procSetLastError.Call(0)
 	//windows.SetLastError(0)
 
-	res1 := procGetWindowLongPtrW.Call(
+	res1 := procGetWindowLongPtrW.Call( //it's a CheckNone so res1.Err is nil
 		uintptr(hwnd),
 		// #nosec G115 -- safe: Win32 ABI expects negative offsets to be cast to uintptr
 		uintptr(index),
@@ -2555,10 +2555,15 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	// GetWindowLongPtr can legally return 0 even on success.
 	// The only reliable failure signal is GetLastError.
 	if ret == 0 {
-		// windows.GetLastError() is safer than trusting err blindly
 		lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far!
-		//if lastErr != windows.ERROR_SUCCESS {
-		if lastErr != nil && !errors.Is(lastErr, windows.ERROR_SUCCESS) {
+		/*
+				Why windows.GetLastError() is Tricky
+			In Go's golang.org/x/sys/windows package, windows.GetLastError() returns an error interface type (under the hood, it’s a windows.Errno).
+			If the underlying Windows API reports 0 (which matches ERROR_SUCCESS), Go's windows package translates this to a literal nil error interface, not an error object containing ERROR_SUCCESS.
+			Therefore, you will never get an error object where errors.Is(err, windows.ERROR_SUCCESS) evaluates to true, because by the time it reaches your code, a success is just a plain old nil.
+		*/
+		// GetLastError returns nil if the last error code is 0 (ERROR_SUCCESS)
+		if lastErr != nil { //&& !errors.Is(lastErr, windows.ERROR_SUCCESS) {//
 			return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", lastErr)
 			// //nolint:wrapcheck
 			// return 0, lastErr

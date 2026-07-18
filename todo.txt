@@ -1,5 +1,4 @@
 todo:
-* fullscreen firefox aka F11 key isn't detected as fullscreen or anything, so gesture works.
 * incredible amount of errcheck (116 of them) ie. returned errors not checked, most in proc*.Call() calls, now they're hidden behind(because of) WinResult (the return from .Call()) !
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 * check if it's bad to deinit() in the recovered panic, i remember some AI saying it's bad in the past, but not why.
@@ -16,6 +15,7 @@ dontdothis:
 
 
 done:
+//* fullscreen firefox aka F11 key isn't detected as fullscreen or anything, so gesture works but shouldn't. My bad, setting was off by default! so ofc it wouldn't prevent the gesture! when on tho, it works: prevents it, even F11 of vscode!
 //untestedyet//* don't spam this "Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)", say it only once per window maybe? or once per second, in case 30mins pass and user just tried it again looking for debug/err msgs as to why it doesn't work and sees none because maybe it's same window, that's why maybe 1 per sec is better?! 
 //* need to make this log line be before the "Press..." one because they look mixed: "Press any key to exit...[Sat Jul 18 01:46:45.732790500 CEST 2026] Explicitly forcing focus back to startup terminal(so keyboard input is sensed here) HWND: 0x1504A0" and the next line is the "(clrbuf)..." from the "Press..."
 //* when u say this ""initDarkMode: uxtheme ordinal 135 (SetPreferredAppMode) succeeded, " tell me the current/prev as a string of this:  0=Default, 1=AllowDark, 2=ForceDark, 3=ForceLight, 4=Max
