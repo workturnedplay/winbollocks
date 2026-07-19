@@ -4478,12 +4478,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 			cmd := res2.R1
 			// Required by MSDN to dismiss menu correctly
-			res3 := procSendMessage.Call(hwnd, WM_NULL, 0, 0) // Send WM_NULL
+			_ = procSendMessage.Call(hwnd, WM_NULL, 0, 0) // Send WM_NULL, cannot fail, it's also CheckNone
 			// restoreForegroundAfterTrayMenu()
-			if res3.Failed() { //FIXME: never hit because procSendMessage is CheckNone
-				logf("in wndProc, WM_MYSYSTRAY, failed to SendMessage(WM_NULL) to (correctly)dismiss systray menu, err=%v", res3.Err)
-				return 0 // Handled
-			}
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
