@@ -506,6 +506,10 @@ const (
 	NIF_ICON    = 0x00000002
 	NIF_TIP     = 0x00000004
 	NIF_INFO    = 0x00000010
+	//In Windows Vista and later, when you choose Version 4 behavior, Windows suppresses the standard legacy tooltip by default.
+	// It assumes that because you are using the modern API version, you intend to provide your own advanced, application-drawn popup UI rather than a plain text tooltip.
+	//To tell Windows that you still want to display the standard text tooltip while using Version 4, you must explicitly add the NIF_SHOWTIP flag to your UFlags.
+	NIF_SHOWTIP = 0x00000080
 )
 
 const (
@@ -1612,7 +1616,8 @@ func initTray() error {
 	trayIcon.HWnd = mainMsgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
-	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
+	// 2. Add NIF_SHOWTIP here to force Windows to show the SzTip text under Version 4
+	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE | NIF_SHOWTIP
 
 	const IDI_APPLICATION = 32512
 
@@ -1627,7 +1632,7 @@ func initTray() error {
 	tipText := selfName + " " + GetVersion()
 	copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
 
-	//1
+	//1 Add the tray icon
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 	//if ret1 == 0 {
 	if res2.Failed() {
@@ -1635,6 +1640,7 @@ func initTray() error {
 		// You could exitf or fallback here, but for now just log
 	}
 
+	//Set the version behavior
 	//2, this must happen after NIM_ADD ! (bad chatgpt which suggested it before NIM_ADD)
 	res3 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
 	//if ret2 == 0 {
