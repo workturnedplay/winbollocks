@@ -58,10 +58,10 @@ if "!ec!" NEQ "0" (
   exit /b 1
 )
 
-if "!log_file!" NEQ "" (
-  if exist "!log_file!" (
-    echo Cleared log file: "!log_file!"
-    type nul > "!log_file!"
+if "!winbollocks_log_file!" NEQ "" (
+  if exist "!winbollocks_log_file!" (
+    echo Cleared log file: "!winbollocks_log_file!"
+    type nul > "!winbollocks_log_file!"
   )
 )
 
@@ -104,11 +104,11 @@ if "!ec!"=="0" (
     echo "!exe_name!" finished successfully.
 ) else (
     echo "!exe_name!" exited with error code "!ec!"
-    if "!log_file!" NEQ "" (
-      if exist "!log_file!" (
-        echo ---- debug log file "!log_file!" echoed below ----
-        type "!log_file!"
-        echo ---- debug log file "!log_file!" echoed above ----
+    if "!winbollocks_log_file!" NEQ "" (
+      if exist "!winbollocks_log_file!" (
+        echo ---- debug log file "!winbollocks_log_file!" echoed below ----
+        type "!winbollocks_log_file!"
+        echo ---- debug log file "!winbollocks_log_file!" echoed above ----
       )
     )
 )

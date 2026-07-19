@@ -4899,9 +4899,17 @@ func initLogFile() {
 	if logFile != nil {
 		return
 	}
+
+	// 1. Check if the batch script provided a log file path
+	logFilename := os.Getenv(selfName + "_log_file") // aka "winbollocks_log_file" env. var. which depends on readcfg.env 's key value being this! and readcfg.bat reading it and run.bat the top caller thus using it(the env. var.!)
+	if logFilename == "" {
+		// Fallback just in case it's run directly without the .bat
+		logFilename = selfName + "_debug.log"
+	}
+
 	// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
 	f, err := os.OpenFile(
-		selfName+"_debug.log", //"winbollocks_debug.log", //FIXME: keep this in sync with the one in the .bat, or rather make the .bat keep it in sync, somehow.
+		logFilename,
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
