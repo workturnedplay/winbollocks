@@ -1624,7 +1624,8 @@ func initTray() error {
 	trayIcon.UCallbackMessage = WM_MYSYSTRAY
 	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
 
-	copy(trayIcon.SzTip[:], windows.StringToUTF16("winbollocks")) //TODO: make const
+	tipText := selfName + " " + GetVersion()
+	copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
 
 	//1
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
@@ -1749,7 +1750,7 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 	if e1 == nil && targetIL > selfIntegrityLevel {
 		//XXX: this actually never gets reached because windows doesn't allow winbollocks to see the events(while higher itegrity window is focused) thus the gesture to drag it can never trigger!
 		procName := getProcessNameFast(pid)
-		showTrayInfo("winbollocks", fmt.Sprintf("Cannot use native drag on elevated window with pid=%d (%s)", pid, procName))
+		showTrayInfo(selfName, fmt.Sprintf("Cannot use native drag on elevated window with pid=%d (%s)", pid, procName))
 		return false
 	}
 	if e1 != nil {
@@ -2256,8 +2257,9 @@ func hardReset(releaseCapture bool) {
 }
 
 // Define the overlay window class name as a constant
-const winbollocksResizingOverlayClassName = "winbollocksResizingOverlayClass" //TODO: see if underscores work in this!
-const winbollocksHiddenClassName = "winbollocksHidden"
+const winbollocksResizingOverlayClassName = selfName + "ResizingOverlayClass" //winbollocksResizingOverlayClass //TODO: see if underscores work in this!
+const winbollocksHiddenClassName = selfName + "Hidden"                        // winbollocksHidden
+const selfName = "winbollocks"
 
 var hiddenClassRegistered atomic.Bool
 var overlayClassRegistered atomic.Bool
@@ -3902,7 +3904,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			// if errors.Is(err1, windows.ERROR_ACCESS_DENIED) { // Access denied (UIPI likely)
 			//if errCode == 5 { // Access denied (UIPI likely)
 			if res1.ErrIs(windows.ERROR_ACCESS_DENIED) { // ==5 aka Access denied (UIPI likely)
-				showTrayInfo("winbollocks", "Cannot resize elevated window (access denied), you'd have to run as admin.")
+				showTrayInfo(selfName, "Cannot resize elevated window (access denied), you'd have to run as admin.")
 			}
 		}
 		// --- STEP 2: MEASURE WHAT WINDOWS ACTUALLY ALLOWED ---
@@ -3981,7 +3983,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			logf("SetWindowPos/Move-after-Resize failed(from within main message loop): hwnd=0x%x err=%v", target, res3.Err)
 			// if errCode == 5 { // Access denied (UIPI likely)
 			if res3.ErrIs(windows.ERROR_ACCESS_DENIED) { // ==5 aka Access denied (UIPI likely)
-				showTrayInfo("winbollocks", "Cannot resizemove elevated window (access denied), you'd have to run as admin.")
+				showTrayInfo(selfName, "Cannot resizemove elevated window (access denied), you'd have to run as admin.")
 			}
 		}
 
@@ -4027,7 +4029,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			logf("SetWindowPos/Move-or-AsyncResize failed(from within main message loop): hwnd=0x%x err=%v", target, res4.Err)
 			// if errCode == 5 { // Access denied (UIPI likely)
 			if res4.ErrIs(windows.ERROR_ACCESS_DENIED) { // ==5 aka Access denied (UIPI likely)
-				showTrayInfo("winbollocks", "Cannot Move-or-AsyncResize elevated window (access denied), you'd have to run as admin.")
+				showTrayInfo(selfName, "Cannot Move-or-AsyncResize elevated window (access denied), you'd have to run as admin.")
 			}
 		}
 	}
@@ -4753,7 +4755,7 @@ func deinitMainMsgHwnd() {
 		instance := uintptr(selfHInstance)
 		classNamePtr := mustUTF16(winbollocksHiddenClassName)
 		if res3 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res3.Failed() {
-			logf("deinitMainMsgHwnd: UnregisterClassW failed for winbollocksHidden class: %v", res3.Err)
+			logf("deinitMainMsgHwnd: UnregisterClassW failed for our own hidden class named: %v", res3.Err)
 		}
 	}
 }
@@ -4898,7 +4900,7 @@ func initLogFile() {
 	}
 	// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
 	f, err := os.OpenFile(
-		"winbollocks_debug.log",
+		selfName+"_debug.log", //"winbollocks_debug.log", //FIXME: keep this in sync with the one in the .bat, or rather make the .bat keep it in sync, somehow.
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 		0644,
 	)
@@ -5953,7 +5955,7 @@ func main() {
 
 	installCtrlHandlerIfConsole()
 
-	ensureSingleInstance("winbollocks_uniqueID_123lol", MutexScopeSession)
+	ensureSingleInstance(selfName+"_uniqueID_123lol" /*winbollocks_uniqueID_123lol*/, MutexScopeSession)
 
 	cpus := int64(runtime.NumCPU())
 	if cpus < 0 {
@@ -6045,7 +6047,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	resFg := procGetForegroundWindow.Call()
 	startupTerminalHwnd = windows.Handle(resFg.R1)
 
-	logf("Started winbollocks %s", GetVersion())
+	logf("Started %s %s", selfName, GetVersion())
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
 
 	if writeProfile {
@@ -6914,7 +6916,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 
 					reason := eventName //it's EVENT_SYSTEM_FOREGROUND
 					if forceReconcile {
-						reason = "reconciliation via " + reason + "(should only happen once, the first time after just started winbollocks)" //TODO: track if this happens more than once and warn in red color or something somehow notify me the dev, maybe write into a new file about it, or I guess the log is enough since it's always append
+						reason = "reconciliation via " + reason + "(should only happen once, the first time after just started " + selfName + ")" //TODO: track if this happens more than once and warn in red color or something somehow notify me the dev, maybe write into a new file about it, or I guess the log is enough since it's always append
 					}
 
 					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) [%s] after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", targetHwnd, pid, targetIL, reason)
