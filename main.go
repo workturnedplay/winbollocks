@@ -273,7 +273,7 @@ var (
 	// procSetProcessDpiAwareness        = shcore.NewProc("SetProcessDpiAwareness")
 	//doneTODO: need to impl. Find() like Call() was, maybe!
 	procSetProcessDpiAwarenessContext = wincoe.NewBoundProc(user32, "SetProcessDpiAwarenessContext", wincoe.CheckBool)
-	procSetProcessDpiAwareness        = wincoe.NewBoundProc(shcore, "SetProcessDpiAwareness", wincoe.CheckErrno)
+	procSetProcessDpiAwareness        = wincoe.NewBoundProc(shcore, "SetProcessDpiAwareness", wincoe.CheckHRESULT)
 
 	// procAttachThreadInput = user32.NewProc("AttachThreadInput")
 	procAttachThreadInput = wincoe.NewBoundProc(user32, "AttachThreadInput", wincoe.CheckBool)
@@ -303,8 +303,8 @@ var (
 	// procGetThreadPriority = kernel32.NewProc("GetThreadPriority")
 	procSetPriorityClass  = wincoe.NewBoundProc(kernel32, "SetPriorityClass", wincoe.CheckBool)
 	procGetPriorityClass  = wincoe.NewBoundProc(kernel32, "GetPriorityClass", wincoe.CheckZero)
-	procGetCurrentProcess = wincoe.NewBoundProc(kernel32, "GetCurrentProcess", wincoe.CheckNone)
-	procGetCurrentThread  = wincoe.NewBoundProc(kernel32, "GetCurrentThread", wincoe.CheckHandle)
+	procGetCurrentProcess = wincoe.NewBoundProc(kernel32, "GetCurrentProcess", wincoe.CheckEquals(CURRENT_PROCESS_PSEUDO_HANDLE))
+	procGetCurrentThread  = wincoe.NewBoundProc(kernel32, "GetCurrentThread", wincoe.CheckEquals(CURRENT_THREAD_PSEUDO_HANDLE))
 	procSetThreadPriority = wincoe.NewBoundProc(kernel32, "SetThreadPriority", wincoe.CheckBool)
 	procGetThreadPriority = wincoe.NewBoundProc(kernel32, "GetThreadPriority", wincoe.CheckThreadPriority)
 
@@ -2552,29 +2552,9 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 		return false
 	}
 
-	// FIX: Exclude regular maximized windows (like Notepad).
+	// Exclude regular maximized windows (like Notepad).
 	// They retain their title bar style even though their window rect bleeds
 	// past the monitor edges. True fullscreen or borderless windows drop WS_CAPTION.
-	// We use ^uintptr(15) to represent -16 (GWL_STYLE) to prevent Go constant overflow errors.
-
-	//too convoluted:
-	// const GWL_STYLE = ^uintptr(15)
-	// styleRes := procGetWindowLongPtrW.Call(uintptr(hwnd), GWL_STYLE)
-	// if !styleRes.Failed() {
-	// 	const WS_CAPTION uintptr = 0x00C00000 // WS_BORDER | WS_DLGFRAME
-	// 	if (styleRes.R1 & WS_CAPTION) == WS_CAPTION {
-	// 		return false // It's just a normal window (likely maximized)
-	// 	}
-	// }
-
-	if style, err := getWindowLongPtr(hwnd, GWL_STYLE); err != nil {
-		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
-		return false
-	} else {
-		if (style & WS_CAPTION) == WS_CAPTION {
-			return false // It's just a normal window (likely maximized)
-		}
-	}
 
 	// 1. Get the Window dimensions first
 	var r RECT
@@ -2720,7 +2700,7 @@ const (
 )
 const WS_EX_TOPMOST = 0x00000008
 const (
-	GWL_STYLE   = -16
+	GWL_STYLE   = -16 // We could use ^uintptr(15) to represent -16 (GWL_STYLE) to prevent Go constant overflow errors.
 	GWL_EXSTYLE = -20
 )
 
@@ -3642,7 +3622,7 @@ func hookWorker() {
 			logf("CRITICAL: from hookWorker, signaling main thread to die...")
 
 			if mainThreadID == 0 {
-				panic2("BUG: mainThreadID shouldn't be 0 here!")
+				badprogramming("BUG: mainThreadID shouldn't be 0 here!")
 			}
 			// 2. Nuke the main thread's GetMessage loop, works only if systray popup menu isn't open!
 			// Use PostThreadMessage to mainThreadId, or post WM_CLOSE to your main HWND
@@ -4673,19 +4653,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	return res1111.R1 //LRESULT
 })
 
-func panic2(msg string) {
-	logf("%s", msg)
-	wincoe.GetBugLogger().Error(msg)
-	panic(msg)
-}
-
 const WM_QUIT = 0x0012
 
 // runs only on main() never from any other threads!
 func deinit() {
 	deinitThreadID := windows.GetCurrentThreadId()
 	if mainThreadID != 0 /*ie. is set already*/ && deinitThreadID != mainThreadID {
-		panic2("BUG: deinit() should only ever run from main/wndProc thread!")
+		badprogramming("BUG: deinit() should only ever run from main/wndProc thread!")
 	}
 	hardReset(false)
 
@@ -4702,7 +4676,7 @@ func deinit() {
 		//itwasdoneFIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho) | we're waiting for it in caller of deinit() which is primary_defer()
 
 		if deinitThreadID == htidcached {
-			logf("BUG: deinit() should never run from hook thread!")
+			badprogramming("BUG: deinit() should never run from hook thread!")
 		}
 	}
 
@@ -5382,13 +5356,13 @@ func assertStructSizes() {
 	)
 
 	if got := unsafe.Sizeof(INPUT{}); got != expectedINPUT {
-		panic(fmt.Sprintf(
+		badprogramming(fmt.Sprintf(
 			"INPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d — SendInput will be broken",
 			got, expectedINPUT,
 		))
 	}
 	if got := unsafe.Sizeof(KEYBDINPUT{}); got != expectedKEYBDINPUT {
-		panic(fmt.Sprintf(
+		badprogramming(fmt.Sprintf(
 			"KEYBDINPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d",
 			got, expectedKEYBDINPUT,
 		))
@@ -5513,7 +5487,7 @@ func init() {
 	il, err := processIntegrityLevel(selfPID)
 	if err != nil {
 		//myIntegrityLevel = 0x2000 // Default to Medium if check fails
-		panic(fmt.Sprintf("can't get own integrity level! err=%v", err)) // and don't wanna default to anything
+		badprogramming(fmt.Sprintf("can't get own integrity level! err=%v", err)) // and don't wanna default to anything
 	} else {
 		selfIntegrityLevel = il
 	}
@@ -5608,7 +5582,7 @@ func ensureSingleInstance(name string, scope MutexScope) {
 	// }
 	if res1.Failed() { // aka If handle is 0, we didn't even create it (likely Access Denied for Global\)
 		var extra string = ""
-		if res1.ErrIs(windows.Errno(5)) {
+		if res1.ErrIs(windows.ERROR_ACCESS_DENIED) {
 			extra = " this means mutex attempt was 'Global\\' and it was already acquired by an admin-running exe"
 		}
 		//exitf(5, "Application '%s' failed to create mutex %s", name, str)
@@ -6330,7 +6304,8 @@ func lockRAM() {
 				res3 := procAdjustTokenPrivileges.Call(token, 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
 				//if err3 != nil || ret3 == 0 || !errors.Is(err3, windows.Errno(0)) {
 				if res3.Failed() {
-					logf("Warning: Could not enable SeIncrementWorkingSetPrivilege, err: '%v', callStatus: '%v', ret: '%d', continuing tho.", res3.Err, res3.CallStatus, res3.R1)
+					logf("Warning: Could not enable %q, err: '%v', callStatus: '%v', ret: '%d', continuing tho.",
+						SE_INC_WORKING_SET_NAME, res3.Err, res3.CallStatus, res3.R1)
 				}
 				//}
 			}
@@ -6452,7 +6427,10 @@ func getCurrentProcess() (hProc uintptr) {
 	//a rename to Local isn't needed here but i wanna be sure visibly too.
 	res1 := procGetCurrentProcess.Call()
 	hProcLocal := res1.R1
-	if hProcLocal == 0 || hProcLocal != CURRENT_PROCESS_PSEUDO_HANDLE {
+	// procGetCurrentProcess is bound with wincoe.CheckEquals(CURRENT_PROCESS_PSEUDO_HANDLE),
+	// so .Failed() here means the OS returned something other than the one
+	// value GetCurrentProcess is contractually guaranteed to return.
+	if res1.Failed() {
 		// This virtually never happens, but if it did,
 		// the system is in a very weird state.
 		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v, callStatus: %v", hProcLocal, res1.Err, res1.CallStatus)
@@ -6464,8 +6442,10 @@ func getCurrentThread() (hThread uintptr) {
 	//Note that GetCurrentThread also returns a pseudo-handle (usually -2), so it doesn't need to be closed either.
 	res1 := procGetCurrentThread.Call()
 	currThread := res1.R1
-	if currThread == 0 || currThread != CURRENT_THREAD_PSEUDO_HANDLE {
-		exitf(1, "Critical: GetCurrentProcess returned 0x%X, err: %v, callStatus: %v", currThread, res1.Err, res1.CallStatus)
+	// See the identical comment in getCurrentProcess() above; procGetCurrentThread
+	// is bound with wincoe.CheckEquals(CURRENT_THREAD_PSEUDO_HANDLE).
+	if res1.Failed() {
+		exitf(1, "Critical: getCurrentThread returned 0x%X, err: %v, callStatus: %v", currThread, res1.Err, res1.CallStatus)
 	}
 	return currThread
 }
@@ -6948,6 +6928,14 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 }
 
 func badprogramming(msg string) {
+	panic2(msg)
+}
+
+// use badprogramming() instead
+func panic2(msg string) {
+	//FIXME: once initWincoeLogging() wires the bridge, the wincoe.GetBugLogger().Error(msg) also funnels back into logf() (via slogBridge.Handle), so every panic2() call after that point writes the same message twice (once raw, once prefixed [wincoe])
+	logf("%s", msg)
+	wincoe.GetBugLogger().Error(msg) // so after initWincoeLogging(), this redirects to logf tho, so it doubles the line!
 	panic(msg)
 }
 

@@ -574,6 +574,27 @@ var (
 	}
 )
 
+// CheckEquals returns a WinCheckFunc that treats any r1 not equal to
+// expected as a failure. This is the right tool specifically for APIs that
+// combine two properties: (1) documented as unable to fail through ordinary
+// means, and (2) documented to always return exactly one fixed, known
+// value on success (e.g. GetCurrentProcess always returns the pseudo-handle
+// -1; GetCurrentThread always returns -2). For those, the interesting
+// failure mode isn't "the API reported an error" but "the OS/ABI returned
+// something other than the single value it's contractually guaranteed to
+// return" — which would itself indicate a much deeper problem (calling
+// convention mismatch, corrupted stack, etc.) worth surfacing through the
+// normal WinResult.Failed()/.Err plumbing instead of a bespoke inline check
+// re-derived at every call site.
+//
+// Don't reach for this for APIs that can validly return more than one
+// value on success (e.g. CreateToolhelp32Snapshot, GetPriorityClass) —
+// CheckEquals would incorrectly treat every valid value except one as a
+// failure.
+func CheckEquals(expected uintptr) WinCheckFunc {
+	return func(r1 uintptr, _ error) bool { return r1 != expected }
+}
+
 const CLR_INVALID uint32 = 0xffffffff
 const GDIError = uint32(0xffffffff)
 

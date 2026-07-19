@@ -1,4 +1,10 @@
 todo:
+* The log filename is duplicated with no single source of truth. readcfg.env has log_file=.\winbollocks_debug.log, which run.bat reads to know what file to clear/dump on failure — but initLogFile() in main.go hardcodes the literal "winbollocks_debug.log" independently
+* make panic2() not log twice after initWincoeLogging() has run! somehow, the proper way.
+
+* hovering on systray icon should show winbollocks version as tooltip!
+
+* trying to resize an F11(fullscreen-ed) vscode will show the overlay but won't change its size at all, unclear why, is the target resisting resizes?!
 
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 
