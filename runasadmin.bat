@@ -59,6 +59,13 @@ if "!ec!" NEQ "0" (
   exit /b 1
 )
 
+if "!winbollocks_log_file!" NEQ "" (
+  if exist "!winbollocks_log_file!" (
+    echo Cleared log file: "!winbollocks_log_file!"
+    type nul > "!winbollocks_log_file!"
+  )
+)
+
 @rem %~dp0 already has the end \ but adding another one for visibility:
 :run
 :: this variant eats the "^" in the dir name:
