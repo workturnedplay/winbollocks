@@ -1632,6 +1632,7 @@ func initTray() error {
 	tipText := selfName + " " + GetVersion()
 	copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
 
+	//When you call NIM_ADD, Windows initializes the icon using legacy rules (where NIF_SHOWTIP doesn't exist yet, so it gets ignored). Then, when you call NIM_SETVERSION, Windows switches the icon to Version 4 behavior, which instantly silences the tooltip because it expects NIF_SHOWTIP to be set while in Version 4 mode. It's a catch-22.
 	//1 Add the tray icon
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
 	//if ret1 == 0 {
@@ -1647,6 +1648,12 @@ func initTray() error {
 	if res3.Failed() {
 		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): '%v'", res3.Err)
 		// You could exitf or fallback here, but for now just log
+	}
+
+	// 3. FIX: Modify the icon AFTER switching to V4 to force Windows to recognize NIF_SHOWTIP
+	res4 := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon)))
+	if res4.Failed() {
+		logf("NIM_MODIFY for tray icon failed to apply NIF_SHOWTIP: '%v'", res4.Err)
 	}
 
 	return nil
