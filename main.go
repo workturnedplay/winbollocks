@@ -2174,8 +2174,8 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_HIDE_OVERLAY, 0, 0); res.Failed() {
 			logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
 		}
-	} else {
-		logf("unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
+		// } else {
+		// 	logf("unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
 	}
 }
 
@@ -2193,6 +2193,9 @@ func hardReset(releaseCapture bool) {
 const winbollocksResizingOverlayClassName = "winbollocksResizingOverlayClass" //TODO: see if underscores work in this!
 const winbollocksHiddenClassName = "winbollocksHidden"
 
+var hiddenClassRegistered atomic.Bool
+var overlayClassRegistered atomic.Bool
+
 func initOverlay() error {
 	className := mustUTF16(winbollocksResizingOverlayClassName)
 	//Both Windows APIs just read the null-terminated UTF-16 string from that memory address during the call; they don't seize ownership or modify it.
@@ -2206,6 +2209,8 @@ func initOverlay() error {
 
 	if res1b := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); res1b.Failed() {
 		return fmt.Errorf("RegisterClassEx failed in initOverlay(), err: %w", res1b.Err)
+	} else {
+		overlayClassRegistered.Store(true)
 	}
 
 	res2 := procCreateWindowEx.Call(
@@ -3460,6 +3465,8 @@ func createMessageWindow() (windows.Handle, error) {
 	if res2 := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); res2.Failed() { //err2 != nil || ret == 0 {
 		//lastErr := windows.GetLastError()
 		return 0, fmt.Errorf("RegisterClassEx failed: %w", res2.Err) //, lastErr) //XXX: multiple %w is legal in Go v1.20+ (Feb 2023)
+	} else {
+		hiddenClassRegistered.Store(true)
 	}
 
 	res3 := procCreateWindowEx.Call(
@@ -4670,10 +4677,12 @@ func deinitOverlayClass() {
 		blackBrush = 0
 	}
 
-	instance := uintptr(selfHInstance)
-	classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
-	if res2 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res2.Failed() {
-		logf("deinitOverlayClass: UnregisterClassW failed for overlay class: %v", res2.Err)
+	if overlayClassRegistered.Load() { //deinit it only if it was inited ever
+		instance := uintptr(selfHInstance)
+		classNamePtr := mustUTF16(winbollocksResizingOverlayClassName)
+		if res2 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res2.Failed() {
+			logf("deinitOverlayClass: UnregisterClassW failed for overlay class: %v", res2.Err)
+		}
 	}
 }
 
@@ -4687,10 +4696,12 @@ func deinitMainMsgHwnd() {
 		mainMsgHwnd = 0
 	}
 
-	instance := uintptr(selfHInstance)
-	classNamePtr := mustUTF16(winbollocksHiddenClassName)
-	if res3 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res3.Failed() {
-		logf("deinitMainMsgHwnd: UnregisterClassW failed for winbollocksHidden class: %v", res3.Err)
+	if hiddenClassRegistered.Load() { //deinit it only if it was inited ever
+		instance := uintptr(selfHInstance)
+		classNamePtr := mustUTF16(winbollocksHiddenClassName)
+		if res3 := procUnregisterClassW.Call(uintptr(unsafe.Pointer(classNamePtr)), instance); res3.Failed() {
+			logf("deinitMainMsgHwnd: UnregisterClassW failed for winbollocksHidden class: %v", res3.Err)
+		}
 	}
 }
 
