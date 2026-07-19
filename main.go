@@ -1608,6 +1608,8 @@ func appendMenuChecked(hMenu, flags, id uintptr, textStr string) {
 	}
 }
 
+const IDI_APPLICATION = 32512
+
 func initTray() error {
 	if mainMsgHwnd == 0 {
 		return fmt.Errorf("main message window is not initialized")
@@ -1616,10 +1618,9 @@ func initTray() error {
 	trayIcon.HWnd = mainMsgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
-	// 2. Add NIF_SHOWTIP here to force Windows to show the SzTip text under Version 4
-	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE | NIF_SHOWTIP
 
-	const IDI_APPLICATION = 32512
+	// Just the classic flags. No NIF_SHOWTIP needed.
+	trayIcon.UFlags = NIF_TIP | NIF_ICON | NIF_MESSAGE
 
 	res1 := procLoadIcon.Call(0, IDI_APPLICATION)
 	if res1.Failed() {
@@ -1627,48 +1628,35 @@ func initTray() error {
 	}
 	trayIcon.HIcon = windows.Handle(res1.R1)
 	trayIcon.UCallbackMessage = WM_MYSYSTRAY
-	trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
+
+	// Notice: We completely removed trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4
+	// Leaving it as 0 defaults to the legacy behavior that handles tooltips automatically.
 
 	tipText := selfName + " " + GetVersion()
 	copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
 
-	//When you call NIM_ADD, Windows initializes the icon using legacy rules (where NIF_SHOWTIP doesn't exist yet, so it gets ignored). Then, when you call NIM_SETVERSION, Windows switches the icon to Version 4 behavior, which instantly silences the tooltip because it expects NIF_SHOWTIP to be set while in Version 4 mode. It's a catch-22.
-	//1 Add the tray icon
+	// 1. Add the tray icon
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
-	//if ret1 == 0 {
 	if res2.Failed() {
 		logf("Failed to add tray icon (real error): '%v'", res2.Err)
-		// You could exitf or fallback here, but for now just log
 	}
 
-	//Set the version behavior
-	//2, this must happen after NIM_ADD ! (bad chatgpt which suggested it before NIM_ADD)
-	res3 := procShellNotifyIcon.Call(NIM_SETVERSION, uintptr(unsafe.Pointer(&trayIcon)))
-	//if ret2 == 0 {
-	if res3.Failed() {
-		logf("NIM_SETVERSION for tray icon failed(are you on pre Windows Vista 2007?): '%v'", res3.Err)
-		// You could exitf or fallback here, but for now just log
-	}
-
-	// 3. FIX: Modify the icon AFTER switching to V4 to force Windows to recognize NIF_SHOWTIP
-	res4 := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon)))
-	if res4.Failed() {
-		logf("NIM_MODIFY for tray icon failed to apply NIF_SHOWTIP: '%v'", res4.Err)
-	}
+	// 2. We are done! No NIM_SETVERSION. No NIM_MODIFY.
 
 	return nil
 }
 
-const WM_DESTROY = 0x0002
+/*
+WM_DESTROY Breakdown
 
-/* The WM_DESTROY Breakdown
-   Constant Value: 0x0002
+	Constant Value: 0x0002
 
-   What triggers it: It is sent by the system to a window after the window has been removed from the screen, but before the child windows are destroyed.
-   Specifically, calling procDestroyWindow.Call(hwnd) is what triggers the WM_DESTROY message to be sent to that hwnd's wndProc.
+	What triggers it: It is sent by the system to a window after the window has been removed from the screen, but before the child windows are destroyed.
+	Specifically, calling procDestroyWindow.Call(hwnd) is what triggers the WM_DESTROY message to be sent to that hwnd's wndProc.
 
-   The Flow: User clicks Exit (or Hook panics) → WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage().
+	The Flow: User clicks Exit (or Hook panics) → WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage().
 */
+const WM_DESTROY = 0x0002
 
 func cleanupTray() {
 	if trayIcon.HWnd == 0 {
