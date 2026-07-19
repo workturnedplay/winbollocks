@@ -1366,7 +1366,11 @@ func injectLMBClickAtCoords(x, y int32) {
 	// remotely without visibly teleporting the user's mouse.
 	var currentPt POINT
 	// 1. Capture current physical mouse position to restore it later
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&currentPt)))
+	resGetCursorPos := procGetCursorPos.Call(uintptr(unsafe.Pointer(&currentPt)))
+	haveOriginalCursorPos := resGetCursorPos.Succeeded()
+	if !haveOriginalCursorPos {
+		logf("injectLMBClickAtCoords: GetCursorPos failed, err:%v; will not restore cursor position after the injected click (would otherwise teleport it to (0,0))", resGetCursorPos.Err)
+	}
 	// 2. Inject the click at the original gesture location
 	res2 := procSendInput.Call(
 		uintptr(len(inputs)),
@@ -1383,21 +1387,24 @@ func injectLMBClickAtCoords(x, y int32) {
 			res2.Err,
 		)
 	}
-	// 3. Teleport the mouse back to where the user had it a millisecond ago
-	res3 := procSetCursorPos.Call(
-		//When SetCursorPos(X, Y) is called, Windows expects the X coordinate to be in the RCX register and Y to be in RDX.
-		// Even though the arguments are 32-bit integers, Windows expects the entire 64-bit register to be properly sign-extended.
-		// If the upper 32 bits contain garbage or are cleared to zero when they shouldn't be, the CPU behavior or the OS wrapper can misinterpret the value.
-		// and that's why the 'inf' cast is needed.
-		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		uintptr(currentPt.X),
-		// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		uintptr(currentPt.Y),
-	)
 
-	//if restoreRet == 0 {
-	if res3.Failed() {
-		logf("injectLMBClickAtCoords: SetCursorPos failed: %v", res3.Err)
+	if haveOriginalCursorPos {
+		// 3. Teleport the mouse back to where the user had it a millisecond ago
+		res3 := procSetCursorPos.Call(
+			//When SetCursorPos(X, Y) is called, Windows expects the X coordinate to be in the RCX register and Y to be in RDX.
+			// Even though the arguments are 32-bit integers, Windows expects the entire 64-bit register to be properly sign-extended.
+			// If the upper 32 bits contain garbage or are cleared to zero when they shouldn't be, the CPU behavior or the OS wrapper can misinterpret the value.
+			// and that's why the 'inf' cast is needed. What inf? It's enough they're int32 cast to uintptr!
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(currentPt.X),
+			// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+			uintptr(currentPt.Y),
+		)
+
+		//if restoreRet == 0 {
+		if res3.Failed() {
+			logf("injectLMBClickAtCoords: SetCursorPos failed: %v", res3.Err)
+		}
 	}
 }
 
@@ -1758,7 +1765,7 @@ func startDrag(hwnd windows.Handle, pt POINT, viaMissedGestureRecovery bool) boo
 			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", hwnd, res.Err)
 			wasMaximized = false // skip alignment rather than use a zero rect
 		}
-		procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
+		_ = procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
 		//TODO: should I re-maximize if it was maximized, after drag/move is done? probably not!
 	}
 	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, preRestoreRect)
@@ -1944,7 +1951,7 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) (started, 
 		// Restore the window first so the resize starts from, and is measured
 		// against, the non-maximized rect. Without this the OS leaves the window
 		// in a mixed state (visually resized but still flagged as maximized).
-		procShowWindow.Call(uintptr(wantTargetWnd), SW_RESTORE)
+		_ = procShowWindow.Call(uintptr(wantTargetWnd), SW_RESTORE)
 	}
 
 	var r RECT
@@ -2026,8 +2033,41 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 		hwnd = windowFromPoint(pt) // window under cursor
 	} else {
 		// winkey + shift + MMB -> bring currently focused window to top
+		/*
+					Based on how the Windows API behaves, procGetForegroundWindow should remain CheckNone rather than CheckNull.
+
+			Here is a breakdown of why treating a NULL (0) return value from GetForegroundWindow as an API failure (which CheckNull typically does) will cause bugs in your application:
+			1. NULL is a valid, normal state
+
+			According to Microsoft's documentation for GetForegroundWindow:
+
+			    "The return value is a handle to the foreground window. The foreground window can be NULL in certain circumstances, such as when a window is losing activation."
+
+			Other common scenarios where it returns NULL (0) include:
+
+			    The workstation is locked (Ctrl+Alt+Del or Win+L).
+
+			    A screen saver is active.
+
+			    The system is in the middle of a window-switching transition.
+
+			    A full-screen exclusive application (like some games) is changing display modes.
+
+			Because NULL is a legitimate state meaning "there is currently no foreground window," your Go code should handle this as a normal logic branch (e.g., skipping an action or retrying later), rather than treating it as an exceptional system failure.
+
+			2. It does not set GetLastError
+
+			Functions that use CheckNull usually assume that if the function returns 0, it failed, and they will automatically call syscall.GetLastError() to append a descriptive error message.
+
+			However, GetForegroundWindow does not set an error code via SetLastError. If it returns NULL, calling GetLastError will return either 0 (The operation completed successfully.) or a stale error left over from a completely unrelated previous system call. This leads to confusing log pollution or false-positive panics.
+
+			- Gemini 3.5 Thinking
+		*/
 		res1 := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
-		if res1.Failed() {
+		// procGetForegroundWindow is bound with wincoe.CheckNone (GetForegroundWindow has no
+		// real failure signal beyond returning NULL), so res1.Failed() can never be true here;
+		// check R1 directly, matching GetForegroundWindow's documented NULL-on-failure contract.
+		if res1.R1 == 0 {
 			logf("Couldn't get currently focused window for the purposes of bringing it to front for winkey+shift+MMB gesture ergo aborting attempt, err=%v callStatus=%v r1=%v", res1.Err, res1.CallStatus, res1.R1)
 			return false, false
 		}
@@ -2256,7 +2296,9 @@ func initOverlay() error {
 	overlayHwnd = windows.Handle(res2.R1 /*aka hwndRaw*/)
 
 	// Set Magenta (0x00FF00FF) as the transparent color key, and 200/255 opacity for the rest
-	procSetLayeredWindowAttributes.Call(uintptr(overlayHwnd), 0x00FF00FF, 220, LWA_COLORKEY|LWA_ALPHA)
+	if resLayered := procSetLayeredWindowAttributes.Call(uintptr(overlayHwnd), 0x00FF00FF, 220, LWA_COLORKEY|LWA_ALPHA); resLayered.Failed() {
+		logf("initOverlay: SetLayeredWindowAttributes failed, err: %v; overlay will lack its transparent color-key/opacity, continuing anyway", resLayered.Err)
+	}
 
 	// Create our reusable GDI brushes once
 	res3 := procGdiCreateSolidBrush.Call(0x00FF00FF)
@@ -2338,9 +2380,9 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 	} //if WM_PAINT
 
 	res8 := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam) //DefWindowProcW returns LRESULT.
-	if res8.Failed() {
-		logf("in overlayWndProc, DefWindowProc() failed, err: %v, continuing", res8.Err)
-	}
+	// if res8.Failed() {//it's CheckNone and no real failure mode to detect!
+	// 	logf("in overlayWndProc, DefWindowProc() failed, err: %v, continuing", res8.Err)
+	// }
 	return res8.R1 //LRESULT
 }
 
@@ -2422,7 +2464,7 @@ const SW_HIDE = 0
 
 func hideOverlay() {
 	if overlayHwnd != 0 {
-		procShowWindow.Call(uintptr(overlayHwnd), SW_HIDE)
+		_ = procShowWindow.Call(uintptr(overlayHwnd), SW_HIDE)
 	}
 }
 
@@ -3599,15 +3641,22 @@ func hookWorker() {
 			}
 			logf("CRITICAL: from hookWorker, signaling main thread to die...")
 
+			if mainThreadID == 0 {
+				panic2("BUG: mainThreadID shouldn't be 0 here!")
+			}
 			// 2. Nuke the main thread's GetMessage loop, works only if systray popup menu isn't open!
 			// Use PostThreadMessage to mainThreadId, or post WM_CLOSE to your main HWND
-			procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0) //TODO: investigate if mainThreadID can be unset or 0 here.
+			if res := procPostThreadMessage.Call(uintptr(mainThreadID), WM_QUIT, 0, 0); res.Failed() { //cantbeTODO: investigate if mainThreadID can be unset or 0 here.
+				logf("hookWorker panic-bridge: PostThreadMessage(WM_QUIT) to mainThreadID=%d failed, err: %v", mainThreadID, res.Err)
+			}
 			//doneFIXME: what if main is dead too, and would ignore the signal or what, then we exit here? sure after X seconds
 
 			if mainMsgHwnd != 0 {
 				// Post to the Window Handle, NOT the Thread ID.
 				// This cuts through modal menus like the systray popup menu!
-				procPostMessage.Call(uintptr(mainMsgHwnd), WM_CLOSE, 0, 0)
+				if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_CLOSE, 0, 0); res.Failed() {
+					logf("hookWorker panic-bridge: PostMessage(WM_CLOSE) to mainMsgHwnd=0x%X failed, err: %v", mainMsgHwnd, res.Err)
+				}
 			}
 			/* When you right-click your tray icon and the menu appears, the code is stuck inside the TrackPopupMenu Win32 call.
 				That function runs its own private message loop.
@@ -3765,7 +3814,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	// Lazy once-per-session SetCapture.
 	// We are guaranteed to be on the main thread here (wndProc context).
 	if cur := activeSession.Load(); cur != nil && captureHeldForSession.Load() != cur {
-		procSetCapture.Call(uintptr(mainMsgHwnd))
+		_ = procSetCapture.Call(uintptr(mainMsgHwnd))
 		/*
 			One caveat worth stating: since you're using WH_MOUSE_LL, you receive all mouse events globally regardless of capture.
 			 SetCapture here is about preventing other windows from acting on cursor interactions during a drag, not about receiving events yourself.
@@ -4112,10 +4161,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	// 	return 0
 
 	case WM_DO_RELEASE_CAPTURE:
-		res1 := procReleaseCapture.Call()
-		res2 := procGetCapture.Call()
-		prev := windows.Handle(res1.R1)
-		current := windows.Handle(res2.R1)
+		res2 := procGetCapture.Call() //CheckNone
+		prev := windows.Handle(res2.R1)
+		res1 := procReleaseCapture.Call() //CheckBool
+		if res1.Failed() {
+			logf("in wndProc, WM_DO_RELEASE_CAPTURE: ReleaseCapture failed, err: %v", res1.Err)
+		}
+		res3 := procGetCapture.Call() //CheckNone
+		current := windows.Handle(res3.R1)
 		// Normal case (prev=1 or 0, current=0) → completely silent
 		if current != 0 {
 			logf("in wndProc part2of2, WM_DO_RELEASE_CAPTURE says the current capture (after releasing) is still 0x%X instead of none aka 0", current)
@@ -4583,7 +4636,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	case WM_CLOSE:
 		//exit(0)
 		//WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage() -> getmessage() -> break loop -> outside of loop continuation...
-		procDestroyWindow.Call(hwnd)
+		if res := procDestroyWindow.Call(hwnd); res.Failed() {
+			logf("in wndProc, WM_CLOSE: DestroyWindow failed for hwnd=0x%X, err: %v", hwnd, res.Err)
+		}
 		return 0
 
 	case WM_DESTROY:
@@ -4612,9 +4667,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 	//let the default window proc handle the rest:
 	res1111 := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam)
-	if res1111.Failed() {
-		logf("in wndProc, DefWindowProc() failed, err: %v, continuing", res1111.Err)
-	}
+	// if res1111.Failed() {//it's CheckNone and no real failure mode to detect!
+	// 	logf("in wndProc, DefWindowProc() failed, err: %v, continuing", res1111.Err)
+	// }
 	return res1111.R1 //LRESULT
 })
 
@@ -4641,7 +4696,9 @@ func deinit() {
 	htidcached := hookThreadID.Load()
 	if htidcached != 0 {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
-		procPostThreadMessage.Call(uintptr(htidcached), WM_QUIT, 0, 0)
+		if res := procPostThreadMessage.Call(uintptr(htidcached), WM_QUIT, 0, 0); res.Failed() {
+			logf("deinit: PostThreadMessage(WM_QUIT) to hook thread ID=%d failed, err: %v", htidcached, res.Err)
+		}
 		//itwasdoneFIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho) | we're waiting for it in caller of deinit() which is primary_defer()
 
 		if deinitThreadID == htidcached {
@@ -5268,12 +5325,16 @@ func keyboardProc(nCode int, wParam, lParam uintptr) uintptr {
 					• If the queue is full or the window is gone, the post can fail, but it does not block.
 					chatgpt5.2
 				*/
-				procPostMessage.Call(
+				if res := procPostMessage.Call(
 					uintptr(mainMsgHwnd),
 					WM_INJECT_SEQUENCE,
 					uintptr(vk), // VK_LWIN or VK_RWIN,
 					0,
-				)
+				); res.Failed() {
+					// Can't recover from inside this low-level keyboard hook; the shift-tap
+					// injection that suppresses Start menu simply won't happen this time.
+					logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, err: %v; Start menu may(unlikely tho) pop up, but probably won't because the vkE8 was injected when gesture started", res.Err)
+				}
 
 				return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
 				/* well crap:
@@ -5943,9 +6004,9 @@ func getConsoleWindow() (windows.HWND, error) {
 		// syscall wrappers often return err == "The operation completed successfully."
 		// when no failure occurred, so treat that as nil.
 		// if err != nil && err != windows.ERROR_SUCCESS {
-		if res1.Failed() {
-			return 0, fmt.Errorf("in getConsoleWindow, GetConsoleWindow() failed, err=%w", res1.Err)
-		}
+		// if res1.Failed() {//it's CheckNone, so useless to check here!
+		// 	return 0, fmt.Errorf("in getConsoleWindow, GetConsoleWindow() failed, err=%w", res1.Err)
+		// }
 
 		// No console is a normal state, not an error.
 		return 0, nil
@@ -5968,7 +6029,9 @@ func installCtrlHandlerIfConsole() {
 	} else {
 		logf("Installing Ctrl+C handler due to console.")
 	}
-	procSetConsoleCtrlHandler.Call(ctrlHandler, 1) // this doesn't work(ie. has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
+	if res := procSetConsoleCtrlHandler.Call(ctrlHandler, 1); res.Failed() { // this doesn't work(ie. has no console) for: go build -mod=vendor -ldflags="-H=windowsgui" .
+		logf("installCtrlHandlerIfConsole: SetConsoleCtrlHandler failed to install handler, err: %v; Ctrl+C/Break won't be intercepted this run.", res.Err)
+	}
 }
 
 func todo() {
@@ -6034,7 +6097,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 
 	initDPIAwareness() //If you call it after window creation, it does nothing.
 
-	mainThreadID = windows.GetCurrentThreadId()
+	mainThreadID = windows.GetCurrentThreadId() //XXX: it's set before 'go hookWorker()' below
 	logf("main loop thread started. ThreadID: %d", mainThreadID)
 
 	hwnd, err3 := createMessageWindow() //TODO: how to undo this via defer or something?!
@@ -6276,6 +6339,8 @@ func lockRAM() {
 		if err5 != nil {
 			logf("CloseHandle(token) failed, err='%v', continuing tho.", err5)
 		}
+	} else {
+		logf("OpenProcessToken failed, err: '%v', callStatus: '%v'; skipping SeIncreaseWorkingSetPrivilege enablement, continuing tho.", res1.Err, res1.CallStatus)
 	}
 
 	// 2. Set the Working Set Size
@@ -6971,13 +7036,11 @@ const OBJID_WINDOW int32 = 0
 // window while our hook was already active.
 func initForegroundIntegrityState() {
 	res1 := procGetForegroundWindow.Call()
-	if res1.Failed() {
-		logf("initForegroundIntegrityState: GetForegroundWindow failed, err: %v", res1.Err)
-		return
-	}
+	// procGetForegroundWindow is bound with wincoe.CheckNone (no failure signal beyond
+	// NULL), so res1.Failed() can never be true; rely on the HWND itself instead.
 	hwnd := windows.Handle(res1.R1)
 	if hwnd == 0 {
-		return // no foreground window right now; nothing to seed
+		return // no foreground window right now (or GetForegroundWindow failed — indistinguishable per its docs); nothing to seed
 	}
 
 	pid := getWindowPID(hwnd)
