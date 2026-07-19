@@ -6944,9 +6944,9 @@ func badprogramming(msg string) {
 
 // use badprogramming() instead
 func panic2(msg string) {
-	//FIXME: once initWincoeLogging() wires the bridge, the wincoe.GetBugLogger().Error(msg) also funnels back into logf() (via slogBridge.Handle), so every panic2() call after that point writes the same message twice (once raw, once prefixed [wincoe])
+	//halfassedFIXME: once initWincoeLogging() wires the bridge, the wincoe.GetBugLogger().Error(msg) also funnels back into logf() (via slogBridge.Handle), so every panic2() call after that point writes the same message twice (once raw, once prefixed [wincoe])
 	logf("%s", msg)
-	wincoe.GetBugLogger().Error(msg) // so after initWincoeLogging(), this redirects to logf tho, so it doubles the line!
+	//wincoe.GetBugLogger().Error(msg) // so after initWincoeLogging(), this redirects to logf tho, so it doubles the line!
 	panic(msg)
 }
 
