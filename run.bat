@@ -1,4 +1,6 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
 
 :: (nope:)disallow Ctrl+break, no effect, it still prompts: Terminate batch job (Y/N)?
 ::break off
@@ -38,7 +40,7 @@ echo Current^(changed^) working directory is on next line:
 cd
 
 rem set "READCFG_PRIME=1" not needed anymore
-rem call readcfg.bat
+rem call .\readcfg.bat
 rem even tho we are in %~dp0 already, still doing this to be sure, doesn't work due to "^"(in dir name) getting eaten.
 rem call "%~dp0\readcfg.bat"
 for %%I in (.) do (

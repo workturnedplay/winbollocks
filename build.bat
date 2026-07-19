@@ -1,5 +1,12 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
+
 setlocal enabledelayedexpansion
+
+::if running as admin must get back to current dir:
+cd /d %~dp0
+
 echo building without console I/O
 
 :: 0. Capture Workspace State
@@ -27,22 +34,20 @@ if "!HAS_WORKSPACE!"=="1" (
   echo Running vendored due to lack of workspace
 )
 
-::if running as admin must get back to current dir:
-cd /d %~dp0
-
-echo Running go vet...
-:: ./... means “Walk the directory tree from here, find every Go package, and apply vet to each.”
-:: 'go vet' does:
-:: Full static analysis of the package
-:: Including unreachable code
-:: Including dead branches
-:: Including code not exercised by tests
-::go vet -mod=vendor ./...
-go vet !MOD_FLAG! -unsafeptr=false
-if errorlevel 1 goto :fail
+call .\prebuildcheck.bat silent
+if errorlevel 1 (
+    echo.
+    choice /c NY /m "%lintexe% found issues. Stop build?"
+    if errorlevel 2 goto :fail
+)
 
 echo Building
-go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! -ldflags="-H=windowsgui" .
+:: Capture git tag/hash into VERSION_TAG
+@for /f "tokens=*" %%i in ('git describe --tags --always') do set VERSION_TAG=%%i
+@echo Setting version: !VERSION_TAG!
+
+rem go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! -ldflags="-H=windowsgui" .
+go build !BUILD_WITH_RACE_DETECTOR! !MOD_FLAG! -ldflags="-H=windowsgui -X 'main.Version=!VERSION_TAG!'" .
 if errorlevel 1 goto :fail
 
 ::When you build with: -ldflags "-H=windowsgui"

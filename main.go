@@ -6071,7 +6071,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	resFg := procGetForegroundWindow.Call()
 	startupTerminalHwnd = windows.Handle(resFg.R1)
 
-	logf("Started")
+	logf("Started winbollocks %s", GetVersion())
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
 
 	if writeProfile {
@@ -7224,4 +7224,75 @@ func FlushLogs() {
 	case <-logWorkerDone:
 		// Worker exited before it could process
 	}
+}
+
+// Version is a global variable that can be overwritten at build time via -ldflags
+var Version = ""
+
+// Compute the string exactly once at package startup
+var memoizedVersion = func() string {
+	var baseVersion string
+	var vcsRevision string
+	var vcsTime string
+	var isModified bool
+
+	// 1. Determine the base version (Release tag / module path)
+	if Version != "" {
+		baseVersion = Version
+	} else if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			baseVersion = info.Main.Version
+		}
+	}
+
+	// Default base if nothing is found yet
+	if baseVersion == "" {
+		baseVersion = "dev"
+	}
+
+	// 2. Extract the underlying VCS revision if embedded by the compiler
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if setting.Value != "" {
+					vcsRevision = setting.Value
+					if len(vcsRevision) > 16 {
+						vcsRevision = vcsRevision[:16]
+					}
+				}
+			case "vcs.time":
+				if setting.Value != "" {
+					if t, err := time.Parse(time.RFC3339, setting.Value); err == nil {
+						vcsTime = t.Format("20060102150405")
+					} else {
+						vcsTime = strings.NewReplacer("-", "", "T", "", ":", "", "Z", "").Replace(setting.Value)
+					}
+				}
+			case "vcs.modified":
+				if setting.Value == "true" {
+					isModified = true
+				}
+			}
+		}
+	}
+
+	// 3. Assemble the final version string
+	suffix := ""
+	if vcsTime != "" {
+		suffix += "-0." + vcsTime
+	}
+	if vcsRevision != "" && !strings.Contains(baseVersion, vcsRevision) {
+		suffix += "-" + vcsRevision
+	}
+	if isModified {
+		suffix += "+dirty"
+	}
+
+	return baseVersion + suffix
+}()
+
+// GetVersion returns the cached build info string directly
+func GetVersion() string {
+	return memoizedVersion
 }

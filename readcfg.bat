@@ -1,4 +1,8 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
+cd /d "%~dp0"
+
 ::you must have EnableDelayedExpansion in caller, else this will err then pause then exit!
 :: you must pass any args to can run this, like: call readcfg.bat anything
 

@@ -1,4 +1,7 @@
 @echo off
+rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
+set "NoDefaultCurrentDirectoryInExePath=1"
+
 echo building with race detector...
 
 rem go env GOARCH
@@ -15,6 +18,6 @@ set "BUILD_WITH_RACE_DETECTOR=-race"
 
 rem only when running the exe: set "GORACE=halt_on_error=1:log_path=race.log"
 
-call devbuild.bat
+call .\devbuild.bat
 rem double pause here, it's ok
 pause
