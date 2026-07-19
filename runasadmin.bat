@@ -83,17 +83,33 @@ if not exist "!exe_name!" (
     exit /b
 )
 echo Running command^(in current dir^): "!exe_name!"
-echo Requesting elevation for command "!exe_name!"... (spawns in new cmd.exe window, doesn't wait for it here)
+echo Requesting elevation for command "!exe_name!"... (spawns in new cmd.exe window unless built with no UI, we wait for it here in case it fails so we can show the log)
 rem !exe_name!
 ::powershell -Command "Start-Process cmd -ArgumentList '/k \"\"!exe_name!\"\"' -Verb RunAs"
-powershell -NoProfile -Command "$wd = (Get-Location).Path; $exe = $env:EXE_NAME; Start-Process -FilePath (Join-Path -Path $wd -ChildPath $exe) -WorkingDirectory $wd -Verb RunAs"
-set "ec=%ERRORLEVEL%"
+rem powershell -NoProfile -Command "$wd = (Get-Location).Path; $exe = $env:EXE_NAME; Start-Process -FilePath (Join-Path -Path $wd -ChildPath $exe) -WorkingDirectory $wd -Verb RunAs"
+rem powershell -NoProfile -Command ^
+  rem "$wd=(Get-Location).Path; $exe=$env:EXE_NAME; $p=Start-Process -FilePath (Join-Path $wd $exe) -WorkingDirectory $wd -Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+
+powershell -NoProfile -Command ^
+  "try { $wd=(Get-Location).Path; $exe=$env:EXE_NAME; $p=Start-Process -FilePath (Join-Path $wd $exe) -WorkingDirectory $wd -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { exit 1223 }"
+ 
+rem powershell -NoProfile -Command ^
+rem bad:  "try { $wd=(Get-Location).Path; $exe=$env:EXE_NAME; $p=Start-Process -FilePath (Join-Path $wd $exe) -WorkingDirectory $wd -Verb RunAs -Wait -PassThru; exit $p.ExitCode } catch { if ($_.Exception.NativeErrorCode -eq 1223) { exit 1223 }; exit 1 }"
+  
+set "ec=!ERRORLEVEL!"
 
 if "!ec!"=="0" (
-    :: ^( is ( but escaped, lame i kno.
-    echo Started it successfully in a new cmd.exe^(as admin^) window^(which lingers only if it's the devbuild and thus has a console^).
+    echo "!exe_name!" finished successfully.
+) else if "!ec!"=="1223" (
+    echo Elevation request was cancelled by the user.
 ) else (
-    echo couldn't start it, exited with error code "!ec!"
-    pause
-    exit !ec!
+    echo "!exe_name!" exited with error code "!ec!"
+    if "!winbollocks_log_file!" NEQ "" (
+      if exist "!winbollocks_log_file!" (
+        echo ---- debug log file "!winbollocks_log_file!" echoed below ----
+        type "!winbollocks_log_file!"
+        echo ---- debug log file "!winbollocks_log_file!" echoed above ----
+      )
+    )
 )
+pause
