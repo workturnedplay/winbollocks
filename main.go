@@ -4589,11 +4589,20 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 	return res1111.R1 //LRESULT
 })
 
+func panic2(msg string) {
+	logf("%s", msg)
+	wincoe.GetBugLogger().Error(msg)
+	panic(msg)
+}
+
 const WM_QUIT = 0x0012
 
 // runs only on main() never from any other threads!
 func deinit() {
 	deinitThreadID := windows.GetCurrentThreadId()
+	if mainThreadID != 0 /*ie. is set already*/ && deinitThreadID != mainThreadID {
+		panic2("BUG: deinit() should only ever run from main/wndProc thread!")
+	}
 	hardReset(false)
 
 	if timer := memoryVerifyTimer.Load(); timer != nil {
@@ -4605,9 +4614,10 @@ func deinit() {
 		// Send WM_QUIT (0x0012) directly to the hook thread's message queue
 		procPostThreadMessage.Call(uintptr(htidcached), WM_QUIT, 0, 0)
 		//itwasdoneFIXME: wait for it to finish deinit-ing ? or to exit thread (currently doesn't exit thread tho) | we're waiting for it in caller of deinit() which is primary_defer()
-	}
-	if deinitThreadID == htidcached {
-		logf("BUG: deinit() should never run from hook thread!")
+
+		if deinitThreadID == htidcached {
+			logf("BUG: deinit() should never run from hook thread!")
+		}
 	}
 
 	cleanupTray()
