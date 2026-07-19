@@ -29,7 +29,7 @@ if not "%TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKDL%"=="!TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKD
 
 rem temp IDs were generated in git bash via: tr -dc 'A-Z0-9' </dev/urandom | head -c 20
 :: whitelist of allowed keys, user-settable (here!)
-set "TMPSCRIPT_WHITELIST_E4ZXH9LAH07QF1RNOKDL=exe_name log_file"
+set "TMPSCRIPT_WHITELIST_E4ZXH9LAH07QF1RNOKDL=exe_name log_file winbollocks_log_file"
 
 ::TODO: use TMPSCRIPT_*_E4ZXH9LAH07QF1RNOKDL
 set "TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL=readcfg.env"

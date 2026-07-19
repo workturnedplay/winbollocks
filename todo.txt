@@ -1,14 +1,12 @@
 todo:
 * should I dup the logfile logic from run.bat into runasadmin.bat ?!
 
-
-* trying to resize an F11(fullscreen-ed) vscode will show the overlay but won't change its size at all, unclear why, is the target resisting resizes?!
-
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 
 
 notmybug:
 //* find out if my reordering of windows via winkey+MMB (sends to back) is why sometimes when a window exits the focus isn't to prev. focused window but to another! or is this exclusively due to tcmd ran as admin after a copy to make it succeed. This is a win11 bug: it happens even without my program running at all: so i restart win11, login, start tcmd, start firefox, LMB whatever else first(or not) then LMB firefox to get it focused, LMB tcmd, start a.bat that does 'pause' from tcmd which makes it gain focus as a cmd.exe terminal window, i press 'e' key because terminal opened and is focused and 'pause' waits for key before exits, it goes away(terminal window disappears) and firefox gets focused instead of tcmd!
+//* trying to resize an F11(fullscreen-ed) vscode will show the overlay but won't change its size at all, unclear why, is the target resisting resizes?!
 
 
 dontdothis:
