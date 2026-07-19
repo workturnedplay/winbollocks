@@ -32,6 +32,7 @@ import (
 	//"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -335,6 +336,8 @@ var (
 
 	// procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 	// procSetCursorPos     = user32.NewProc("SetCursorPos")
+
+	//Per Win32 docs, GetSystemMetrics returns 0 for both "the queried value is legitimately 0" and "the index is invalid/unsupported" — it does not set GetLastError in any meaningful way for these system-metric indices.
 	procGetSystemMetrics = wincoe.NewBoundProc(user32, "GetSystemMetrics", wincoe.CheckNone) // returns int, 0 on failure for most indices
 	procSetCursorPos     = wincoe.NewBoundProc(user32, "SetCursorPos", wincoe.CheckBool)
 
@@ -1236,7 +1239,17 @@ func injectLMBClickAtCoords(x, y int32) {
 	res1 = procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
 	var virtualHeight int32 = int32(res1.R1)
 
-	// Prevent divide-by-zero and nonsensical coordinate transforms.
+	// GetSystemMetrics has no distinguishable failure signal for these indices
+	// (0 is returned both on legitimate "value is 0" and on any hypothetical
+	// failure, and none of them set a meaningful GetLastError), so there's no
+	// .Failed()-style check available here. SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN
+	// legitimately go negative whenever a monitor extends up/left of the
+	// primary, and legitimately sit at exactly 0 in the common single/aligned
+	// monitor case, so neither "is negative" nor "is zero" can be used as a
+	// failure heuristic for the origin values either. Instead, sanity-check
+	// self-consistency: the reported origin must actually lie within the
+	// reported width/height span, which catches OS/driver-level garbage
+	// without misfiring on any legitimate multi-monitor layout.
 	//
 	// Width/height of 1 would make the rightmost/bottommost pixel also
 	// be the leftmost/topmost pixel, so the normalization formula below
@@ -1246,6 +1259,19 @@ func injectLMBClickAtCoords(x, y int32) {
 			"injectLMBClickAtCoords: invalid virtual desktop size %dx%d",
 			virtualWidth,
 			virtualHeight,
+		)
+		return
+	}
+
+	// Defensive: the origin must be finite and the resulting bounding box
+	// must not overflow int32 arithmetic used below. This does not (and
+	// cannot) detect a "failed" GetSystemMetrics call — it only catches an
+	// internally inconsistent set of metrics, which would otherwise silently
+	// produce garbage normalized coordinates.
+	if virtualLeft > math.MaxInt32-virtualWidth || virtualTop > math.MaxInt32-virtualHeight {
+		logf(
+			"injectLMBClickAtCoords: virtual desktop metrics overflow int32 range: left=%d top=%d width=%d height=%d",
+			virtualLeft, virtualTop, virtualWidth, virtualHeight,
 		)
 		return
 	}
