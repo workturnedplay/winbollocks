@@ -10,7 +10,6 @@ notmybug:
 
 dontdothis:
 * do winkey+shift+MMB over the non-focused window bring it into focus and thus to top, just like it does for the currently focused window currently, but now we can use the thread-attach method of focusing a window (and maybe use the LMB click fallback here too?) and thus can bring it to zorder top afterwards! So then it removes bring only currently focused window to top which was on same key combo. I dno about this.
-* make focusOnDrag and bringToFrontOnDrag apply to the ModeResize gesture as well! then rename them appropriately.
 //failedtodo//* other gestures like at least winkey+MMB should work when coming from higher UIPI and doing the MMB on the lower/normal UIPI window, currently only winkey+LMB and winkey+RMB have this feature.
 
 
