@@ -1,5 +1,4 @@
 todo:
-
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 
 
@@ -9,6 +8,7 @@ notmybug:
 
 
 dontdothis:
+//* nitpicks to consider (done: 1, justanote: 2,3) https://gemini.google.com/app/b9951ecbdd3de184
 * do winkey+shift+MMB over the non-focused window bring it into focus and thus to top, just like it does for the currently focused window currently, but now we can use the thread-attach method of focusing a window (and maybe use the LMB click fallback here too?) and thus can bring it to zorder top afterwards! So then it removes bring only currently focused window to top which was on same key combo. I dno about this.
 //failedtodo//* other gestures like at least winkey+MMB should work when coming from higher UIPI and doing the MMB on the lower/normal UIPI window, currently only winkey+LMB and winkey+RMB have this feature.
 

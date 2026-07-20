@@ -139,6 +139,8 @@ func init() {
 var (
 	// The Data Pipe (2048 is plenty for lag spikes)
 	moveDataChan = make(chan WindowMoveData, 2048)
+	// Tracks if a WM_DO_SETWINDOWPOS is already sitting in the message queue
+	doorbellPending atomic.Bool
 
 	// Modern Atomic tracking
 	droppedMoveOrResizeEvents   atomic.Uint64
@@ -4100,6 +4102,10 @@ func wtsSessionChangeName(code uintptr) string {
 var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case WM_DO_SETWINDOWPOS:
+		// Reset the doorbell immediately so new incoming mouse events
+		// can queue a fresh wakeup call if they arrive while we are draining.
+		doorbellPending.Store(false)
+
 		if coalesceMoveResizeEvents.Load() {
 			drainMoveChannelCoalesced() // ← new coalescing version
 		} else {
@@ -7185,11 +7191,14 @@ func enqueueMoveOrResize(data WindowMoveData, context3 string) {
 	select {
 	case moveDataChan <- data:
 		// SUCCESS: The data was copied into the buffered channel.
-		// Now we ring the "Doorbell" to wake up the Main Thread.
-		// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
-		//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
-		if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
-			logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
+		// Only ring the doorbell if it hasn't been rung yet
+		if doorbellPending.CompareAndSwap(false, true) {
+			// Now we ring the "Doorbell" to wake up the Main Thread.
+			// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
+			//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
+			if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
+				logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
+			}
 		}
 	default:
 		// FAIL: The channel (2048 slots) is completely full.
