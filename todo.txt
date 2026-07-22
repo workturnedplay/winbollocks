@@ -14,3 +14,5 @@ dontdothis:
 
 
 done:
+//* if I sent a window to back via winkey+MMB and I LMB on it, let's bring it to front, else I've to do winkey+shift+MMB to do that and it's annoying! I'm aware that it's still focused during the whole time, that's why LMB doesn't bring it to front, but we have to do it!
+

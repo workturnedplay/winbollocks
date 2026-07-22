@@ -557,22 +557,23 @@ const (
 	WM_DO_RELEASE_CAPTURE = WM_USER + 215
 )
 const (
-	MENU_EXIT                                   = 1
-	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK           = 2
-	MENU_ACTIVATE_MOVE                          = 3
-	MENU_RATELIMIT_MOVES                        = 4
-	MENU_LOG_RATE_OF_MOVES                      = 5
-	MENU_TOGGLE_ASYNC_RESIZE                    = 6
-	MENU_TOGGLE_REQUIRE_WINDOWN                 = 7
-	MENU_TOGGLE_COALESCE_EVENTS                 = 8
-	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT       = 9
-	MENU_TOGGLE_MISSED_GESTURE_RECOVERY         = 10
-	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY    = 11
-	MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG          = 12
-	MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN = 13
-	MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS = 14
-	MENU_TOGGLE_ACTIVATE_RESIZE                 = 15
-	MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE        = 16
+	MENU_EXIT                                      = 1
+	MENU_USE_LMB_TO_FOCUS_AS_FALLBACK              = 2
+	MENU_ACTIVATE_MOVE                             = 3
+	MENU_RATELIMIT_MOVES                           = 4
+	MENU_LOG_RATE_OF_MOVES                         = 5
+	MENU_TOGGLE_ASYNC_RESIZE                       = 6
+	MENU_TOGGLE_REQUIRE_WINDOWN                    = 7
+	MENU_TOGGLE_COALESCE_EVENTS                    = 8
+	MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT          = 9
+	MENU_TOGGLE_MISSED_GESTURE_RECOVERY            = 10
+	MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY       = 11
+	MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG             = 12
+	MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN    = 13
+	MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS    = 14
+	MENU_TOGGLE_ACTIVATE_RESIZE                    = 15
+	MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE           = 16
+	MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK = 17
 
 	MF_STRING = 0x0000
 
@@ -887,6 +888,7 @@ var bringToFrontOnDrag atomic.Bool
 // so the two modes can be configured independently. Toggleable via systray.
 var focusOnResize atomic.Bool
 var bringToFrontOnResize atomic.Bool
+var bringToFrontOnBackgroundClick atomic.Bool
 
 // bypassGesturesWhenFullscreen, when true, suppresses winkey+mouse gestures
 // whose resolved target window is fullscreen (exclusive or
@@ -1496,7 +1498,7 @@ func windowFromPoint(pt POINT) windows.Handle {
 	res2 := procGetAncestor.Call(res1.R1, GA_ROOT)
 	//if err2 != nil {
 	if res2.Failed() {
-		return 0 //kinda redundant because root == 0 if err2 != nil
+		return 0 //kinda redundant because root == 0 if err2 != nil aka .Failed()
 	}
 	return windows.Handle(res2.R1)
 }
@@ -3019,6 +3021,23 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 
 			return 1 // swallow LMB
+		} else if !winDown && bringToFrontOnBackgroundClick.Load() {
+			// --- NEW FIX: Bring focused-but-backgrounded window to front ---
+			// If the user clicks the window that already has focus, Windows normally
+			// skips Z-order promotion. If we sent it to the back previously via
+			// winkey+MMB, it stays stuck there. We detect this and explicitly bring it up.
+			fg := getForegroundWindow()
+			if fg != 0 {
+				clickedHwnd := windowFromPoint(info.Pt)
+				if clickedHwnd != 0 && clickedHwnd == fg {
+					// It's the foreground window. Fire an async message to bring it to top.
+					// We DO NOT swallow the click (we let it fall through to CallNextHookEx)
+					// so the target window still receives the actual mouse click!
+					if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
+						logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
+					}
+				}
+			}
 		}
 
 	case WM_MOUSEMOVE:
@@ -4363,6 +4382,16 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 
 			{
+				var btfbcFlags uintptr = MF_STRING
+				if bringToFrontOnBackgroundClick.Load() {
+					btfbcFlags |= MF_CHECKED
+				}
+				btfbcText := "Bring backgrounded-but-focused window(ie. winkey+MMB -ed one) to front on LMB click"
+				appendMenuChecked(hMenu, btfbcFlags,
+					MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK, btfbcText)
+			}
+
+			{
 				var useThreadAttachInputForFocusFlags uintptr = MF_STRING
 				if useThreadAttachInputForFocus.Load() {
 					useThreadAttachInputForFocusFlags |= MF_CHECKED
@@ -4608,6 +4637,9 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			case MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE:
 				bringToFrontOnResize.Store(!bringToFrontOnResize.Load())
+
+			case MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK:
+				bringToFrontOnBackgroundClick.Store(!bringToFrontOnBackgroundClick.Load())
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
 				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
@@ -5449,6 +5481,8 @@ func init() {
 	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture) // default to same as above ^ TODO: should I make this apply to resize as well?
 	focusOnResize.Store(bringToFrontByDefaultOnGesture)
 	bringToFrontOnResize.Store(bringToFrontByDefaultOnGesture)
+	//Default to true for the LMB click fallback
+	bringToFrontOnBackgroundClick.Store(true)
 
 	useThreadAttachInputForFocus.Store(false) // default false because for some reason it doesn't seem needed right now 17 July 2026, for me, tho I coulda sworn it was, before!
 
