@@ -1,4 +1,115 @@
 todo:
+
+### **1. Fatal Panics Across Cgo/Callback Boundaries**
+
+* **The Issue (`wndProc` / `WM_EXIT_VIA_CTRL_C`):** When handling `CTRL_C_EVENT`, the code calls `exitf(128, ...)`, which triggers a Go `panic`.
+* **Why it's wrong:** `wndProc` is wrapped in `windows.NewCallback` and invoked directly by the OS during message pumping (`DispatchMessage`). Panicking across a C/OS callback boundary is undefined behavior in Go. It catastrophically tears down the OS stack and crashes the runtime with a fatal error, completely bypassing your carefully constructed `primary_defer` and `secondary_defer` cleanups.
+
+### **2. Orphaned Mouse Events (State Desync)**
+
+* **The Issue (`mouseProc`):** When a user holds `Win + LMB` to drag a window, you swallow the `WM_LBUTTONDOWN` event (`return 1`). If the user then releases the `Win` key, the drag stops and `hardReset(true)` sets `activeSession` to `nil`.
+* **Why it's wrong:** When the user eventually releases the left mouse button, `WM_LBUTTONUP` fires. Because `activeSession` is now `nil`, your hook falls through and passes the `LMB UP` event to the target application. The target app receives a button-up event without ever receiving the preceding button-down, which frequently causes stuck hover states, unwanted text selections, or spurious clicks in third-party software.
+
+### **3. Buffer Overruns on `NOTIFYICONDATA` Strings**
+
+* **The Issue (`initTray`):** You use `copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))` for the tooltips and tray info.
+* **Why it's wrong:** `windows.StringToUTF16` returns a slice that includes the critical `0x0000` null terminator. If `tipText` is exactly 128 characters or longer, the `copy` function will truncate the slice to fit the `[128]uint16` array, chopping off the null terminator. When Windows reads this struct, it will read past the end of the array into adjacent memory, resulting in garbage text or crashing `explorer.exe`.
+
+### **4. Stale `LastError` Evaluations**
+
+* **The Issue (`CheckStringLength` / `getWindowTextFast`):** The `procInternalGetWindowText` call is bound with `CheckStringLength`.
+* **Why it's wrong:** If a window legitimately has no title, `InternalGetWindowText` returns `0` but **does not** set a new error code via `SetLastError`. Because `WinCall` does not clear the thread's error state before execution, `callErr` will contain whatever stale error was left over from a completely unrelated prior system call. `CheckStringLength` will see `r1 == 0` and `callErr != ERROR_SUCCESS`, falsely flagging a perfectly normal empty title as a failure.
+
+### **5. Deliberate OS Thread Leaks**
+
+* **The Issue (`hookWorker`):** In the deferred panic bridge, if the worker encounters an unexpected crash and the main thread is unresponsive, the code executes a `select {}` block to hang forever.
+* **Why it's wrong:** Because this goroutine is bound to a physical thread via `runtime.LockOSThread()`, hanging forever permanently leaks that OS thread.
+
+### **6. Phantom `WM_QUIT` Messages**
+
+* **The Issue (`deinit`):** You call `procPostQuitMessage.Call(0)` inside the teardown sequence.
+* **Why it's wrong:** `deinit()` is executed inside `primary_defer()` during a panic unwind or after the message loop has already broken. Posting a quit message to a thread's queue *after* it has already stopped pumping `GetMessage` is a complete no-op.
+
+### **7. Panicking in Telemetry/Logging Paths**
+
+* **The Issue (`logf`):** If the atomic `CompareAndSwap` loop for the channel's high-water mark fails 100 times in a row, the logging function calls `panic(...)`.
+* **Why it's wrong:** Logging and telemetry should be strictly non-destructive. Crashing the entire application because you couldn't record a diagnostic metric under heavy thread contention turns a minor bottleneck into a fatal flaw.
+
+### **8. Cache-Miss Race Condition**
+
+* **The Issue (`GetServiceNamesFromPIDCached`):** The function unlocks `serviceCacheMu` after a cache miss, and then attempts to lock `serviceInFlightMu`.
+* **Why it's wrong:** There is an unprotected window between the unlock and the subsequent lock. In a highly concurrent environment, another goroutine could complete the lookup and populate the cache during this exact gap. The current thread will proceed to do redundant work or block unnecessarily instead of realizing the cache was just updated.
+
+### **9. Inconsistent Atomic Typing**
+
+* **The Issue (`winEventProc`):** The `eventCount` variable is declared as a primitive `uint64` and mutated using the older `sync/atomic` functions (e.g., `atomic.AddUint64(&eventCount, 1)`).
+* **Why it's wrong:** The rest of the codebase (e.g., `droppedMoveOrResizeEvents`) correctly uses the modern, type-safe `atomic.Uint64` structs. Mixing the two API paradigms in the same project is bad practice and risks accidental non-atomic reads.
+
+### **10. 64-bit `HRESULT` Sign-Extension Traps**
+
+* **The Issue (`initDPIAwareness`):** You directly compare a `uintptr` return value to a hardcoded constant: `if res2.R1 == 0x80070005`.
+* **Why it's wrong:** On 64-bit Windows, if the OS returns an `HRESULT` (a signed 32-bit integer) in the 64-bit RAX register, it may be sign-extended. In Go, that `uintptr` will manifest as `0xFFFFFFFF80070005`. A direct equality check against `0x80070005` will silently fail, bypassing your fallback logic.
+
+### **11. Naive Fullscreen Detection**
+
+* **The Issue (`isWindowFullscreenOnMonitor`):** To rule out normal maximized windows, the code checks `if (style & WS_CAPTION) == WS_CAPTION`.
+* **Why it's wrong:** Many modern borderless fullscreen applications (especially video games) do not actually remove the `WS_CAPTION` style. Instead, they hide the frame using `SetWindowRgn` or Desktop Window Manager (DWM) composition attributes. This logic will result in false negatives, failing to bypass gestures in games.
+
+### **12. Arbitrary Buffer Growth Limits**
+
+* **The Issue (`callWithRetry`):** If an API returns `ERROR_INSUFFICIENT_BUFFER` but fails to update the `size` pointer, the loop artificially bumps the size by 1024 bytes.
+* **Why it's wrong:** The loop is hardcapped at `MAX_RETRIES = 10`. This means the fallback mechanism can only ever grow the buffer by a maximum of 10KB. If you are querying a heavily loaded system table (like UDP/TCP connections) that requires substantially more memory, it will exhaust the retries and fail entirely.
+
+### **13. Type-Punning Memory Violations**
+
+* **The Issue (`injectLMBClick`):** You initialize `inputs[0].Ki` as a `KEYBDINPUT` (24 bytes). You then cast its address to `*MOUSEINPUT` (32 bytes) and write into it.
+* **Why it's wrong:** Even though the parent `INPUT` struct has padding to accommodate the 32 bytes, you are explicitly casting a field of one type/size to a larger type/size and writing past its defined boundaries. This violates Go's type safety and relies entirely on undefined memory layout behavior that could break if struct layouts change in future Go versions.
+
+### **14. Infinite `WM_PAINT` Spam (GDI Leak)**
+
+* **The Issue (`overlayWndProc`):** Inside your `WM_PAINT` handler, if `procFillRect`, `procGdiSetTextColor`, or `procDrawText` fails, you log the error and immediately `return 0`.
+* **Why it's wrong:** You called `BeginPaint`, but by returning early, you skip `EndPaint`. Windows relies on `EndPaint` to validate the update region and release the device context (DC). If you bail out without calling it, the window remains "dirty," the DC leaks, and the OS will instantly fire another `WM_PAINT` message the millisecond your message queue is empty. This will completely lock up one of your CPU cores in an infinite rendering loop.
+
+### **15. `EnumServicesStatusEx` Size Miscalculation**
+
+* **The Issue (`GetServiceNamesFromPIDUncached` / `callWithRetry`):** You assume the `size` variable (populated by `pcbBytesNeeded` in the Windows API) returns the *total* buffer size required for the retry loop.
+* **Why it's wrong:** When `EnumServicesStatusEx` fails with `ERROR_MORE_DATA`, the `pcbBytesNeeded` parameter does not return the total size; it returns the **additional** number of bytes needed for the *remaining* service entries. If your initial buffer was 1,000 bytes and the API needed 500 more, `size` becomes 500. On the next iteration of your loop, you shrink your allocation to 500 bytes, guaranteeing it will fail again until your fallback `size += increment` mechanism coincidentally bloats it enough to work.
+
+### **16. Data Race on `trayIcon**`
+
+* **The Issue:** `trayIcon` is a globally shared `NOTIFYICONDATA` struct.
+* **Why it's wrong:** Your Hook Thread modifies it asynchronously via `showTrayInfo` (`trayIcon.UFlags |= NIF_INFO`), while your Main Thread concurrently mutates it during shutdown in `cleanupTray` (`trayIcon.UFlags = 0`). Modifying a complex Win32 struct concurrently from two different threads without a mutex will result in memory corruption and malformed calls to `Shell_NotifyIconW`.
+
+### **17. Out-of-Bounds String Reads**
+
+* **The Issue (`GetServiceNamesFromPIDUncached`):** You check if the pointer `data.ServiceName` starts inside the allocated buffer (`snPtr < bufStart || snPtr >= bufEnd`).
+* **Why it's wrong:** Validating that the pointer's *starting address* is inside the buffer does not guarantee the *entire string* is inside the buffer. `windows.UTF16PtrToString` blindly scans forward until it hits a `0x0000` null terminator. If the string runs off the edge of your allocated byte slice, Go will continue reading adjacent memory until it hits a random null byte or triggers a `STATUS_ACCESS_VIOLATION` page fault.
+
+### **18. Synchronous Disk I/O Inside Low-Level Hooks**
+
+* **The Issue (`logf`):** If the background logging channel fills up and `logQuitClosed` flips to true, your logging function falls back to calling `internalLogger(finalMsg)` directly.
+* **Why it's wrong:** `logf` is heavily called from inside `mouseProc` (your `WH_MOUSE_LL` hook). `internalLogger` executes synchronous hardware I/O via `os.Stderr.Write` or `logFile.Sync()`. Executing blocking disk I/O directly on the thread executing a low-level mouse hook guarantees OS timeout drops, severe mouse stutter, and system-wide input lag.
+
+### **19. Unconditional Stale Handle Closing**
+
+* **The Issue (`getProcessNameFast` and others):** You declare `defer closeHandleLogged(hProc, ...)` immediately after calling `windows.OpenProcess`, but *before* you actually check if `err != nil`.
+* **Why it's wrong:** If `OpenProcess` fails, it returns an invalid handle (usually `0` or `0xFFFFFFFF`). Because your `defer` was placed blindly above the error check, you will unconditionally attempt to call `CloseHandle` on garbage data. This is noisy, pollutes the logs, and can trigger exceptions when running under a debugger.
+
+### **20. Racing the Log File Initializer**
+
+* **The Issue (`internalLogger`):** You check `if logFile == nil`, and if so, call `initLogFile()`.
+* **Why it's wrong:** `internalLogger` can be executed concurrently by the `logWorker` thread, the main thread, or the hook thread. Because `initLogFile()` is not guarded by a `sync.Once` or a mutex, a flood of concurrent logs before the file is opened will cause multiple threads to race into `initLogFile()` simultaneously. This results in file descriptor leaks, overlapping file locks, and data races on the global `logFile` pointer itself.
+
+### **21. Shutdown Deadlock via `os.Stdin.Read**`
+
+* **The Issue (`WaitAnyKey`):** You spawn a goroutine to read a key sequence (`os.Stdin.Read(b[:])`) and block the main thread waiting for a signal (`<-done`).
+* **Why it's wrong:** `os.Stdin.Read` is a blocking system call. If the environment detaches standard input unexpectedly, or if the user never presses a key while the system attempts an asynchronous teardown, the goroutine will permanently hang. Because your main thread strictly waits on `<-done`, the entire shutdown sequence paralyzes.
+
+### **22. Indefinite Slice Capacity Bloat**
+
+* **The Issue (`drainMoveChannelCoalesced`):** You reset the length of your slice with `coalesceOrder = coalesceOrder[:0]` and then continually `append` new window handles to it.
+* **Why it's wrong:** While resetting the length reuses the backing array and avoids immediate GC pressure, the capacity of that backing array never shrinks. If your application runs for weeks and interacts with thousands of unique temporary window handles (e.g., tooltips, context menus), the slice's backing array will silently and permanently grow in capacity to accommodate the highest peak of unique windows it ever saw in a single drain cycle.
+
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
 
 
