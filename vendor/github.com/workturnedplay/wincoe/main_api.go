@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -1871,6 +1872,31 @@ func ReplaceFile(replaced, replacement, backup string, flags uint32) error {
 	return res1.Err
 }
 
+// fileWriteLocks serializes concurrent writers targeting the SAME file path
+// (keyed by its cleaned, lowercased form — NTFS path comparison is
+// case-insensitive) while letting writes to DIFFERENT files (e.g.
+// config.json vs query_whitelist.json vs hosts2ip.json) proceed fully in
+// parallel instead of serializing through one FileWriter-instance-wide
+// mutex. Entries are never removed: the set of distinct file paths this
+// process ever writes to is small and fixed by construction.
+var fileWriteLocks sync.Map // map[string]*sync.Mutex
+
+// lockFileForWrite acquires (creating on first use) the per-filename mutex
+// for filename and returns a function that releases it. Callers should
+// `defer` the returned function immediately.
+func lockFileForWrite(filename string) func() {
+	key := strings.ToLower(filepath.Clean(filename))
+	muIface, _ := fileWriteLocks.LoadOrStore(key, &sync.Mutex{})
+	mu, ok := muIface.(*sync.Mutex)
+	if !ok {
+		panic2("BUG: fileWriteLocks contained a non-*sync.Mutex value")
+	}
+	mu.Lock()
+	return mu.Unlock
+}
+
+// FileWriter is the persistence contract.
+
 // FileWriter is the persistence contract.
 // Extracted from Server so saves can be intercepted in tests without
 // touching the filesystem, and so fileWriteMu is an implementation detail
@@ -1883,11 +1909,16 @@ type FileWriter interface {
 }
 
 // GenericSafeFileWriter is the production FileWriter.
-// It serialises all writes through its own mutex (replacing Server.fileWriteMu)
-// and conditionally uses a staging file when cfg.ExtraSafety is true.
+// Writes to the SAME file path are serialised via fileWriteLocks (replacing
+// the old single instance-wide Server.fileWriteMu); writes to DIFFERENT file
+// paths proceed fully in parallel. It conditionally uses a staging file when
+// cfg.ExtraSafety is true.
 // cfg is a pointer to Server.config so ExtraSafety is always read at call time.
 type GenericSafeFileWriter struct {
-	mu             sync.Mutex
+	// paramsMu guards extraSafety/maxRetries/retryBackoffMs only. Actual file
+	// writes are serialized per-filename via fileWriteLocks instead of this
+	// mutex, so concurrent writes to different files never block each other.
+	paramsMu       sync.Mutex
 	extraSafety    bool
 	maxRetries     int
 	retryBackoffMs int
@@ -1908,8 +1939,8 @@ func (fw *GenericSafeFileWriter) getLogger() *slog.Logger {
 }
 
 func (fw *GenericSafeFileWriter) SetExtraSafety(enabled bool) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	fw.paramsMu.Lock()
+	defer fw.paramsMu.Unlock()
 	fw.extraSafety = enabled
 }
 
@@ -1954,14 +1985,16 @@ func (fw *GenericSafeFileWriter) CheckPowerLossFile(filename string) {
 		tmpName, fi.Size(), filename,
 		PowerlossFileExtension, PowerlossFileExtension,
 	)
-	log.Error(logmsg)
-	panic(logmsg) //FIXME: ? the errors/args are embedded in the msg
+	log.Error(logmsg) //FIXME: ? the errors/args are embedded in the msg
+	panic(logmsg)
 }
 
 // SafeWriteFile attempts a crash-safe file update without using os.Rename,
 // preserving Windows ACLs and falling back gracefully if directory permissions
 // block the creation of temporary files.
-// All writes are serialised through fw.mu (replacing the old Server.fileWriteMu).
+// Writes to the SAME file path are serialised via fileWriteLocks (replacing
+// the old Server.fileWriteMu); writes to DIFFERENT file paths proceed fully
+// in parallel instead of contending on one instance-wide mutex.
 //
 // By writing the complete payload to [filename].powergotlost first, flushing it
 // to hardware, and only then truncating the target file, you create a cryptographic-like commit phase.
@@ -1981,14 +2014,19 @@ func (fw *GenericSafeFileWriter) CheckPowerLossFile(filename string) {
 func (fw *GenericSafeFileWriter) SafeWriteFile(filename string, data []byte, perm os.FileMode) error {
 	log := fw.getLogger()
 
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
-
-	// Capture these parameters immediately AFTER taking the lock
+	fw.paramsMu.Lock()
 	maxAttempts := 1 + fw.maxRetries
 	backoffDuration := time.Duration(fw.retryBackoffMs) * time.Millisecond
+	extraSafety := fw.extraSafety
+	fw.paramsMu.Unlock()
 
-	if fw.extraSafety {
+	// Serialize actual disk I/O per-filename rather than per-instance, so a
+	// slow write to one file never blocks an unrelated write to a different
+	// file — see fileWriteLocks's doc comment.
+	unlockFile := lockFileForWrite(filename)
+	defer unlockFile()
+
+	if extraSafety {
 		tmpName := filename + PowerlossFileExtension
 
 		// step1. Try to write to a temp file first to ensure disk space and data integrity.
@@ -2128,12 +2166,16 @@ const PowerlossFileExtension string = ".powergotlost"
 const BackupFileExtension string = ".bak"
 
 // win11SafeFileWriter is the production FileWriter for Windows.
-// It serialises all writes through its own mutex and always attempts a
+// Writes to the SAME file path are serialised via fileWriteLocks; writes to
+// DIFFERENT file paths proceed fully in parallel. It always attempts a
 // transactional swap via ReplaceFileW to gain atomic updates and automated backups.
 // If the Win32 transaction is blocked by directory/file permissions or ACL limits,
 // it gracefully falls back to an in-place truncate write.
 type win11SafeFileWriter struct {
-	mu             sync.Mutex
+	// paramsMu guards maxRetries/retryBackoffMs (and extraSafety, though it's
+	// currently unread by SafeWriteFile) only. Actual file writes are
+	// serialized per-filename via fileWriteLocks instead of this mutex.
+	paramsMu       sync.Mutex
 	extraSafety    bool // Kept for interface alignment; always runs staging on Windows
 	maxRetries     int
 	retryBackoffMs int
@@ -2154,8 +2196,8 @@ func (fw *win11SafeFileWriter) getLogger() *slog.Logger {
 }
 
 func (fw *win11SafeFileWriter) SetExtraSafety(enabled bool) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	fw.paramsMu.Lock()
+	defer fw.paramsMu.Unlock()
 	fw.extraSafety = enabled
 }
 
@@ -2209,12 +2251,16 @@ func (fw *win11SafeFileWriter) CheckPowerLossFile(filename string) {
 func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm os.FileMode) error {
 	log := fw.getLogger()
 
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
-
-	// Capture these parameters immediately AFTER taking the lock
+	fw.paramsMu.Lock()
 	maxAttempts := 1 + fw.maxRetries
 	backoffDuration := time.Duration(fw.retryBackoffMs) * time.Millisecond
+	fw.paramsMu.Unlock()
+
+	// Serialize actual disk I/O per-filename rather than per-instance, so a
+	// slow write to one file never blocks an unrelated write to a different
+	// file — see fileWriteLocks's doc comment.
+	unlockFile := lockFileForWrite(filename)
+	defer unlockFile()
 
 	tmpName := filename + PowerlossFileExtension
 	backupName := filename + BackupFileExtension
@@ -2297,15 +2343,15 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 }
 
 func (fw *GenericSafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	fw.paramsMu.Lock()
+	defer fw.paramsMu.Unlock()
 	fw.maxRetries = maxRetries
 	fw.retryBackoffMs = retryBackoffMs
 }
 
 func (fw *win11SafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
+	fw.paramsMu.Lock()
+	defer fw.paramsMu.Unlock()
 	fw.maxRetries = maxRetries
 	fw.retryBackoffMs = retryBackoffMs
 }
