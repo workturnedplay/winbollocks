@@ -3476,7 +3476,24 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
 			}
 			return 1 // Swallow
-		} //if
+		} else if !winDown && bringToFrontOnBackgroundClick.Load() {
+			// --- NEW FIX: Bring focused-but-backgrounded window to front ---
+			// If the user clicks the window that already has focus, Windows normally
+			// skips Z-order promotion. If we sent it to the back previously via
+			// winkey+MMB, it stays stuck there. We detect this and explicitly bring it up.
+			fg := getForegroundWindow()
+			if fg != 0 {
+				clickedHwnd := windowFromPoint(info.Pt)
+				if clickedHwnd != 0 && clickedHwnd == fg {
+					// It's the foreground window. Fire an async message to bring it to top.
+					// We DO NOT swallow the click (we let it fall through to CallNextHookEx)
+					// so the target window still receives the actual mouse click!
+					if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
+						logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
+					}
+				}
+			}
+		}
 
 	case WM_MBUTTONDOWN: //MMB pressed
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
@@ -3498,7 +3515,24 @@ func mouseProc(nCode int, wParam, lParam uintptr) uintptr {
 			}
 
 			return 1 // swallow MMB
-		} // the 'if' in MMB
+		} else /* the 'if' in MMB*/ if !winDown && bringToFrontOnBackgroundClick.Load() {
+			// --- NEW FIX: Bring focused-but-backgrounded window to front ---
+			// If the user clicks the window that already has focus, Windows normally
+			// skips Z-order promotion. If we sent it to the back previously via
+			// winkey+MMB, it stays stuck there. We detect this and explicitly bring it up.
+			fg := getForegroundWindow()
+			if fg != 0 {
+				clickedHwnd := windowFromPoint(info.Pt)
+				if clickedHwnd != 0 && clickedHwnd == fg {
+					// It's the foreground window. Fire an async message to bring it to top.
+					// We DO NOT swallow the click (we let it fall through to CallNextHookEx)
+					// so the target window still receives the actual mouse click!
+					if res := procPostMessage.Call(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
+						logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
+					}
+				}
+			}
+		}
 	} //switch
 
 	if nowDiff := time.Since(start); nowDiff > Duration5ms {
@@ -4386,7 +4420,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				if bringToFrontOnBackgroundClick.Load() {
 					btfbcFlags |= MF_CHECKED
 				}
-				btfbcText := "Bring backgrounded-but-focused window(ie. winkey+MMB -ed one) to front on LMB click"
+				btfbcText := "Bring backgrounded-but-focused window(ie. winkey+MMB -ed one) to front on LMB/MMB/RMB click"
 				appendMenuChecked(hMenu, btfbcFlags,
 					MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK, btfbcText)
 			}
