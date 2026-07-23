@@ -825,7 +825,12 @@ func (b *BoundProc) Call(args ...uintptr) WinResult {
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc) Find() error {
-	return b.Proc.Find()
+	err := b.Proc.Find()
+	if err == nil {
+		return nil
+	} else {
+		return fmt.Errorf("BoundProc:Find says that LazyProcish/LaziProc.Find() failed, err: %w", err)
+	}
 }
 
 // NewBoundProc initializes a BoundProc by resolving a procedure from the
@@ -964,7 +969,7 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 
 		if err == nil {
 			if uint64(size) > uint64(len(buf)) {
-				impossibiru("size is bigger than len(buf)")
+				impossibiru(who + ":callWithRetry: size is bigger than len(buf)")
 			}
 			return buf, nil // epic fail here if returning buf[:size] because size is 0 even tho servicesReturned is > 0
 			//return buf[:size], nil // fixed one issue! nope this "fix" was wrong because: The size parameter is only reliable when the API returns ERROR_MORE_DATA or ERROR_INSUFFICIENT_BUFFER. On success it is frequently set to 0, even when the buffer contains real data.
@@ -976,7 +981,7 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 		//EnumServicesStatusEx (and many Enumeration APIs) returns ERROR_MORE_DATA.
 		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) &&
 			!errors.Is(err, windows.ERROR_MORE_DATA) {
-			return nil, err
+			return nil, err //TODO: shouldn't we wrap this err here? surely caller is using errors.Is on it no?! and if we don't wrap it, it's not clear it passed thru callWithRetry itself!
 		}
 		// Loop continues, using the updated 'size' from the failed call
 		//however:
@@ -989,12 +994,12 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 			const increment = 1024
 			const MaxInt = math.MaxUint32
 			if MaxInt-size < increment {
-				return nil, fmt.Errorf("buffer size(%d) would overflow uint32(%d) if adding %d", size, MaxInt, increment)
+				return nil, fmt.Errorf("%s:callWithRetry: buffer size(%d) would overflow uint32(%d) if adding %d", who, size, MaxInt, increment)
 			}
 			size += increment
 		}
 	}
-	return nil, fmt.Errorf("buffer growth exceeded max retries(%d)", MAX_RETRIES)
+	return nil, fmt.Errorf("%s:callWithRetry: buffer growth exceeded max retries(%d)", who, MAX_RETRIES)
 }
 
 // boolToUintptr converts a Go bool to a uintptr (1 for true, 0 for false)
@@ -1218,7 +1223,7 @@ func resolveExeName(owningPid uint32, remoteAddrStr string) (string, error) {
 	}
 	exe, err3 := GetProcessName(owningPid)
 	if err3 != nil {
-		return "", fmt.Errorf("pid %d not found for %s, errTransient:'%v', err:'%w'", owningPid, remoteAddrStr, err2, err3)
+		return "", fmt.Errorf("pid %d not found for %s, errTransient:'%w', err:'%w'", owningPid, remoteAddrStr, err2, err3) //fine, wrap both then!
 	}
 	return exe, nil
 }
@@ -1417,35 +1422,148 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 	// DON'T: Trim the buffer to the actual data written, bad Grok 4.20! because data.ServiceName is a pointer past this size, still in the buffer tho!
 	//buffer = buffer[:realLen] // BAD! don't do this!
 
+	// Define buffer endpoints as unsafe.Pointers safely using unsafe.Add
+	bufStart := unsafe.Pointer(&buffer[0])
+	bufEnd := unsafe.Add(bufStart, len(buffer))
+
+	bufStartAddr := uintptr(bufStart)
+	bufEndAddr := uintptr(bufEnd)
+
 	for i := uint32(0); i < servicesReturned; i++ {
 		offset := uintptr(i) * entrySize
 		if offset+entrySize > uintptr(len(buffer)) {
 			return nil, fmt.Errorf("entry %d at offset %d + entrySize %d exceeds buffer len %d",
 				i, offset, entrySize, len(buffer))
 		}
-		data := (*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[offset]))
+		//data := (*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buffer[offset]))
+		data := (*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Add(bufStart, offset))
 
 		// Validate ServiceName pointer is within buffer before dereferencing
-		bufStart := uintptr(unsafe.Pointer(&buffer[0]))
-		bufEnd := bufStart + uintptr(len(buffer))
-		snPtr := uintptr(unsafe.Pointer(data.ServiceName))
-		if snPtr < bufStart || snPtr >= bufEnd {
+		// bufStart := uintptr(unsafe.Pointer(&buffer[0]))
+		// bufEnd := bufStart + uintptr(len(buffer))
+		// snPtr := uintptr(unsafe.Pointer(data.ServiceName))
+		//if snPtr < bufStart || snPtr >= bufEnd {
+
+		// Validate ServiceName pointer is within buffer before dereferencing
+		snPtr := data.ServiceName // type is *uint16
+		snAddr := uintptr(unsafe.Pointer(snPtr))
+		if snAddr < bufStartAddr || snAddr >= bufEndAddr {
 			// pointer outside buffer — skip this entry
+
+			// return nil, fmt.Errorf("entry %d at offset %0x which has entrySize %d, in the buffer len %d, "+
+			// 	"has a ServiceName ptr outside the buffer=%p area, snPtr=%0x bufStart=%0x bufEnd=%0x",
+			// 	i, offset, entrySize, len(buffer),
+			// 	buffer, snPtr, bufStart, bufEnd)
 			return nil, fmt.Errorf("entry %d at offset %0x which has entrySize %d, in the buffer len %d, "+
 				"has a ServiceName ptr outside the buffer=%p area, snPtr=%0x bufStart=%0x bufEnd=%0x",
 				i, offset, entrySize, len(buffer),
-				buffer, snPtr, bufStart, bufEnd)
+				buffer, snAddr, bufStartAddr, bufEndAddr)
 		}
 
 		if data.ServiceStatusProcess.ProcessId == targetPID {
-			str := windows.UTF16PtrToString(data.ServiceName)
-			// We use UTF16PtrToString because ServiceName is a *uint16
-			// pointing into the same buffer returned by the API.
+			// Bounded decode instead of windows.UTF16PtrToString: the check
+			// above only confirms the string's START address lies within the
+			// buffer, not that a null terminator is guaranteed to appear
+			// before bufEnd. A corrupted/malformed SCM response could
+			// otherwise send UTF16PtrToString scanning past the end of this
+			// allocation into unmapped memory.
+			str, ok := utf16StringWithinBounds(snPtr, bufEnd)
+			if !ok {
+				return nil, fmt.Errorf("entry %d: ServiceName string has no null terminator before bufEnd (snPtr=%0x bufEnd=%0x)", i, snPtr, bufEnd)
+			}
 			serviceNames = append(serviceNames, str)
 		}
 	}
 	return serviceNames, nil
 }
+
+// utf16StringWithinBounds decodes a null-terminated UTF-16 string starting
+// at startAddr, refusing to read past endAddr. Used instead of
+// windows.UTF16PtrToString when the caller only knows the string's start
+// address lies within a fixed-size buffer, not that a null terminator is
+// guaranteed to appear before the buffer's end.
+func utf16StringWithinBounds(strPtr *uint16, bufEnd unsafe.Pointer) (string, bool) { // by Gemini 3.6 Thinking
+	if strPtr == nil || bufEnd == nil {
+		return "", false
+	}
+
+	startAddr := uintptr(unsafe.Pointer(strPtr))
+	endAddr := uintptr(bufEnd)
+
+	if startAddr >= endAddr {
+		return "", false
+	}
+
+	// Calculate maximum allowed uint16 elements before bufEnd
+	maxUnits := int((endAddr - startAddr) / 2)
+	if maxUnits <= 0 {
+		return "", false
+	}
+
+	// unsafe.Slice accepts *uint16 directly—no unsafe.Pointer conversion needed!
+	units := unsafe.Slice(strPtr, maxUnits)
+
+	for i, u := range units {
+		if u == 0 {
+			return windows.UTF16ToString(units[:i]), true
+		}
+	}
+
+	return "", false // no null terminator found before bufEnd
+}
+
+// func utf16StringWithinBounds0(startAddr, endAddr uintptr) (string, bool) { //this was made by Claude Sonnet 5 Extra Thinking
+// 	var units []uint16
+// 	for addr := startAddr; addr+1 < endAddr; addr += 2 {
+// 		//main_api.go:1470:19: possible misuse of unsafe.Pointer
+// 		u := *(*uint16)(unsafe.Pointer(addr)) //nolint:gosec // bounds-checked by the loop condition above
+// 		if u == 0 {
+// 			return windows.UTF16ToString(units), true
+// 		}
+// 		units = append(units, u)
+// 	}
+// 	return "", false // no null terminator found before endAddr
+// }
+
+// func utf16StringWithinBounds1(startAddr, endAddr uintptr) (string, bool) { // by Gemini 3.6 Thinking
+// 	var units []uint16
+// 	basePtr := unsafe.Pointer(startAddr) //possible misuse of unsafe.Pointer
+
+// 	for offset := uintptr(0); startAddr+offset+1 < endAddr; offset += 2 {
+// 		// unsafe.Add performs single-expression pointer arithmetic
+// 		u := *(*uint16)(unsafe.Add(basePtr, offset))
+// 		if u == 0 {
+// 			return windows.UTF16ToString(units), true
+// 		}
+// 		units = append(units, u)
+// 	}
+
+// 	return "", false // no null terminator found before endAddr
+// }
+
+// func utf16StringWithinBounds2(startAddr, endAddr uintptr) (string, bool) { // by Gemini 3.6 Thinking
+// 	if startAddr >= endAddr {
+// 		return "", false
+// 	}
+
+// 	// Calculate the max possible uint16 elements in the memory range
+// 	count := (endAddr - startAddr) / 2
+// 	if count == 0 {
+// 		return "", false
+// 	}
+
+// 	// Create a slice referencing the memory range
+// 	units := unsafe.Slice((*uint16)(unsafe.Pointer(startAddr)), count) //possible misuse of unsafe.Pointer
+
+// 	// Search for null terminator
+// 	for i, u := range units {
+// 		if u == 0 {
+// 			return windows.UTF16ToString(units[:i]), true
+// 		}
+// 	}
+
+// 	return "", false // no null terminator found before endAddr
+// }
 
 // PidAndExeForUDP returns (pid, exePath_or_exeName, error).
 // clientAddr should be the remote UDP address observed on the server side.
@@ -1474,7 +1592,6 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 
 	if buf == nil {
 		return 0, "", errors.New("GetExtendedUdpTable returned empty buffer which means there were no UDP entries in the table")
-
 	}
 
 	// Buffer layout: DWORD dwNumEntries; then array of MIB_UDPROW_OWNER_PID entries.
@@ -1586,7 +1703,6 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	}
 	if buf == nil {
 		return 0, "", errors.New("GetExtendedTcpTable returned empty buffer")
-
 	}
 
 	if len(buf) < 4 {
@@ -1779,7 +1895,10 @@ func GoRoutineId() int64 {
 	n := runtime.Stack(buf[:], false)
 	// "goroutine 17 [running]:\n..."
 	var id int64 = -1
-	fmt.Sscanf(string(buf[:n]), "goroutine %d", &id)
+	_, err := fmt.Sscanf(string(buf[:n]), "goroutine %d", &id)
+	if err != nil {
+		GetBugLogger().Error("BUG: unexpected fail from fmt.Sscanf", SafeErr(err))
+	}
 	return id
 }
 
@@ -2379,7 +2498,7 @@ func closeHandleLogged(h windows.Handle, context string) {
 // to ensure disk space and data integrity before touching the main file.
 func writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, maxAttempts int, backoff time.Duration) error {
 	return RetryFileOp(maxAttempts, backoff, func() error {
-		tmpFile, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+		tmpFile, err := openStagingFileSafely(tmpName, perm)
 		if err != nil {
 			return fmt.Errorf("create failed: %w", err)
 		}
@@ -2388,16 +2507,113 @@ func writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, ma
 		closeErr := tmpFile.Close()
 
 		if writeErr != nil || syncErr != nil || closeErr != nil {
-			return fmt.Errorf("write/sync/close failed (write=%v sync=%v close=%v)", writeErr, syncErr, closeErr)
+			return fmt.Errorf("write/sync/close failed (write=%w sync=%w close=%w)", writeErr, syncErr, closeErr)
 		}
 		return nil
 	})
 }
 
+// openStagingFileSafely opens (creating if needed) the staging file used for
+// crash-safe atomic writes, refusing to blindly follow whatever might
+// already exist at that path. Because CheckPowerLossFile already runs at
+// process boot and panics if a NON-EMPTY staging file is found there, the
+// only pre-existing staging file this should ever encounter mid-run is
+// either (a) a benign leftover — a previous write succeeded but its own
+// cleanup couldn't unlink the now-empty (0-byte) staging file — or (b)
+// something planted by a lower-privileged local attacker: a symlink or a
+// hard link aliasing this name onto a file the attacker cannot write to
+// directly, hoping this process (running with equal or higher privilege)
+// will overwrite the real target through the alias. Opening with O_EXCL
+// (fails outright if anything already exists at tmpName) forces that
+// distinction to be made explicitly instead of silently following whatever
+// is already there via O_TRUNC.
+func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
+	f, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err == nil {
+		return f, nil
+	}
+	if !os.IsExist(err) {
+		return nil, fmt.Errorf("openStagingFileSafely says that os.OpenFile failed(and not because it doesn't exist) to create %q staging file, with err:%w", tmpName, err) // some other failure (permissions, path issues, etc.) — propagate as-is
+	}
+
+	// Something already exists at tmpName. Only ever safe to reclaim it if
+	// it is a plain, empty, regular file with a single hard link — exactly
+	// what CheckPowerLossFile's own "empty staging file" tolerance
+	// describes. Refuse anything else outright rather than following it.
+	safe, reason, inspectErr := inspectExistingStagingFile(tmpName)
+	if inspectErr != nil {
+		return nil, fmt.Errorf("staging file %q exists but could not be safely inspected: %w", tmpName, inspectErr)
+	}
+	if !safe {
+		return nil, fmt.Errorf("refusing to use staging file %q: %s (possible attack or genuine corruption)", tmpName, reason)
+	}
+
+	// Confirmed benign: remove the empty leftover and retry the exclusive
+	// create so we never write through a pre-existing name.
+	if rmErr := OsRemoveFunc(tmpName); rmErr != nil {
+		return nil, fmt.Errorf("failed to remove confirmed-benign empty staging file %q before recreating it: %w", tmpName, rmErr)
+	}
+	if fil, ofErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm); ofErr != nil {
+		return nil, fmt.Errorf("failed to create staging file %q after removed the existing file (so, directory permissions doesn't allow creating new files? and we shoulda just truncated the existing one to keep ACLs?!), err: %w", tmpName, ofErr)
+	} else {
+		return fil, nil
+	}
+}
+
+// inspectExistingStagingFile opens path WITHOUT following any reparse point
+// (symlink/junction) that might be there, and reports whether it is safe to
+// reclaim as a benign, previously-written-but-not-yet-cleaned-up staging
+// file: specifically, a plain regular file, zero bytes long, with exactly
+// one hard link (itself).
+//
+// FILE_FLAG_OPEN_REPARSE_POINT is essential here: without it, CreateFile
+// transparently follows a symlink/junction planted at path and reports
+// information about whatever it points AT instead of the link itself, which
+// would make this whole check trivially bypassable by an attacker.
+func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string, err error) {
+	pathPtr, cerr := windows.UTF16PtrFromString(path)
+	if cerr != nil {
+		return false, "", fmt.Errorf("convert path %q to UTF-16: %w", path, cerr)
+	}
+	h, cerr := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if cerr != nil {
+		return false, "", fmt.Errorf("CreateFile failed: %w", cerr)
+	}
+	defer closeHandleLogged(h, "inspectExistingStagingFile:CreateFile h")
+
+	var info windows.ByHandleFileInformation
+	if gerr := windows.GetFileInformationByHandle(h, &info); gerr != nil {
+		return false, "", fmt.Errorf("GetFileInformationByHandle failed: %w", gerr)
+	}
+
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false, "it is a symlink/junction/reparse point, not a plain regular file", nil
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		return false, "it is a directory, not a regular file", nil
+	}
+	if info.NumberOfLinks > 1 {
+		return false, "it has multiple hard links", nil
+	}
+	if info.FileSizeHigh != 0 || info.FileSizeLow != 0 {
+		size := (uint64(info.FileSizeHigh) << 32) | uint64(info.FileSizeLow)
+		return false, fmt.Sprintf("it already contains data (%d byte(s))", size), nil
+	}
+	return true, "", nil
+}
+
 // neutralizeOrPanic encapsulates the resilience cleanup logic for an abandoned staging file.
 // It attempts deletion first. If deletion fails, it forces a truncation down to 0 bytes
 // to neutralize any partial garbage data that would trip up the next boot.
-func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration, log *slog.Logger, actionErr error, title string, extraPanicMsg string) {
+func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration, log *slog.Logger, actionErr error, title, extraPanicMsg string) {
 	ondeleteErr := RetryFileOp(maxAttempts, backoff, func() error { return OsRemoveFunc(tmpName) })
 	if ondeleteErr == nil {
 		log.Debug("ExtraSafety: successfully neutralized staging file by deleting it", slog.String("tempfilename", tmpName))
