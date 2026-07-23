@@ -1,5 +1,7 @@
 todo:
 
+* make a setting (in systray) that when true (false by default) it will unfocus the window that's sent to back via winkey+MMB, this way typing after it won't execute things in it even though it's out of view! So othe unfocus will focus what? our own hwnd (which isn't really a window, iirc, it's hidden) or whichever window is now topmost in Z-order ?
+
 * **The Issue (`wndProc` / `WM_EXIT_VIA_CTRL_C`):** When handling `CTRL_C_EVENT`, the code calls `exitf(128, ...)`, which triggers a Go `panic`. Same thing happens when MENU_EXIT and when WM_ENDSESSION !
 * **Why it's wrong:** `wndProc` is wrapped in `windows.NewCallback` and invoked directly by the OS during message pumping (`DispatchMessage`). Panicking across a C/OS callback boundary is undefined behavior in Go. It catastrophically tears down the OS stack and crashes the runtime with a fatal error, completely bypassing your carefully constructed `primary_defer` and `secondary_defer` cleanups.
 

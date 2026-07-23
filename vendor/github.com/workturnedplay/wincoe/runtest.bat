@@ -55,6 +55,11 @@ echo Running go test
 go test !MOD_FLAG! -v ./...
 if errorlevel 1 goto :fail
 
+echo Running go test with race detector!
+go test -race !MOD_FLAG! -v ./...
+if errorlevel 1 goto :fail
+
+
 echo all succeeded.
 pause
 goto :eof
