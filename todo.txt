@@ -74,34 +74,18 @@ gemini-found issues (may not be a thing, double-check first):
  * **Why it's wrong:** While resetting the length reuses the backing array and avoids immediate GC pressure, the capacity of that backing array never shrinks. If your application runs for weeks and interacts with thousands of unique temporary window handles (e.g., tooltips, context menus), the slice's backing array will silently and permanently grow in capacity to accommodate the highest peak of unique windows it ever saw in a single drain cycle.
 
 ### `main_api.go`
-* **The Issue (`logmsg` string formatting flaw):** The final panic message concatenates `"%s"` and `"Halting execution immediately..."` without any separating spaces or newlines.
- * **Why it's wrong:** Whatever string is passed into `extraPanicMsg` will be jammed directly against the word "Halting". If `extraPanicMsg` is "Access Denied", the console output will print `Access DeniedHalting execution immediately...`, creating a malformed log entry.
 
 * **The Issue (Sharing Violation trap in `TruncateStagingFileToZero`):** You justify the truncation fallback with the comment, "Since we already have write handle permissions to this file, this is highly likely to succeed."
  * **Why it's wrong:** Having a previous handle with write permissions does not guarantee a new file path operation will succeed. If the initial delete failed because a third-party process (like an antivirus or indexer) temporarily locked the file with an `ERROR_SHARING_VIOLATION`, attempting to open/truncate it using standard file APIs will immediately fail with the exact same sharing violation.
 
-
 * **The Issue (Unflushed Logs Before Panic):** The code triggers `log.Warn` and then immediately constructs a string to violently crash the application.
  * **Why it's wrong:** Depending on the underlying `slog` handler's configuration, I/O writes can be buffered or asynchronous. Halting execution immediately after logging a warning guarantees that the critical telemetry leading up to the crash will likely remain stuck in memory and never flush to the log file.
 
-* **The Issue (`slog` Key-Value signature risk):** You call `log.Warn(..., SafeErr(ondeleteErr))`.
- * **Why it's wrong:** The `slog` package expects arguments to be paired `(key, value)` or to be explicitly strongly-typed `slog.Attr` objects. If `SafeErr` returns a raw `error` interface or string instead of an `slog.Attr`, it breaks the key-value pairing, causing `slog` to output a malformed `!BADKEY=` tag in your structured logs.
-
-* **The Issue (Redundant Build Tags):** You use both `//go:build windows` and `// +build windows`.
- * **Why it's wrong:** `// +build` is the legacy constraint system deprecated in Go 1.17. Since you are using `log/slog` (introduced in Go 1.21), maintaining the legacy tag is dead boilerplate that clutters the file.
-
 ### `main.go`
-* **The Issue (SemVer violation in version generation):** The initialization closure unconditionally appends `+dirty` to the version suffix if `isModified` is true.
- * **Why it's wrong:** Semantic Versioning (SemVer) specifications strictly permit only a single `+` character to denote build metadata. If `baseVersion` or the previously appended `vcsRevision` already contains build metadata (e.g., `v1.0.0+build123`), appending `+dirty` creates an invalid SemVer string (`v1.0.0+build123+dirty`) that will break downstream package managers or version-parsing libraries.
 
 * **The Issue (`windowFromPoint` behavior with overlays):** `tryBringForegroundToFrontAt` relies on `windowFromPoint(pt)` to identify the clicked window.
  * **Why it's wrong:** The Win32 `WindowFromPoint` API natively ignores hidden, disabled, or transparent windows (such as overlays with `HTTRANSPARENT`). If the user clicks over an invisible overlay that belongs to another application, `WindowFromPoint` will pierce through it and return the underlying window. If that underlying window happens to be your `fg` window, it will trigger an unintended Z-order promotion despite the user technically clicking the overlay.
 
-* **The Issue (Malformed Linter Directives):** You use the comment block `// CRAPitkillsallfromrevive//nolint:revive,var-declaration`.
- * **Why it's wrong:** Smashing arbitrary text, slashes, and linter directives together on the same line without whitespace violates standard parser rules for many Go linters (like `golangci-lint`), causing them to fail to recognize the directive entirely and throwing the exact warnings you are trying to suppress.
-
-* **The Issue (Commented-out Standard Library Imports):** `//"errors"` is left in the import block.
- * **Why it's wrong:** It is dead code clutter. Go's native tooling (like `goimports`) automatically manages dependencies and will strip unused imports, but it ignores commented-out lines, leaving them permanently stranded in the file.
 
 
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
@@ -120,8 +104,17 @@ dontdothis:
 worksasintended(don't fix):
 //* **The Issue (Thread blocking in `RetryFileOp`):** You wrap the truncation fallback in a `RetryFileOp` loop with `maxAttempts` and `backoff`.
 // * **Why it's wrong:** If this code executes synchronously on a thread responsible for message pumping, window hooks, or UI rendering (which the rest of your architecture implies), a blocking backoff loop will freeze the thread. This risks triggering a Windows "Not Responding" state or causing the OS to silently drop your global mouse/keyboard hooks due to timeout.
+//* **The Issue (SemVer violation in version generation):** The initialization closure unconditionally appends `+dirty` to the version suffix if `isModified` is true.
+// * **Why it's wrong:** Semantic Versioning (SemVer) specifications strictly permit only a single `+` character to denote build metadata. If `baseVersion` or the previously appended `vcsRevision` already contains build metadata (e.g., `v1.0.0+build123`), appending `+dirty` creates an invalid SemVer string (`v1.0.0+build123+dirty`) that will break downstream package managers or version-parsing libraries.
+//* **The Issue (Redundant Build Tags):** You use both `//go:build windows` and `// +build windows`.
+// * **Why it's wrong:** `// +build` is the legacy constraint system deprecated in Go 1.17. Since you are using `log/slog` (introduced in Go 1.21), maintaining the legacy tag is dead boilerplate that clutters the file.
 
 
 done:
 //* if I sent a window to back via winkey+MMB and I LMB on it, let's bring it to front, else I've to do winkey+shift+MMB to do that and it's annoying! I'm aware that it's still focused during the whole time, that's why LMB doesn't bring it to front, but we have to do it!
 
+hallucinated/hand-waved:
+//* **The Issue (`slog` Key-Value signature risk):** You call `log.Warn(..., SafeErr(ondeleteErr))`.
+// * **Why it's wrong:** The `slog` package expects arguments to be paired `(key, value)` or to be explicitly strongly-typed `slog.Attr` objects. If `SafeErr` returns a raw `error` interface or string instead of an `slog.Attr`, it breaks the key-value pairing, causing `slog` to output a malformed `!BADKEY=` tag in your structured logs.
+//* **The Issue (`logmsg` string formatting flaw):** The final panic message concatenates `"%s"` and `"Halting execution immediately..."` without any separating spaces or newlines.
+// * **Why it's wrong:** Whatever string is passed into `extraPanicMsg` will be jammed directly against the word "Halting". If `extraPanicMsg` is "Access Denied", the console output will print `Access DeniedHalting execution immediately...`, creating a malformed log entry.

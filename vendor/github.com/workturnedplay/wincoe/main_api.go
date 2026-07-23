@@ -2198,7 +2198,7 @@ func (fw *GenericSafeFileWriter) SafeWriteFile(filename string, data []byte, per
 			defer neutralizeOrPanic(
 				tmpName, perm, maxAttempts, backoffDuration, log, nil,
 				"Staging file cleanup failed completely!",
-				"Because the file contains non-zero bytes, the next server boot will panic.\n",
+				"Because the file contains non-zero bytes, the next server boot will panic.",
 			)
 		} else {
 			// --- FAILURE BRANCH ---
@@ -2672,6 +2672,10 @@ func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backof
 	if truncErr == nil {
 		log.Warn("ExtraSafety: successfully truncated staging file to 0 bytes as a fallback preservation step", slog.String("tempfilename", tmpName))
 		return
+	}
+
+	if extraPanicMsg == "" || !strings.HasSuffix(extraPanicMsg, "\n") {
+		extraPanicMsg += "\n"
 	}
 
 	// Absolute worst case scenario: Can't delete AND can't write/truncate an open file.
