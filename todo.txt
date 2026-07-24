@@ -1,10 +1,10 @@
 todo:
 
-* make a setting (in systray) that when true (false by default) it will unfocus the window that's sent to back via winkey+MMB, this way typing after it won't execute things in it even though it's out of view! So then unfocus will focus what? our own hwnd (which isn't really a window, iirc, it's hidden) or whichever window is now topmost in Z-order ?
+* see why when unfocusSentToBackWindow is true and i winkey+MMB send to back a focused window thus another one becomes focused, then on winkey+shift+MMB to bring back the first window(now unfocused) doesn't do it at all: no focus, no bring to front. When unfocusSentToBackWindow is false then works as expected because it only deals with the focused window (focus doesn't change).
 
 gemini-found issues (may not be a thing, double-check first):
 
-* in hookWorker's defer recover() block, we should probably just exit that thread rather than just select{}, so just tell the secondary defer aka hookWorkerSecondaryDefer when we're exitting normally? which is when those two "select {}" are hit.
+* in hookWorker's defer recover() block, we should probably just exit that thread(this means NOT os.Exit) rather than just select{}, so just tell the secondary defer aka hookWorkerSecondaryDefer when we're exitting normally? which is when those two "select {}" are hit.
 
 * **The Issue (`hookWorker`):** In the deferred panic bridge, if the worker encounters an unexpected crash and the main thread is unresponsive, the code executes a `select {}` block to hang forever.
 * **Why it's wrong:** Because this goroutine is bound to a physical thread via `runtime.LockOSThread()`, hanging forever permanently leaks that OS thread.
@@ -160,3 +160,6 @@ done:
     Alex Brainman (Go's Primary Windows Maintainer):
     "Do not call GetLastError directly from your code — Go runtime calls GetLastError for you behind the scenes. It is pointless to call GetLastError from your Go code, because GetLastError changes every time you make a new Windows API call... before calling the actual DLL routine, last error information is erased."
   " - via Gemini 3.6 Thinking
+
+//* make a setting (in systray) that when true (false by default) it will unfocus the window that's sent to back via winkey+MMB, this way typing after it won't execute things in it even though it's out of view! So then unfocus will focus what? our own hwnd (which isn't really a window, iirc, it's hidden) or whichever window is now topmost in Z-order ?
+
