@@ -703,10 +703,32 @@ type WindowMoveData struct {
 	// whether unfocusSentToBackWindow requires shifting focus to whatever
 	// is now the top-of-Z-order window afterward. Left false (the zero
 	// value) for every other origin (ordinary drag-move, resize, or the
-	// winkey+shift+MMB bring-to-front gesture, which never uses
-	// SWP_NOACTIVATE and so never strands focus on a backgrounded window
-	// in the first place).
+	// winkey+shift+MMB bring-to-front gesture -- that one uses its own
+	// FocusAfterBringToFront flag below instead, since it always wants
+	// target itself refocused, never some OTHER now-topmost window).
 	UnfocusAfterSendToBack bool
+
+	// FocusAfterBringToFront marks this entry as originating from a
+	// winkey+shift+MMB (bring-to-front) gesture (see
+	// tryPerformMMBGestureAt's shiftDown branch), so
+	// handleActualMoveOrResize explicitly refocuses Hwnd via
+	// forceForeground() once its Z-order change (always issued with
+	// SWP_NOACTIVATE for this gesture -- see Flags) succeeds. This gesture
+	// always sets this flag rather than relying on SetWindowPos's own
+	// implicit activation (omitting SWP_NOACTIVATE and hoping HWND_TOP
+	// alone both reorders AND focuses): that implicit path is gated by the
+	// same foreground-lock/focus-stealing-prevention rules as a bare
+	// SetForegroundWindow call, and empirically both silently fails to
+	// steal focus AND declines to fully promote the window to the top of
+	// the Z order when the target isn't already foreground -- exactly the
+	// situation unfocusSentToBackWindow creates (some other window now
+	// holds focus after an earlier send-to-back). forceForeground()
+	// already no-ops safely when Hwnd happens to already be foreground
+	// (the unfocusSentToBackWindow==false fallback path in
+	// tryPerformMMBGestureAt, where the target comes straight from
+	// GetForegroundWindow()), so setting this unconditionally for the
+	// gesture is correct regardless of that setting.
+	FocusAfterBringToFront bool
 }
 
 type KEYBDINPUT struct {
@@ -2331,8 +2353,20 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 			// but no other modifiers like ctrl or alt are down
 			// then we start the bring focused window to front gesture:
 			data.InsertAfter = HWND_TOP
-			data.Flags = SWP_NOMOVE | SWP_NOSIZE
-			// Bring to front, no activation, works only for the currently focused window which was sent to back before
+			// Always request SWP_NOACTIVATE here and handle activation
+			// ourselves afterward via forceForeground() (see
+			// FocusAfterBringToFront) instead of relying on SetWindowPos's
+			// own implicit activation: when hwnd isn't already the
+			// foreground window (exactly the case unfocusSentToBackWindow
+			// creates -- some OTHER window now holds focus after an
+			// earlier send-to-back), that implicit path is gated by the
+			// same foreground-lock/focus-stealing-prevention rules as a
+			// bare SetForegroundWindow call, and empirically fails to
+			// steal focus AND to fully promote hwnd to the very top of the
+			// Z order -- silently doing neither. See FocusAfterBringToFront's
+			// doc comment on WindowMoveData.
+			data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+			data.FocusAfterBringToFront = true
 		}
 		data.Hwnd = hwnd // window under cursor
 		data.X = 0       // int32, full range
@@ -3862,11 +3896,15 @@ var (
 var hookPanicPayload atomic.Value // We use atomic for thread-safety
 var mainAcknowledgedShutdown = make(chan struct{})
 
-// hookWorkerDone is closed by hookWorker's own teardown closure once it
-// reaches a genuine no-panic exit (WM_QUIT received normally, no recover()
-// payload at all). primary_defer() waits on this — after wincoe.WaitAnyKey()
-// — so hookWorker's OS thread has actually finished (both hooks unhooked,
-// goroutine returned) before logs get flushed and the process exits.
+// hookWorkerDone is closed by hookWorker's own teardown closure immediately
+// before its OS thread is actually about to finish — whether that's a
+// genuine no-panic exit (WM_QUIT received normally, no recover() payload at
+// all), or after recovering from a panic and completing its shutdown-
+// signaling sequence (see the Cross-Thread Panic Bridge closure's two
+// select-case branches, which now return instead of hanging in select{}
+// forever). In every case both hooks are already unhooked by the time this
+// closes. primary_defer() waits on this — after wincoe.WaitAnyKey() — so
+// logs don't get flushed and the process doesn't exit before that's true.
 // Mirrors the existing logWorkerDone/closeAndFlushLog() pattern.
 var hookWorkerDone = make(chan struct{})
 
@@ -3876,9 +3914,13 @@ var hookWorkerDone = make(chan struct{})
 // first — LIFO) panics again while handling the original panic.
 //
 // Unlike secondary_defer(), reaching this with recover() == nil is NOT a
-// bug here — it's the ordinary path once the panic-bridge closure's
-// clean-exit branch (see hookWorker's tail code) runs and returns normally
-// so this goroutine's OS thread can actually finish. Nothing to do then.
+// bug here — it's the ordinary path for every one of the panic-bridge
+// closure's own exit points: its entirely-panic-free tail case, AND (since
+// that closure no longer hangs forever in select{} — see its two
+// select-case branches) both of its recovered-panic return points too. In
+// all three, the closure's own recover() call already fully absorbed
+// whatever panic there was (or there was none to begin with) before it
+// returned, so there's nothing left propagating for this defer to catch.
 //
 // Deliberately uses directLoggerf/os.Exit instead of logf/closeAndFlushLog:
 // this runs on a different goroutine than main's own shutdown sequence
@@ -3965,25 +4007,29 @@ func hookWorker() {
 			logf("hookWorker is now waiting %d seconds for main to exit us...", waitForMainSeconds)
 			select {
 			case <-mainAcknowledgedShutdown: // Check if closed
-				logf("main() acknowledged shutdown. hookWorker is now waiting indefinitely for main to terminate the process.")
-				// We wait here forever. Why? Because we want the main thread's
-				// deinit() to be the one that finishes and potentially waits for
-				// the user's "Press a key or Enter" keypress. It then calls os.Exit there in primary_defer() in main() thread.
-				close(hookWorkerDone)
-				select {}
-
+				logf("main() acknowledged shutdown; hookWorker is finishing its own OS thread now instead of hanging it forever.")
 			case <-time.After(waitForMainSeconds * time.Second):
-				directLoggerf("CRITICAL: Main thread unresponsive after %d seconds. hookWorker will now hang forever", waitForMainSeconds)
-				// Main is frozen.
-				//we let it fall thru to below which means it hangs forever
+				directLoggerf("CRITICAL: Main thread unresponsive after %d seconds. hookWorker will finish its own OS thread anyway; primary_defer()'s already-bounded wait on hookWorkerDone covers main's side of this.", waitForMainSeconds)
 			}
-			// Panic path, main unresponsive: block forever, unchanged from
-			// before this change. hookWorkerDone is intentionally NOT closed
-			// here — primary_defer()'s wait on it will simply time out,
-			// which is the correct, already-bounded fallback for this case.
-			directLoggerf("hookWorker clean exit (but not quitting thread because main is hung or taking too long to exit)")
+			// Either way, hookWorker's own job is done here: both hooks are
+			// already unhooked (their unhook defers were registered right
+			// after SetWindowsHookEx succeeded, above -- they always run
+			// before this closure during LIFO unwind), and the shutdown
+			// signals (WM_QUIT/WM_CLOSE) have been posted. There's nothing
+			// left only this specific OS thread is still needed for, so
+			// actually finish the goroutine -- and let
+			// runtime.UnlockOSThread() release the OS thread
+			// runtime.LockOSThread() pinned it to -- instead of leaking
+			// that thread for the remaining lifetime of the process by
+			// hanging in select{} forever, as this used to do. Returning
+			// here is exactly as safe as the entirely-panic-free tail case
+			// below: recover() already consumed the original panic, and a
+			// deferred function returning normally afterward is standard,
+			// well-defined behavior -- hookWorkerSecondaryDefer's own
+			// recover() will see nil here, same as it does for that tail
+			// case (see its doc comment).
 			close(hookWorkerDone)
-			select {} //infinite wait, or else secondary_defer() will trigger, doneFIXME: find a better way to not os.Exit and still exit this thread. like tell secondary_defer to not os.Exit via a global bool?!
+			return
 		} //if recover
 
 		// True clean, no-panic exit: the message loop above returned because
@@ -4357,6 +4403,19 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 				}
 			} else {
 				logf("handleActualMoveOrResize: no suitable window found to refocus after sending HWND=0x%X to back", target)
+			}
+		} else if data.FocusAfterBringToFront {
+			// The bring-to-front Z-order change above succeeded (issued
+			// with SWP_NOACTIVATE, so it happened unconditionally
+			// regardless of whatever focus-stealing restrictions might
+			// otherwise silently veto SetWindowPos's own implicit
+			// activation -- see FocusAfterBringToFront's doc comment on
+			// WindowMoveData). Now explicitly focus target via the same
+			// reliable mechanism the rest of this codebase already relies
+			// on to steal focus. Safe no-op if target already happens to
+			// be foreground.
+			if !forceForeground(target) {
+				logf("handleActualMoveOrResize: failed to focus HWND=0x%X after bringing it to front via winkey+shift+MMB", target)
 			}
 		}
 	}

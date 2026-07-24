@@ -1,21 +1,5 @@
 todo:
 
-* see why when unfocusSentToBackWindow is true and i winkey+MMB send to back a focused window thus another one becomes focused, then on winkey+shift+MMB to bring back the first window(now unfocused) doesn't do it at all: no focus, no bring to front. When unfocusSentToBackWindow is false then works as expected because it only deals with the focused window (focus doesn't change).
-
-gemini-found issues (may not be a thing, double-check first):
-
-* in hookWorker's defer recover() block, we should probably just exit that thread(this means NOT os.Exit) rather than just select{}, so just tell the secondary defer aka hookWorkerSecondaryDefer when we're exitting normally? which is when those two "select {}" are hit.
-
-* **The Issue (`hookWorker`):** In the deferred panic bridge, if the worker encounters an unexpected crash and the main thread is unresponsive, the code executes a `select {}` block to hang forever.
-* **Why it's wrong:** Because this goroutine is bound to a physical thread via `runtime.LockOSThread()`, hanging forever permanently leaks that OS thread.
- Kept as is, but fix is in this: https://claude.ai/chat/87a23110-1da4-4b69-9ac4-1dac48e05480  so, I didn't do the watchdog because I don't want an os.Exit and clear/lose the console after 10 minutes of waiting at 'press a key' so...
-
-* **The Issue (`logf`):** If the background logging channel fills up and `logQuitClosed` flips to true, your logging function falls back to calling `internalLogger(finalMsg)` directly.
- * **Why it's wrong:** `logf` is heavily called from inside `mouseProc` (your `WH_MOUSE_LL` hook). `internalLogger` executes synchronous hardware I/O via `os.Stderr.Write` or `logFile.Sync()`. Executing blocking disk I/O directly on the thread executing a low-level mouse hook guarantees OS timeout drops, severe mouse stutter, and system-wide input lag.
- Claude says: "logf's synchronous internalLogger fallback during shutdown — reviewed, low risk, no change
- logQuitClosed only becomes true from closeAndFlushLog(), which runs from primary_defer()/secondary_defer()/hookWorkerSecondaryDefer() — all of which only fire after deinit() has sent WM_QUIT to the hook thread and its GetMessage loop has already broken. mouseProc/keyboardProc only get invoked reentrant during that loop, so by the time logQuitClosed is set, they shouldn't be firing anymore regardless of whether UnhookWindowsHookEx has literally completed yet — the loop not calling GetMessage anymore is what actually stops callback delivery. The bounded 2s timeout in primary_defer()'s wait doesn't change this, since it's the loop-exit (not the unhook call) that matters. Given the fix here already recommended in item 5 (the watchdog), I don't think a further change is warranted." But I didn't do the watchdog because I don't want an os.Exit and clear/lose the console after 10 minutes of waiting at 'press a key' so... but I do want a thread exit ie. thread/goroutine is done and just exits as in "return", which shouldn't cause the whole program to exit.
-
-
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
   Claude says: "DPI monitors mid-drag
   Since initDPIAwareness() sets winbollocks itself to Per-Monitor-V2 DPI awareness before any window creation, our own process gets real, unvirtualized physical-pixel coordinates from GetCursorPos/the mouse hook/GetWindowRect/SetWindowPos uniformly across all monitors, regardless of each monitor's scale factor or the target window's own DPI-awareness level — that's the entire point of being Per-Monitor-aware. So for ModeMove, newX = startRect.Left + (cursor.X - startCursor.X) stays internally consistent crossing DPI boundaries: nothing in that formula depends on scale factor, and SWP_NOSIZE means we never fight width/height regardless of what a monitor-crossing auto-DPI-resize (Windows does this transparently for DPI-unaware target apps) might do to the window's dimensions mid-drag.
@@ -33,6 +17,7 @@ notmybug:
 dontdothis:
 
 //* nitpicks to consider (done: 1, justanote: 2,3) https://gemini.google.com/app/b9951ecbdd3de184
+
 * do winkey+shift+MMB over the non-focused window bring it into focus and thus to top, just like it does for the currently focused window currently, but now we can use the thread-attach method of focusing a window (and maybe use the LMB click fallback here too?) and thus can bring it to zorder top afterwards! So then it removes bring only currently focused window to top which was on same key combo. I dno about this.
 
 //failedtodo//* other gestures like at least winkey+MMB should work when coming from higher UIPI and doing the MMB on the lower/normal UIPI window, currently only winkey+LMB and winkey+RMB have this feature.
@@ -63,6 +48,12 @@ worksasintended(don't fix):
 // * **Why it's wrong:** The Win32 `WindowFromPoint` API natively ignores hidden, disabled, or transparent windows (such as overlays with `HTTRANSPARENT`). If the user clicks over an invisible overlay that belongs to another application, `WindowFromPoint` will pierce through it and return the underlying window. If that underlying window happens to be your `fg` window, it will trigger an unintended Z-order promotion despite the user technically clicking the overlay.
 // Claude says: "windowFromPoint/tryBringForegroundToFrontAt piercing transparent overlays — reviewed, plausible but no concrete harm found
 // WindowFromPoint does hit-test past WS_EX_TRANSPARENT windows (yours or a third party's), so this is a real, documented behavior. But tryBringForegroundToFrontAt only acts when the resolved window is already the current foreground window, doing a non-activating (SWP_NOACTIVATE-style) Z-order restack — I can't construct a scenario where mis-attributing "what was visually clicked" through a transparent overlay to the already-focused window underneath produces an actually-wrong outcome, given how narrowly the result is used. Flagging as informational rather than something to change unless you've actually observed a misfire."
+
+//* **The Issue (`logf`):** If the background logging channel fills up and `logQuitClosed` flips to true, your logging function falls back to calling `internalLogger(finalMsg)` directly.
+ * **Why it's wrong:** `logf` is heavily called from inside `mouseProc` (your `WH_MOUSE_LL` hook). `internalLogger` executes synchronous hardware I/O via `os.Stderr.Write` or `logFile.Sync()`. Executing blocking disk I/O directly on the thread executing a low-level mouse hook guarantees OS timeout drops, severe mouse stutter, and system-wide input lag.
+ Claude says: "logf's synchronous internalLogger fallback during shutdown — reviewed, low risk, no change
+ logQuitClosed only becomes true from closeAndFlushLog(), which runs from primary_defer()/secondary_defer()/hookWorkerSecondaryDefer() — all of which only fire after deinit() has sent WM_QUIT to the hook thread and its GetMessage loop has already broken. mouseProc/keyboardProc only get invoked reentrant during that loop, so by the time logQuitClosed is set, they shouldn't be firing anymore regardless of whether UnhookWindowsHookEx has literally completed yet — the loop not calling GetMessage anymore is what actually stops callback delivery. The bounded 2s timeout in primary_defer()'s wait doesn't change this, since it's the loop-exit (not the unhook call) that matters. Given the fix here already recommended in item 5 (the watchdog), I don't think a further change is warranted." But I didn't do the watchdog because I don't want an os.Exit and clear/lose the console after 10 minutes of waiting at 'press a key' so... but I do want a thread exit ie. thread/goroutine is done and just exits as in "return", which shouldn't cause the whole program to exit.
+
 
 hallucinated/hand-waved:
 
@@ -162,4 +153,11 @@ done:
   " - via Gemini 3.6 Thinking
 
 //* make a setting (in systray) that when true (false by default) it will unfocus the window that's sent to back via winkey+MMB, this way typing after it won't execute things in it even though it's out of view! So then unfocus will focus what? our own hwnd (which isn't really a window, iirc, it's hidden) or whichever window is now topmost in Z-order ?
+
+//* see why when unfocusSentToBackWindow is true and i winkey+MMB send to back a focused window thus another one becomes focused, then on winkey+shift+MMB to bring back the first window(now unfocused) doesn't do it at all: no focus, no bring to front. When unfocusSentToBackWindow is false then works as expected because it only deals with the focused window (focus doesn't change).
+
+//* in hookWorker's defer recover() block, we should probably just exit that thread(this means NOT os.Exit) rather than just select{}, so just tell the secondary defer aka hookWorkerSecondaryDefer when we're exitting normally? which is when those two "select {}" are hit.
+//* **The Issue (`hookWorker`):** In the deferred panic bridge, if the worker encounters an unexpected crash and the main thread is unresponsive, the code executes a `select {}` block to hang forever.
+//* **Why it's wrong:** Because this goroutine is bound to a physical thread via `runtime.LockOSThread()`, hanging forever permanently leaks that OS thread.
+// Kept as is, but fix is in this: https://claude.ai/chat/87a23110-1da4-4b69-9ac4-1dac48e05480  so, I didn't do the watchdog because I don't want an os.Exit and clear/lose the console after 10 minutes of waiting at 'press a key' so...
 
