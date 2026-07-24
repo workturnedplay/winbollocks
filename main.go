@@ -697,15 +697,21 @@ type WindowMoveData struct {
 	ResizeZone  int
 
 	// UnfocusAfterSendToBack marks this entry as originating from a
-	// winkey+MMB (no shift) send-to-back gesture (see
-	// tryPerformMMBGestureAt's !shiftDown branch), so
-	// handleActualMoveOrResize knows it's safe -- and intended -- to check
-	// whether unfocusSentToBackWindow requires shifting focus to whatever
-	// is now the top-of-Z-order window afterward. Left false (the zero
-	// value) for every other origin (ordinary drag-move, resize, or the
-	// winkey+shift+MMB bring-to-front gesture -- that one uses its own
-	// FocusAfterBringToFront flag below instead, since it always wants
-	// target itself refocused, never some OTHER now-topmost window).
+	// winkey+MMB (no shift) send-to-back gesture whose target actually held
+	// keyboard focus at the moment of the gesture (see
+	// tryPerformMMBGestureAt's !shiftDown branch and its
+	// targetWasFocusedBeforeSendToBack local), so handleActualMoveOrResize
+	// knows it's safe -- and intended -- to check whether
+	// unfocusSentToBackWindow requires shifting focus to whatever is now
+	// the top-of-Z-order window afterward. Left false (the zero value) for
+	// every other case: ordinary drag-move, resize, the winkey+shift+MMB
+	// bring-to-front gesture (which uses its own FocusAfterBringToFront
+	// flag below instead, since it always wants target itself refocused,
+	// never some OTHER now-topmost window), AND a winkey+MMB send-to-back
+	// gesture whose target was NOT already focused -- sending an
+	// already-unfocused "side window" to the back must never disturb
+	// whatever unrelated window actually holds focus, since SWP_NOACTIVATE
+	// already guarantees the OS itself won't touch it either.
 	UnfocusAfterSendToBack bool
 
 	// FocusAfterBringToFront marks this entry as originating from a
@@ -2226,12 +2232,26 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 	var hwnd windows.Handle
 	useTracking := unfocusSentToBackWindow.Load()
 
+	// targetWasFocusedBeforeSendToBack records whether hwnd held keyboard
+	// focus at the moment this gesture fired, computed unconditionally
+	// (independent of useTracking/unfocusSentToBackWindow) so it stays
+	// correct even if that setting gets toggled between now and whenever
+	// handleActualMoveOrResize actually processes the enqueued data below.
+	// Consumed via data.UnfocusAfterSendToBack: sending a window that was
+	// NOT already focused to the back of the Z-order must never disturb
+	// whatever unrelated window actually holds focus (SWP_NOACTIVATE
+	// already guarantees the OS itself won't touch it) -- only a window
+	// that genuinely held focus before being sent back needs its focus
+	// explicitly reconciled afterward.
+	var targetWasFocusedBeforeSendToBack bool
+
 	if !shiftDown {
 		// winkey + MMB -> send window under cursor to bottom of Z-order
 		hwnd = windowFromPoint(pt) // window under cursor
-		if useTracking && hwnd != 0 {
-			// ONLY remember this window if unfocusSentToBackWindow is true AND it currently has focus
-			if isWindowForeground(hwnd) {
+		if hwnd != 0 {
+			targetWasFocusedBeforeSendToBack = isWindowForeground(hwnd)
+			if useTracking && targetWasFocusedBeforeSendToBack {
+				// ONLY remember this window if unfocusSentToBackWindow is true AND it currently has focus
 				lastSentToBackHwnd.Store(uintptr(hwnd))
 			}
 		}
@@ -2283,7 +2303,7 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 			// Do NOT fall back to GetForegroundWindow(), because the active foreground
 			// window is currently sitting on TOP of the Z-order!
 			if hwnd == 0 {
-				logf("winkey+shift+MMB: no valid previously focused sent-to-back window to restore")
+				logf("winkey+shift+MMB: no valid previously focused sent-to-back window to restore (or it's focused already from last time)")
 				return false, false
 			}
 		} else {
@@ -2342,10 +2362,14 @@ func tryPerformMMBGestureAt(pt POINT, shiftDown bool) (started, bypassed bool) {
 			data.InsertAfter = HWND_BOTTOM
 			data.Flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
 			// SWP_NOACTIVATE above means hwnd keeps keyboard focus even
-			// though it's now behind everything else; flag this entry so
-			// handleActualMoveOrResize can optionally shift focus away
-			// from it afterward -- see unfocusSentToBackWindow.
-			data.UnfocusAfterSendToBack = true
+			// though it's now behind everything else -- but only if hwnd
+			// actually held focus to begin with (see
+			// targetWasFocusedBeforeSendToBack above). Sending an
+			// already-unfocused "side window" to the back changes nothing
+			// about focus at all, so only flag this entry for
+			// handleActualMoveOrResize's post-move refocus reconciliation
+			// when there's genuinely something to reconcile.
+			data.UnfocusAfterSendToBack = targetWasFocusedBeforeSendToBack
 		} else {
 			// winkey + shift + MMB → bring focused window to top
 
@@ -4768,7 +4792,8 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				if unfocusSentToBackWindow.Load() {
 					unfocusSentToBackFlags |= MF_CHECKED
 				}
-				unfocusSentToBackText := "Shift focus away from a window sent to back via winkey+MMB (to whichever window is now on top), so typing afterward doesn't go to it unseen"
+				//ie. the meaning of winkey+shift+MMB changes when this is true!
+				unfocusSentToBackText := "Switch the focus from the sent-to-back window(but can bring it back with winkey+shift+MMB) to whichever window is now on top"
 				appendMenuChecked(hMenu, unfocusSentToBackFlags,
 					MENU_TOGGLE_UNFOCUS_SENT_TO_BACK, unfocusSentToBackText)
 			}
