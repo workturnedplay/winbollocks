@@ -1,5 +1,7 @@
 todo:
 
+* should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
+
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
   Claude says: "DPI monitors mid-drag
   Since initDPIAwareness() sets winbollocks itself to Per-Monitor-V2 DPI awareness before any window creation, our own process gets real, unvirtualized physical-pixel coordinates from GetCursorPos/the mouse hook/GetWindowRect/SetWindowPos uniformly across all monitors, regardless of each monitor's scale factor or the target window's own DPI-awareness level — that's the entire point of being Per-Monitor-aware. So for ModeMove, newX = startRect.Left + (cursor.X - startCursor.X) stays internally consistent crossing DPI boundaries: nothing in that formula depends on scale factor, and SWP_NOSIZE means we never fight width/height regardless of what a monitor-crossing auto-DPI-resize (Windows does this transparently for DPI-unaware target apps) might do to the window's dimensions mid-drag.

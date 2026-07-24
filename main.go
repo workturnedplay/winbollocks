@@ -1010,7 +1010,8 @@ var bringToFrontOnBackgroundClick atomic.Bool
 // goes to the window you just tried to banish, not to whatever you can
 // actually see. When enabled, handleActualMoveOrResize walks the Z-order
 // (see findNewForegroundCandidateAfterSendToBack) to find whichever window
-// is now topmost and gives it focus instead. Off by default: most people
+// is now topmost and gives it focus instead.
+// Off by default(Edit:  Switched to on by default!): most people
 // don't mind the quirk, and focusing an arbitrary other-process window
 // carries the same small residual risk any of this codebase's other focus
 // attempts do (e.g. Windows' own focus-stealing prevention could still
@@ -5918,7 +5919,7 @@ func init() {
 	//Default to true for the LMB click fallback
 	bringToFrontOnBackgroundClick.Store(true)
 
-	unfocusSentToBackWindow.Store(false) // default off; opt-in -- see its doc comment
+	unfocusSentToBackWindow.Store(true) // default on;-- see its doc comment
 
 	useThreadAttachInputForFocus.Store(false) // default false because for some reason it doesn't seem needed right now 17 July 2026, for me, tho I coulda sworn it was, before!
 
