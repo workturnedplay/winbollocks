@@ -39,6 +39,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -147,6 +148,13 @@ var (
 	maxChannelFillForMoveEvents atomic.Uint64 // To track how "full" it got
 	maxChannelFillForLogEvents  atomic.Uint64 // To track how "full" it got
 
+	// logDepthCASFailures counts times logf's high-water-mark CAS loop
+	// exhausted all attemptAtomicSwapThisManyTimes retries. Telemetry must
+	// never be allowed to crash the app: losing one high-water-mark sample
+	// under extreme contention is a rounding error, not a correctness
+	// issue, so this is counted (and reported once at shutdown, alongside
+	// the two counters above) instead of panicking.
+	logDepthCASFailures atomic.Uint64
 )
 
 func init() {
@@ -285,7 +293,13 @@ var (
 	procPostThreadMessage = wincoe.NewBoundProc(user32, "PostThreadMessageW", wincoe.CheckBool)
 
 	// procGetLastError = kernel32.NewProc("GetLastError")
-	//procGetLastError = wincoe.NewBoundProc(kernel32, "GetLastError", wincoe.CheckNone) // shouldn't have to use this?
+
+	// // procGetLastError holds the lazy proc handle for kernel32.dll's GetLastError.
+	// //
+	// // Deprecated: Do not call procGetLastError.Call() directly. Go's runtime wipes
+	// // LastError prior to executing DLL calls, causing it to return 0. Use the 3rd
+	// // return argument (err) from other proc.Call() invocations instead.
+	// procGetLastError = wincoe.NewBoundProc(kernel32, "GetLastError", wincoe.CheckNone) //don't use, see: https://github.com/golang/go/issues/41220
 
 	// procSendInput = user32.NewProc("SendInput")
 	// procLoadIcon  = user32.NewProc("LoadIconW")
@@ -347,7 +361,7 @@ var (
 
 	// GetWindowLongPtrW returns LONG_PTR (can be 0 legitimately); we treat non-zero as "success" for most usages
 	procGetWindowLongPtrW = wincoe.NewBoundProc(user32, "GetWindowLongPtrW", wincoe.CheckNone)
-	procSetLastError      = wincoe.NewBoundProc(kernel32, "SetLastError", wincoe.CheckNone) // void-like
+	//procSetLastError      = wincoe.NewBoundProc(kernel32, "SetLastError", wincoe.CheckNone) // void-like, useless call, don't use! it's always nil on beginning of each .Call() anyway, as per: https://github.com/golang/go/issues/41220
 	// procGetWindowLongPtrW = user32.NewProc("GetWindowLongPtrW")
 	// procSetLastError      = kernel32.NewProc("SetLastError")
 
@@ -373,7 +387,17 @@ var (
 	procGetClassName = wincoe.NewBoundProc(user32, "GetClassNameW", wincoe.CheckZero) // returns length
 
 	// procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
-	procInternalGetWindowText = wincoe.NewBoundProc(user32, "InternalGetWindowText", wincoe.CheckStringLength) // returns length
+	// procInternalGetWindowText = user32.NewProc("InternalGetWindowText")
+	// Bound with CheckNone rather than CheckStringLength: InternalGetWindowText
+	// can legitimately return 0 for an empty title WITHOUT calling
+	// SetLastError, so WinCall's automatically-captured callErr may just be
+	// stale cruft left over from some unrelated earlier call -- CheckStringLength
+	// would then misreport a normal empty title as a failure. getWindowTextFast
+	// instead clears the error state itself immediately before the call and
+	// checks GetLastError() freshly afterward, the same pattern getWindowLongPtr
+	// already uses for the identical class of "0 is valid, GetLastError is the
+	// only real signal" API.
+	procInternalGetWindowText = wincoe.NewBoundProc(user32, "InternalGetWindowText", wincoe.CheckNone) // returns length
 
 	// procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
 	procGetConsoleWindow = wincoe.NewBoundProc(kernel32, "GetConsoleWindow", wincoe.CheckNone)
@@ -471,6 +495,7 @@ const (
 
 const (
 	WM_MBUTTONDOWN = 0x0207
+	WM_MBUTTONUP   = 0x0208
 	HWND_BOTTOM    = windows.Handle(uintptr(1)) // good
 	//HWND_TOP       = ^uintptr(1) // (HWND)-1  bad AI
 	HWND_TOP = windows.Handle(uintptr(0)) // good
@@ -773,6 +798,29 @@ var (
 	//The Problem: winGestureUsed, capturing, and resizing manage your state machine. They are flipped by keyboardProc/mouseProc but cleared by hardReset/softReset (which can be triggered by the Main Thread via winEventProc).
 	// used exclusively to know when to inject shift key tap (shiftdown+shiftUP) at the point when physical winkeyUP aka winUP is detected //noTODO: maybe remove because we do it(shifttap) now at gesture start
 	winGestureUsed atomic.Bool
+
+	// lmbDownSwallowed / rmbDownSwallowed / mmbDownSwallowed track whether we
+	// ourselves swallowed the corresponding real WM_*BUTTONDOWN event via our
+	// winkey+button gesture-start handling (see mouseProc's WM_LBUTTONDOWN /
+	// WM_RBUTTONDOWN / WM_MBUTTONDOWN cases), independent of activeSession's
+	// own lifecycle. activeSession can be cleared for reasons unrelated to
+	// whether the ORIGINATING down-event was swallowed (winkey released
+	// mid-drag triggers hardReset from WM_MOUSEMOVE; a gesture that failed to
+	// start at all -- see tryBeginMoveGestureAt's "Invalid window" case --
+	// still swallows the down but never creates a session in the first place;
+	// a WTS lock/unlock cycle discards a stale session in wndProc). Using
+	// activeSession!=nil as a proxy for "should the matching up be swallowed
+	// too" is therefore unreliable and can desync a target app's button state
+	// (a swallowed down with a passed-through up looks, to that app, exactly
+	// like an up with no preceding down -- stuck hover/selection states or
+	// spurious clicks). These flags are the single source of truth for that
+	// decision instead, and are NOT set for missed-gesture-recovery sessions
+	// (viaMissedGestureRecovery): those exist specifically because our hook
+	// never SAW the real down (a higher-integrity window had focus at the
+	// time), so the real up must reach the target normally, same as today.
+	lmbDownSwallowed atomic.Bool
+	rmbDownSwallowed atomic.Bool
+	mmbDownSwallowed atomic.Bool
 )
 
 var (
@@ -782,6 +830,15 @@ var (
 	trayIcon    NOTIFYICONDATA
 	mainMsgHwnd windows.Handle
 )
+
+// trayIconMu guards all reads/writes to trayIcon (including the
+// Shell_NotifyIconW calls that read it by pointer). showTrayInfo can run on
+// the hook thread (via startDrag) while initTray/cleanupTray and
+// showTrayInfo's other callers (via handleActualMoveOrResize) run on the
+// main thread -- without this, concurrent unsynchronized mutation of this
+// shared NOTIFYICONDATA struct from two threads risks memory corruption and
+// malformed Shell_NotifyIconW calls.
+var trayIconMu sync.Mutex
 
 type DragMode int
 
@@ -1173,6 +1230,24 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 		//	logf("done injectShiftTapThenWinUp")
 	}
 }
+
+// mouseInputView reinterprets the union-emulating Ki field of an INPUT as a
+// MOUSEINPUT. Ki is declared as the smaller KEYBDINPUT (24 bytes); INPUT
+// adds an explicit trailing [8]byte padding field right after it so the
+// combined space (Ki + that padding) matches MOUSEINPUT's 32 bytes -- see
+// INPUT's own doc comment. This is Go's closest equivalent to reinterpreting
+// a C union member, since Go has no native union type. Safety here rests
+// entirely on assertStructSizes()'s startup check that unsafe.Sizeof(INPUT{})
+// is exactly 40: since Go lays out struct fields in declaration order with
+// no reordering, that check guarantees the 32 bytes starting at &input.Ki
+// really do extend all the way to INPUT's end, with nothing beyond it. Any
+// future edit to INPUT/KEYBDINPUT/MOUSEINPUT's fields that broke this
+// invariant would panic there, at startup, before this function is ever
+// reached.
+func mouseInputView(input *INPUT) *MOUSEINPUT {
+	return (*MOUSEINPUT)(unsafe.Pointer(&input.Ki))
+}
+
 func injectLMBClick() {
 	inputs := []INPUT{
 		{
@@ -1186,8 +1261,10 @@ func injectLMBClick() {
 	}
 
 	// Fill the union as MOUSEINPUT
-	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
-	(*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
+	// (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
+	// (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki)).DwFlags = MOUSEEVENTF_LEFTUP
+	mouseInputView(&inputs[0]).DwFlags = MOUSEEVENTF_LEFTDOWN
+	mouseInputView(&inputs[1]).DwFlags = MOUSEEVENTF_LEFTUP
 
 	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
 
@@ -1344,17 +1421,18 @@ func injectLMBClickAtCoords(x, y int32) {
 	}
 
 	// Move to target location and press LMB.
-	m0 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki))
+	// m0 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki))
+	m0 := mouseInputView(&inputs[0])
 	m0.Dx = normalizedX
 	m0.Dy = normalizedY
-	m0.DwFlags =
-		MOUSEEVENTF_ABSOLUTE |
-			MOUSEEVENTF_VIRTUALDESK |
-			MOUSEEVENTF_MOVE |
-			MOUSEEVENTF_LEFTDOWN
+	m0.DwFlags = MOUSEEVENTF_ABSOLUTE |
+		MOUSEEVENTF_VIRTUALDESK |
+		MOUSEEVENTF_MOVE |
+		MOUSEEVENTF_LEFTDOWN
 
 	// Release LMB at the same location.
-	m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
+	// m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
+	m1 := mouseInputView(&inputs[1])
 	m1.Dx = normalizedX
 	m1.Dy = normalizedY
 	m1.DwFlags =
@@ -1424,7 +1502,8 @@ func injectLMBDown() {
 	}
 
 	// Fill the union as MOUSEINPUT
-	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
+	// (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
+	mouseInputView(&inputs[0]).DwFlags = MOUSEEVENTF_LEFTDOWN
 
 	//Your inject (MOUSEEVENTF_LEFTDOWN): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
 
@@ -1468,14 +1547,16 @@ func initDPIAwareness() {
 	if procSetProcessDpiAwareness.Find() == nil {
 		res2 := procSetProcessDpiAwareness.Call(PROCESS_PER_MONITOR_DPI_AWARE)
 		if res2.Failed() {
-			// SetProcessDpiAwareness returns an HRESULT, not a Win32 errno.
-			// E_ACCESSDENIED (0x80070005) means DPI is already locked; this is
-			// the HRESULT equivalent of the ERROR_ACCESS_DENIED check above.
-			// Note: windows.ERROR_ACCESS_DENIED (errno 5) != windows.Errno(0x80070005),
-			// so we must compare R1 directly rather than using ErrIs.
-			const hresultEAccessDenied uintptr = 0x80070005
+			// uint32, not uintptr: on 64-bit Windows the upper 32 bits of a
+			// 32-bit HRESULT return value can be sign-extension garbage
+			// (the exact same reasoning CheckHRESULT elsewhere in this
+			// codebase already applies via int32(r1) < 0) -- comparing the
+			// full-width res2.R1 directly against this constant would
+			// silently miss the match if 0x80070005 came back sign-extended
+			// as 0xFFFFFFFF80070005.
+			const hresultEAccessDenied uint32 = 0x80070005
 			//The hresultEAccessDenied constant is intentionally local to the function rather than a package-level constant, since it's a HRESULT interpretation of an API that's an exception to the project's general use of CheckBool/CheckErrno.
-			if res2.R1 == hresultEAccessDenied {
+			if uint32(res2.R1) == hresultEAccessDenied { // #nosec: G115
 				logf("DPI awareness (shcore fallback) already set before main() (application manifest?); skipping.")
 				return
 			}
@@ -1611,12 +1692,46 @@ func appendMenuChecked(hMenu, flags, id uintptr, textStr string) {
 	}
 }
 
+// copyUTF16Truncated copies s (as UTF-16) into dst, guaranteeing dst ends up
+// null-terminated even when s must be truncated to fit. A bare
+// copy(dst, windows.StringToUTF16(s)) can silently drop the terminator
+// entirely if the encoded string (plus its trailing 0) is >= len(dst):
+// copy() only copies min(len(dst), len(src)) elements, chopping off exactly
+// the null terminator in that case and leaving Windows to read past dst's
+// end into whatever struct field follows it until it happens across a
+// stray zero -- garbage tray text at best, explorer.exe misbehaving at
+// worst.
+func copyUTF16Truncated(dst []uint16, s string) {
+	if len(dst) == 0 {
+		return // nothing we can safely write
+	}
+	encoded, err := windows.UTF16FromString(s)
+	if err != nil {
+		// s contains an embedded NUL byte; UTF16FromString refuses to
+		// encode it. Fall back to an explicitly empty, safely
+		// null-terminated string rather than leaving dst's previous
+		// (possibly stale or un-terminated) contents in place.
+		dst[0] = 0
+		return
+	}
+	if len(encoded) > len(dst) {
+		// Truncate the STRING content, but always keep the last slot as the
+		// terminator -- never truncate away the terminator itself.
+		copy(dst, encoded[:len(dst)-1])
+		dst[len(dst)-1] = 0
+		return
+	}
+	copy(dst, encoded)
+}
+
 const IDI_APPLICATION = 32512
 
 func initTray() error {
 	if mainMsgHwnd == 0 {
 		return fmt.Errorf("main message window is not initialized")
 	}
+	trayIconMu.Lock()
+	defer trayIconMu.Unlock()
 
 	trayIcon.HWnd = mainMsgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
@@ -1636,7 +1751,8 @@ func initTray() error {
 	// Leaving it as 0 defaults to the legacy behavior that handles tooltips automatically.
 
 	tipText := selfName + " " + GetVersion()
-	copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
+	//copy(trayIcon.SzTip[:], windows.StringToUTF16(tipText))
+	copyUTF16Truncated(trayIcon.SzTip[:], tipText)
 
 	// 1. Add the tray icon
 	res2 := procShellNotifyIcon.Call(NIM_ADD, uintptr(unsafe.Pointer(&trayIcon)))
@@ -1666,6 +1782,8 @@ func cleanupTray() {
 		// Never initialized or window creation failed — nothing to clean
 		return
 	}
+	trayIconMu.Lock()
+	defer trayIconMu.Unlock()
 
 	// Use the same trayIcon struct from initTray
 	trayIcon.UFlags = 0 // NIM_DELETE ignores most fields, but set to be safe
@@ -1682,6 +1800,8 @@ func cleanupTray() {
 
 func showTrayInfo(title, msg string) {
 	//FIXME: this call should be rate-limited, or the callers of it should be.
+	trayIconMu.Lock()
+	defer trayIconMu.Unlock()
 
 	logf("systray info: %s", msg)
 	//the tray notification shows differently than a tooltip on win11 (didn't test it on anything else tho)
@@ -1691,8 +1811,10 @@ func showTrayInfo(title, msg string) {
 	// because it is already turned on in System->Notifications, Notifications from apps and other senders
 	trayIcon.UFlags |= NIF_INFO
 	trayIcon.UTimeoutOrVersion = 5000 //5sec, though Win11 ignores it and uses system accessibility settings)
-	copy(trayIcon.SzInfoTitle[:], windows.StringToUTF16(title))
-	copy(trayIcon.SzInfo[:], windows.StringToUTF16(msg))
+	// copy(trayIcon.SzInfoTitle[:], windows.StringToUTF16(title))
+	// copy(trayIcon.SzInfo[:], windows.StringToUTF16(msg))
+	copyUTF16Truncated(trayIcon.SzInfoTitle[:], title)
+	copyUTF16Truncated(trayIcon.SzInfo[:], msg)
 	if res1 := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon))); res1.Failed() {
 		logf("Failed to update tray icon info: %v", res1.Err)
 	}
@@ -2330,9 +2452,18 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 		res1 := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		if res1.Failed() {
 			logf("WM_PAINT in overlayWndProc, BeginPaint() failed, err: %v, ignoring the rest of the paint.", res1.Err)
-			return 0 //handled
+			return 0 //handled; BeginPaint itself failed, so there's no DC/update region for EndPaint to release.
 		}
 		hdc := res1.R1
+		// EndPaint MUST run no matter which step below fails, or the update
+		// region never gets validated/cleared and Windows will keep
+		// re-posting WM_PAINT the instant the queue is idle -- a 100%-CPU
+		// repaint storm on whichever thread pumps this window's messages.
+		defer func() {
+			if res7 := procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps))); res7.Failed() {
+				logf("WM_PAINT in overlayWndProc, EndPaint() failed, err: %v", res7.Err)
+			}
+		}()
 
 		var rect RECT
 		res2 := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
@@ -2378,11 +2509,7 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 			return 0 //handled
 		}
 
-		if res7 := procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps))); res7.Failed() {
-			logf("WM_PAINT in overlayWndProc, EndPaint() failed, err: %v", res7.Err)
-			return 0 //handled; keep this dup line, in case I insert something between this and the last return in the block, and i forget to put one return here
-		}
-		return 0 //handled
+		return 0 //handled; the deferred EndPaint above runs regardless of how we got here.
 	} //if WM_PAINT
 
 	res8 := procDefWindowProc.Call(hwnd, uintptr(msg), wParam, lParam) //DefWindowProcW returns LRESULT.
@@ -2604,7 +2731,20 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 		// If it fills the screen AND has a caption, it's just a normal maximized window
 		// (likely bleeding over the edges due to an auto-hidden taskbar).
 		if (style & WS_CAPTION) == WS_CAPTION {
-			return false
+			//Checking GetWindowPlacement's ShowCmd (via
+			// isMaximized, already used elsewhere in this file) is more reliable
+			// than inferring from the WS_CAPTION style bit: some borderless-fullscreen
+			// games/apps hide their frame via other means (SetWindowRgn, DWM
+			// composition attributes) while still leaving WS_CAPTION set in their
+			// style, which would make a WS_CAPTION-only check false-negative --
+			// failing to bypass gestures for exactly the games this feature targets.
+			// A window that reached SW_MAXIMIZE natively (double-click titlebar,
+			// Win+Up, snap-to-maximize) is the "just a normal maximized window"
+			// case (its rect often bleeds slightly past the monitor edges due to
+			// the invisible resize border, which isSpanningMonitor's >=/<= already
+			// tolerates); anything else that still spans the monitor is treated as
+			// fullscreen (exclusive or borderless), regardless of its style bits.
+			return !isMaximized(hwnd)
 		}
 	}
 
@@ -2715,27 +2855,31 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 		return 0, fmt.Errorf("getWindowLongPtr: hwnd is 0")
 	}
 
-	/*
-			The documented pattern is:
+	// //to prevent preemption and running of another goroutine between procSetLastError and procGetWindowLongPtrW, must LockOsThread()
+	// runtime.LockOSThread()
+	// defer runtime.UnlockOSThread()
+	// /*
+	// 		The documented pattern is:
 
-		Clear last error.
-		Call GetWindowLongPtrW.
-		If return value is 0, call GetLastError.
-		If error is non-zero → failure.
-		If error is zero → success, because the actual value was legitimately zero.
-	*/
+	// 	Clear last error.
+	// 	Call GetWindowLongPtrW.
+	// 	If return value is 0, call GetLastError.
+	// 	If error is non-zero → failure.
+	// 	If error is zero → success, because the actual value was legitimately zero.
+	// */
 
-	// Clear last error so we can detect real failure
-	//windows.SetLastError(0)
-	// Clear last error so we can detect real failure
-	_ = procSetLastError.Call(0)
-	//windows.SetLastError(0)
+	// // Clear last error so we can detect real failure
+	// //windows.SetLastError(0)
+	// // Clear last error so we can detect real failure
+	// _ = procSetLastError.Call(0) //You scrubbed the thread's error state clean. Since lasterror is stored in TLS aka thread local storage
+	// //windows.SetLastError(0)
 
+	//as per https://github.com/golang/go/issues/41220 there's no need to call setlasterror because it happens automatically!
 	res1 := procGetWindowLongPtrW.Call( //it's a CheckNone so res1.Err is nil
 		uintptr(hwnd),
 		// #nosec G115 -- safe: Win32 ABI expects negative offsets to be cast to uintptr
 		uintptr(index),
-	)
+	) //Go executes the C code and atomically grabs LastError before anything else can touch it. as the 3rd arg well as res1.CallStatus !
 	ret := res1.R1
 	//Do NOT trust the third return from .Call
 	//You did the right thing ignoring it. For many Win32 APIs it is unreliable.
@@ -2744,7 +2888,8 @@ func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	// GetWindowLongPtr can legally return 0 even on success.
 	// The only reliable failure signal is GetLastError.
 	if ret == 0 {
-		lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far!
+		//lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far! NO, this is always 0/nil because each syscall(which this is) from Go will setlasterr(0) first, as per https://github.com/golang/go/issues/41220
+		lastErr := res1.CallStatus
 		/*
 				Why windows.GetLastError() is Tricky
 			In Go's golang.org/x/sys/windows package, windows.GetLastError() returns an error interface type (under the hood, it’s a windows.Errno).
@@ -3022,7 +3167,8 @@ func mouseProc(nCode int, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				logf("stutter8 %d ns", nowDiff.Nanoseconds())
 			}
 
-			return 1 // swallow LMB
+			lmbDownSwallowed.Store(true) // we're about to eat this down; the matching up must be eaten too, regardless of what happens to activeSession in between.
+			return 1                     // swallow LMB
 		} else if !winDown {
 			tryBringForegroundToFrontAt(info.Pt)
 		} // the 'if' in LMB
@@ -3395,52 +3541,47 @@ func mouseProc(nCode int, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// }
 
 	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
-		session := activeSession.Load()
-		if session == nil {
-			break // No drag or resize is active, do nothing!
+		if session := activeSession.Load(); session != nil && session.mode == ModeMove {
+			// End the drag regardless of whether we owe a swallow below (see
+			// lmbDownSwallowed's doc comment): a real LMB-up always ends an
+			// active ModeMove session, whether or not its own matching down
+			// was one we swallowed (a recovery session's real down reached
+			// the target normally, but this real up still ends OUR side of
+			// the drag). This also means when winkey goes UP it will make
+			// sure from keyboardProc that start menu doesn't pop up!
+			softReset(true)
 		}
-		if session.mode == ModeMove {
-			viaRecovery := session.viaMissedGestureRecovery
-			softReset(true) // this means that when winkey goes UP it will make sure from keyboardProc that start menu doesn't pop up!
-			if viaRecovery {
-				// This session's LMB-down was never seen/swallowed by us, so the
-				// target's own state (e.g. a console mid-selection) genuinely
-				// needs this LMB-up delivered normally, or it's left stuck
-				// thinking LMB is still down until the user clicks it again.
-				break // let it fall thru so CallNextHookEx is also called!
-			}
-
-			//return 0 //0 is to let it thru (1 was to swallow)
-			//XXX: let it fall thru so CallNextHookEx is also called!
-
-			//actually we can't let it thru because LMB Down was eaten, so if LMBUP is allowed then when u move say firefox's Help popup menu while hovering on About it will open About as if just clicked because it triggers on LMBUp!
-			return 1 //eat it
-		} // else let it pass
+		if !lmbDownSwallowed.CompareAndSwap(true, false) {
+			// We never swallowed a matching down for this button (no
+			// gesture was in progress, or this is a missed-gesture-recovery
+			// session whose real down reached the target normally) -- let
+			// this pass through untouched.
+			break
+		}
+		// We swallowed the down; eat this up to keep the target's button
+		// state balanced (e.g. hovering a menu item while releasing LMB
+		// would otherwise act like a real click on LBUTTONUP).
+		return 1
 
 	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
-		session := activeSession.Load()
-		if session == nil {
-			break // No drag or resize is active, do nothing!
-		}
-		if session.mode == ModeResize {
-			viaRecovery := session.viaMissedGestureRecovery
-			//if resizing.Load() && currentDrag != nil {
+		if session := activeSession.Load(); session != nil && session.mode == ModeResize {
+			// See the identical comment in WM_LBUTTONUP: end the resize
+			// regardless of whether we owe a swallow below.
 			softReset(true)
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // FIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
 			}
-			if viaRecovery {
-				// See the identical comment in WM_LBUTTONUP.
-				break
-			}
-			/*
-				(alt+z to toggle word wrapping)
-				Claude 5 Sonnet High Thinking said:
-				"Honest caveat: your app also takes mouse capture (SetCapture(mainMsgHwnd)) once the first move is processed, and releases it via a posted (async) message from softReset. So there's a small theoretical race where, right at button-release, capture might not have been relinquished yet by the time this up-event is routed — in which case it'd go to your hidden window instead of conhost, not fixing the "stuck" state that one time. In practice, for any drag lasting more than a few ms (i.e. essentially all real drags), the posted release will have long since been processed, so this should work correctly the overwhelming majority of the time. If you find it's still occasionally sticky in testing, the more bulletproof fix is to have softReset post the capture-release and then, only for recovery sessions, post a second message that gets processed after it and re-injects a synthetic up-click via SendInput from the main thread (same pattern as WM_INJECT_SEQUENCE) — I didn't implement that since it's meaningfully more invasive and worth validating the simple fix first."
-			*/
-
-			return 1 // Swallow
 		}
+		if !rmbDownSwallowed.CompareAndSwap(true, false) {
+			// See the identical comment in WM_LBUTTONUP.
+			break
+		}
+		/*
+			(alt+z to toggle word wrapping)
+			Claude 5 Sonnet High Thinking said:
+			"Honest caveat: your app also takes mouse capture (SetCapture(mainMsgHwnd)) once the first move is processed, and releases it via a posted (async) message from softReset. So there's a small theoretical race where, right at button-release, capture might not have been relinquished yet by the time this up-event is routed — in which case it'd go to your hidden window instead of conhost, not fixing the "stuck" state that one time. In practice, for any drag lasting more than a few ms (i.e. essentially all real drags), the posted release will have long since been processed, so this should work correctly the overwhelming majority of the time. If you find it's still occasionally sticky in testing, the more bulletproof fix is to have softReset post the capture-release and then, only for recovery sessions, post a second message that gets processed after it and re-injects a synthetic up-click via SendInput from the main thread (same pattern as WM_INJECT_SEQUENCE) — I didn't implement that since it's meaningfully more invasive and worth validating the simple fix first."
+		*/
+		return 1 // Swallow
 
 	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
@@ -3462,7 +3603,8 @@ func mouseProc(nCode int, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter6 %d ns", nowDiff.Nanoseconds())
 			}
-			return 1 // Swallow
+			rmbDownSwallowed.Store(true) // we're about to eat this down; the matching up must be eaten too, regardless of what happens to activeSession in between.
+			return 1                     // Swallow
 		} else if !winDown {
 			tryBringForegroundToFrontAt(info.Pt)
 		} // the 'if' in RMB
@@ -3485,11 +3627,16 @@ func mouseProc(nCode int, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
 				logf("stutter5 %d ns", nowDiff.Nanoseconds())
 			}
-
-			return 1 // swallow MMB
+			mmbDownSwallowed.Store(true) // we're about to eat this down; the matching up must be eaten too, since MMB has no persistent session to key off of at all.
+			return 1                     // swallow MMB
 		} else if !winDown {
 			tryBringForegroundToFrontAt(info.Pt)
 		} // the 'if' in MMB
+	case WM_MBUTTONUP: //MMB released aka MMBUP
+		if !mmbDownSwallowed.CompareAndSwap(true, false) {
+			break // we never swallowed a matching down; let this pass through untouched.
+		}
+		return 1 // eat it, balancing the down we swallowed earlier. MMB gestures are a single immediate Z-order change with no persistent activeSession, so there's nothing else to reset here.
 	} //switch
 
 	if nowDiff := time.Since(start); nowDiff > Duration5ms {
@@ -3522,9 +3669,13 @@ func createMessageWindow() (windows.Handle, error) {
 	wc.LpszClassName = classNameUTF16
 	wc.HInstance = selfHInstance
 
-	procSetLastError.Call(0)
+	//procSetLastError.Call(0) // useless! .Call() already does this, see: https://github.com/golang/go/issues/41220#issuecomment-5072097059
 	// Register class — check return value
-
+	// No SetLastError(0) reset needed here: per golang/go#41220, Go's syscall
+	// layer already captures GetLastError atomically immediately after
+	// RegisterClassExW returns, and that value is normalized into res2.Err
+	// below via wincoe.CheckZero regardless of whatever the thread's error
+	// state was beforehand — resetting it first accomplished nothing.
 	if res2 := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc))); res2.Failed() { //err2 != nil || ret == 0 {
 		//lastErr := windows.GetLastError()
 		return 0, fmt.Errorf("RegisterClassEx failed: %w", res2.Err) //, lastErr) //XXX: multiple %w is legal in Go v1.20+ (Feb 2023)
@@ -4216,6 +4367,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// strictly required, since no further input reaches us at all
 			// while genuinely locked.
 			winGestureUsed.Store(false)
+			// Same reasoning applies to lmbDownSwallowed/rmbDownSwallowed/
+			// mmbDownSwallowed: if the matching real up happened on the
+			// secure desktop, our hook will never see it, and these flags
+			// would otherwise stay stuck true forever -- silently eating
+			// the NEXT, entirely unrelated button-up after unlock.
+			lmbDownSwallowed.Store(false)
+			rmbDownSwallowed.Store(false)
+			mmbDownSwallowed.Store(false)
 			if session := activeSession.Load(); session != nil {
 				logf("WTS session %s detected mid-%v; discarding stale drag/resize session for HWND=0x%X", wtsSessionChangeName(wParam), session.mode, session.targetWnd)
 				softReset(true)
@@ -4717,8 +4876,16 @@ func deinit() {
 
 	deinitOverlayClass()
 
-	//This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
-	_ = procPostQuitMessage.Call(0)
+	// NOTE: deinit() runs from primary_defer(), which executes AFTER
+	// runApplication()'s own `for { GetMessage(); ... }` loop has already
+	// broken (it always exits via the WM_DESTROY handler's own
+	// PostQuitMessage(0), called earlier while that loop was still live --
+	// see WM_DESTROY in wndProc), OR via panic(). Calling PostQuitMessage(0) again here,
+	// this late, would target a message queue nothing is polling with
+	// GetMessage anymore on this thread: a genuine no-op, so it's been
+	// removed rather than left as dead code.
+	// //This puts a WM_QUIT message in the queue, which causes GetMessage to return 0 and gracefully break the loop.
+	// _ = procPostQuitMessage.Call(0)
 	/*
 		PostThreadMessage(id, WM_QUIT, ...) literally pushes a message into the queue.
 
@@ -4879,7 +5046,16 @@ func initWincoeLogging() {
 }
 
 var (
-	logFile *os.File
+	// logFile is guarded by logFileOnce (ensuring exactly one os.OpenFile
+	// call ever happens, avoiding a leaked duplicate file handle) and
+	// stored behind an atomic.Pointer (matching wincoe.Logger's identical
+	// pattern) because internalLogger can run concurrently from logWorker's
+	// own goroutine AND, once logQuitClosed is set, directly from ANY
+	// calling goroutine's logf() (hook thread, main thread, timer
+	// goroutines) -- a plain *os.File package var here would be a genuine,
+	// -race-detectable data race between those callers.
+	logFile     atomic.Pointer[os.File]
+	logFileOnce sync.Once
 	//hasConsole bool
 	canUseConsoleStderr bool // true if os.Stderr is valid/writable and is on console, not on file!
 	//consoleChecked bool
@@ -4923,26 +5099,26 @@ func init() {
 }
 
 func initLogFile() {
-	if logFile != nil {
-		return
-	}
+	logFileOnce.Do(func() {
+		// 1. Check if the batch script provided a log file path
+		logFilename := os.Getenv(selfName + "_log_file") // aka "winbollocks_log_file" env. var. which depends on readcfg.env 's key value being this! and readcfg.bat reading it and run.bat the top caller thus using it(the env. var.!)
+		if logFilename == "" {
+			// Fallback just in case it's run directly without the .bat
+			logFilename = selfName + "_debug.log"
+		}
 
-	// 1. Check if the batch script provided a log file path
-	logFilename := os.Getenv(selfName + "_log_file") // aka "winbollocks_log_file" env. var. which depends on readcfg.env 's key value being this! and readcfg.bat reading it and run.bat the top caller thus using it(the env. var.!)
-	if logFilename == "" {
-		// Fallback just in case it's run directly without the .bat
-		logFilename = selfName + "_debug.log"
-	}
-
-	// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
-	f, err := os.OpenFile( // FIXME: G703: Path traversal via taint analysis (gosec)
-		logFilename,
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
-	if err == nil {
-		logFile = f
-	}
+		// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
+		f, err := os.OpenFile( // FIXME: G703: Path traversal via taint analysis (gosec)
+			logFilename,
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+			0644,
+		)
+		if err == nil {
+			logFile.Store(f)
+		}
+		// on error, logFile stays nil; internalLogger's caller already
+		// handles that by falling back to a no-op.
+	})
 }
 
 var (
@@ -5046,11 +5222,18 @@ func logf(format string, args ...any) {
 		internalLogger(finalMsg)
 	}
 
-	// 2. Note the problem if we exhausted the 100 tries
+	// // 2. Note the problem if we exhausted the 100 tries
+	// if !wentAccordingToPlan {
+	// 	// We failed to record the peak after 100 tries.
+	// 	// Increment a "Contention Error" counter
+	// 	panic(fmt.Sprintf("Failed(%d times) to set an atomic to int64 value %d. Happened during this log msg: '%s'", attemptAtomicSwapThisManyTimes, currentDepth, finalMsg))
+	// }
+
+	// 2. Note the problem if we exhausted the 100 tries. Telemetry must
+	// never crash the app (see logDepthCASFailures' doc comment) -- count
+	// it and move on instead of panicking.
 	if !wentAccordingToPlan {
-		// We failed to record the peak after 100 tries.
-		// Increment a "Contention Error" counter
-		panic(fmt.Sprintf("Failed(%d times) to set an atomic to int64 value %d. Happened during this log msg: '%s'", attemptAtomicSwapThisManyTimes, currentDepth, finalMsg))
+		logDepthCASFailures.Add(1)
 	}
 }
 
@@ -5745,6 +5928,9 @@ loggingLoop:
 	if maxLogEvents > 1 {
 		directLoggerf("Most log events seen at one time ie. peak queued on log channel: %s, out of logChanSize: %s", withCommas(maxLogEvents), withCommas(logChanSize))
 	}
+	if casFailures := logDepthCASFailures.Load(); casFailures > 0 {
+		directLoggerf("High-water-mark CAS loop exhausted its %d retries %s time(s) (never fatal, just an imprecise peak).", attemptAtomicSwapThisManyTimes, withCommas(casFailures))
+	}
 	maxMoveEvents := maxChannelFillForMoveEvents.Load()
 	if maxMoveEvents > 1 {
 		directLoggerf("Most move/resize events queued: %s (Dropped: %s which were <%dms apart, to prevent mouse stuttering)",
@@ -5796,24 +5982,26 @@ func internalLogger(finalMsg string) {
 		return
 	}
 
-	if logFile == nil {
+	lf := logFile.Load()
+	if lf == nil {
 		initLogFile()
-		if logFile == nil {
+		lf = logFile.Load()
+		if lf == nil {
 			return
 		}
 	}
 
-	_, err := fmt.Fprintf(logFile, "%s", finalMsg)
+	_, err := fmt.Fprintf(lf, "%s", finalMsg)
 	if err != nil && canUseConsoleStderr {
-		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't write to logFile %q the logline: %s", err, logFile.Name(), finalMsg)
+		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't write to logFile %q the logline: %s", err, lf.Name(), finalMsg)
 	}
 	// --- START SYNC TIMING ---
 	syncStart := time.Now()
-	err2 := logFile.Sync()
+	err2 := lf.Sync()
 	syncDur := time.Since(syncStart)
 	// --- END SYNC TIMING ---
 	if err2 != nil && canUseConsoleStderr {
-		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't sync logFile %q after writing to it this logline: %s", err2, logFile.Name(), finalMsg)
+		fmt.Fprintf(os.Stderr, "!!! Err:'%v', Couldn't sync logFile %q after writing to it this logline: %s", err2, lf.Name(), finalMsg)
 	}
 	// Check if the sync took an unusually long time
 	const slowSyncThreshold = 1 * time.Second
@@ -5826,9 +6014,9 @@ func internalLogger(finalMsg string) {
 		}
 
 		// Write to the log file WITHOUT calling Sync() again
-		_, err3 := fmt.Fprintf(logFile, "%s", warnMsg)
+		_, err3 := fmt.Fprintf(lf, "%s", warnMsg)
 		if err3 != nil {
-			fmt.Fprintf(os.Stderr, "!!! failed to write to logFile %q too (err:%v) the warn msg: %q", logFile.Name(), err3, warnMsg)
+			fmt.Fprintf(os.Stderr, "!!! failed to write to logFile %q too (err:%v) the warn msg: %q", lf.Name(), err3, warnMsg)
 		}
 	}
 }
@@ -6345,7 +6533,7 @@ func lockRAM() {
 				// so we must check GetLastError (err) specifically.
 				res3 := procAdjustTokenPrivileges.Call(token, 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
 				//if err3 != nil || ret3 == 0 || !errors.Is(err3, windows.Errno(0)) {
-				if res3.Failed() {
+				if res3.Failed() { // uses CheckAdjustTokenPrivileges
 					logf("Warning: Could not enable %q, err: '%v', callStatus: '%v', ret: '%d', continuing tho.",
 						SE_INC_WORKING_SET_NAME, res3.Err, res3.CallStatus, res3.R1)
 				}
@@ -6741,8 +6929,17 @@ var shouldLogWindowEvents = false
 
 var (
 	// XXX: You already safely manage eventCount using atomic.AddUint64 and atomic.SwapUint64, which is good practice. Because you passed WINEVENT_OUTOFCONTEXT to SetWinEventHook, Windows delivers those callbacks to the message queue of the thread that registered the hook (the Main Thread). Therefore, lastReport and eventCount are technically single-threaded in this specific architecture, but keeping the atomics there is a smart defensive move against future refactors.
+	// eventCount uses the typed atomic.Uint64 (matching droppedMoveOrResizeEvents
+	// and friends elsewhere in this file) rather than the older
+	// atomic.AddUint64/SwapUint64 free-function API, for consistency and to
+	// rule out any accidental non-atomic read slipping in later. Because you
+	// passed WINEVENT_OUTOFCONTEXT to SetWinEventHook, Windows delivers
+	// these callbacks to the message queue of the thread that registered
+	// the hook (the Main Thread), so lastReport/eventCount are technically
+	// single-threaded here regardless, but the atomic stays a smart
+	// defensive move against future refactors.
 	//well, read the comment for winEventProc below (didn't double check it, Geminit 3.5 Flash made)
-	eventCount uint64
+	eventCount atomic.Uint64
 	lastReport time.Time = time.Now()
 )
 
@@ -6779,7 +6976,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	//fmt.Println("DEBUG: hook called")
 	var nowCount uint64
 	if shouldLogWindowEvents {
-		nowCount = atomic.AddUint64(&eventCount, 1)
+		//nowCount = atomic.AddUint64(&eventCount, 1)
+		nowCount = eventCount.Add(1)
 	}
 
 	var eventName string = "unclassified&untracked"
@@ -6833,7 +7031,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	if shouldLogWindowEvents {
 		// 1. Monitor Event Frequency (Every 1 second)
 		if time.Since(lastReport) > time.Second && nowCount > 160 { //TODO: make it a const; can get 122 events per sec during resizes, or less than 50 during wtw else not-our-gesture events.
-			count := atomic.SwapUint64(&eventCount, 0)
+			//count := atomic.SwapUint64(&eventCount, 0)
+			count := eventCount.Swap(0)
 			//fmt.Printf
 			logf("[DEBUG] Events per second: %d | Last Event: 0x%x(%s)", count, event, eventName)
 			lastReport = time.Now()
@@ -7008,17 +7207,30 @@ func getProcessNameFast(pid uint32) string {
 // This prevents your program from freezing when Regedit is too busy to respond to messages.
 func getWindowTextFast(hwnd windows.Handle) string {
 	buf := make([]uint16, 512)
+
+	// // Clear the error state first: InternalGetWindowText returning 0 for a
+	// // window with a genuinely empty title does NOT call SetLastError, so
+	// // without this, GetLastError() below could just reflect whatever
+	// // unrelated Win32 call last touched it. See procInternalGetWindowText's
+	// // binding comment.
+	// _ = procSetLastError.Call(0)//XXX: don't do this because as per https://github.com/golang/go/issues/41220 there's no need to call setlasterror because it happens automatically on LazyProc.Call() !
+
 	// This API does NOT send a message; it reads from kernel memory.
 	res1 := procInternalGetWindowText.Call(
 		uintptr(hwnd),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(len(buf)),
 	)
-	//if ret == 0 {
-	if res1.Failed() {
-		return "<failed>"
+	ret := res1.R1
+	if ret == 0 {
+		//if lastErr := windows.GetLastError(); lastErr != nil {// this is always 0/nil because each syscall(which this is) from Go will setlasterr(0) first, as per https://github.com/golang/go/issues/41220
+		if lastErr := res1.CallStatus; lastErr != nil {
+			logf("getWindowTextFast: InternalGetWindowText failed for HWND=0x%X, err: %v", hwnd, lastErr)
+			return "<failed>"
+		}
+		return "" // genuinely empty title, not a failure
 	}
-	return windows.UTF16ToString(buf[:res1.R1])
+	return windows.UTF16ToString(buf[:ret])
 }
 
 // Package-level. Non-nil = capture is currently held for that session pointer.
@@ -7131,7 +7343,7 @@ func injectRMBUp() {
 // initDarkMode tells Windows this app supports dark mode,
 // allowing standard Win32 context menus to follow the system theme.
 func initDarkMode() {
-	uxtheme := windows.NewLazySystemDLL("uxtheme.dll")
+	uxtheme := windows.NewLazySystemDLL("uxtheme.dll") // kept here on purpose just in case this doesn't exist, for some reason
 	if err := uxtheme.Load(); err != nil {
 		logf("initDarkMode: Failed to load uxtheme.dll for dark mode: %v", err)
 		return

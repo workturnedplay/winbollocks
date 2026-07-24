@@ -1,0 +1,4 @@
+todo:
+* make all proc*() to resolve the DLLs early and not be lazy!!! else they might happen to take long time on first use and/or might clobber the lasterr somehow(unlikely, if using only the 3rd arg returned via LazyProc.Call())
+
+* what I call r1,r2,err are actually r0,r1,err in say windows.GetLastError() [btw, never use this function] so i'm off by one in naming?!
