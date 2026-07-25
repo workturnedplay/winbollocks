@@ -1,4 +1,8 @@
 todo:
+* unclear how exactly atm, but interacting with a higher UIPI window with winkey+shift+MMB and shit+MMB also when coming back to normal, while running as non-admin, will somehow get MMB button stuck as pressed down and cause what appears to be weird behaviour because LMB has no focusing effect anymore other than the focus that our own program causes due to it, but if I were to exit our program, LMB wouldn't focus anything due to MMB being seen as held down somehow.
+
+* add an entry in systray maybe penultimate one which shows the getasyncstate of all keys like Lwinkey,Rwinkey,LAlt,RAlt,LCtrl,RCtrl,LShift,RShift, which would help see if any are stuck, also report it in the tooltip if possible(or is the tooltip statically generated only one time at init?).
+
 * todo fixes from: https://gemini.google.com/app/6e1c3d86680d8e74 (done: todo: 1a,1b,2a,2b,2c)
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
@@ -76,3 +80,4 @@ hallucinated/hand-waved:
 
 done:
 
+//* big problem: if I winkey+LMB a cmd.exe user window which is scrolled up a bit, it will scroll back down when LMB is hit, probably because LMB does try to bring it to front unconditionally?! Doesn't happen for simple non-winkey LMB, obviously.  Also happens for winkey+MMB aka send to back! using defaults in systray btw! Crap it's the injected vkE8 ! it used to work fine before with injected Shift tap! and I tested it to still work now, but vkE8 was needed for something which Shift would interfere with, as yes this is why RShift tap was wrong(but vkE8 was solution): "this doesn't work in this one case only: if(in this order!) shift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release shift, it pops startmenu! but it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!" Seems that RCtrl could take the place for the RShift tap (or vkE8 tap) and preserve the scroll position in cmd.exe AND not cause that issue with shift+winkey+MMB just mentioned.

@@ -1193,9 +1193,9 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 // It is guaranteed to register as a state change, disarming the Start menu,
 // even if Shift, Ctrl, or Alt are currently held down.
 //
-// old info:
+// old info(using RShift tap!):
 // this way when winUP happens it won't pop up start menu
-// this doesn't work in this one case only: if(in this order!) shift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release shift, it pops startmenu!
+// this doesn't work in this one case only: if(in this order!) LShift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release LShift, it pops startmenu!
 // but it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!
 //
 // fixed now: using "Unassigned virtual key (vkE8)"(instead of RShift) as per Gemini 3.1 Pro 's suggestion did fix the above case ^!
@@ -1203,6 +1203,17 @@ func injectShiftTapOnly() {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
+	/* note to self:
+	Left Ctrl (Press): WScan: 0x1D, DwFlags: KEYEVENTF_SCANCODE
+	Right Ctrl (Press): WScan: 0x1D, DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED
+
+	Left Alt (Press): WScan: 0x38, DwFlags: KEYEVENTF_SCANCODE
+	Right Alt (Press): WScan: 0x38, DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED
+	  via Gemini 3.5 Flash-Lite Extended Thinking
+	*/
+
+	// //RShift tap works but if(in this order!) LShift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release LShift, it pops startmenu!
+	// // however, it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!
 	// inputs := []INPUT{
 	// 	{
 	// 		Type: INPUT_KEYBOARD,
@@ -1226,18 +1237,48 @@ func injectShiftTapOnly() {
 	// 		},
 	// 	},
 	// }
+
+	//vkE8, works but bad caveat: it make the scroll move to bottom! ie. in cmd.exe window that's scrolled up before this!
+	// inputs := []INPUT{
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			WVk: 0xE8, // Unassigned virtual key (vkE8)
+	// 		},
+	// 	},
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			WVk:     0xE8,
+	// 			DwFlags: KEYEVENTF_KEYUP,
+	// 		},
+	// 	},
+	// }
+
+	// //let's try on UP, no effect!
+	// inputs := []INPUT{
+	// 	{
+	// 		Type: INPUT_KEYBOARD,
+	// 		Ki: KEYBDINPUT{
+	// 			WVk:     0xE8,
+	// 			DwFlags: KEYEVENTF_KEYUP,
+	// 		},
+	// 	},
+	// }
+
 	inputs := []INPUT{
 		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				WVk: 0xE8, // Unassigned virtual key (vkE8)
+				WScan:   0x1D, //RCtrl DOWN
+				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED,
 			},
 		},
-		{
+		{ // putting this after winUP below has same effect!
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				WVk:     0xE8,
-				DwFlags: KEYEVENTF_KEYUP,
+				WScan:   0x1D, //RCtrl UP
+				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED | KEYEVENTF_KEYUP,
 			},
 		},
 	}
@@ -1249,8 +1290,6 @@ func injectShiftTapOnly() {
 	)
 	if res1.Failed() {
 		logf("SendInput for injectShiftTapOnly failed: %v", res1.Err)
-		//} else {
-		//	logf("done injectShiftTapOnly")
 	}
 }
 
@@ -1291,17 +1330,32 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 	// 	},
 	// }
 	inputs := []INPUT{
+		// {//FIXME: temporarily commented-out during testing!, restore this or somehow DRY it with injectShiftTapOnly!
+		// 	Type: INPUT_KEYBOARD,
+		// 	Ki: KEYBDINPUT{
+		// 		WVk: 0xE8, // Unassigned virtual key (vkE8)
+		// 	},
+		// },
+		// {
+		// 	Type: INPUT_KEYBOARD,
+		// 	Ki: KEYBDINPUT{
+		// 		WVk:     0xE8,
+		// 		DwFlags: KEYEVENTF_KEYUP,
+		// 	},
+		// },
+
 		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				WVk: 0xE8, // Unassigned virtual key (vkE8)
+				WScan:   0x1D, //RCtrl DOWN
+				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED,
 			},
 		},
-		{
+		{ // putting this after winUP below has same effect!
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
-				WVk:     0xE8,
-				DwFlags: KEYEVENTF_KEYUP,
+				WScan:   0x1D, //RCtrl UP
+				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED | KEYEVENTF_KEYUP,
 			},
 		},
 		{
