@@ -1189,6 +1189,35 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 	return x, y, w, h
 }
 
+const (
+	shiftScanCode = 0x1D //Ctrl key
+
+	shiftFlags = KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED // make it RCtrl aka Right Ctrl key(with that KEYEVENTF_EXTENDED) instead of LCtrl
+)
+
+var shiftTapInputs = [...]INPUT{
+	{
+		Type: INPUT_KEYBOARD,
+		Ki: KEYBDINPUT{
+			WScan:   shiftScanCode,
+			DwFlags: shiftFlags,
+		},
+	},
+	{
+		Type: INPUT_KEYBOARD,
+		Ki: KEYBDINPUT{
+			WScan:   shiftScanCode,
+			DwFlags: shiftFlags | KEYEVENTF_KEYUP,
+		},
+	},
+}
+
+// injectShiftTapOnly uses the RCtrl key tap(keydown then key up) injected when gesture starts
+// should prevent Start Menu from popping up, but it still needs this to be done before winkeyUP is injected
+// later on when gesture's done.
+// Has no known caveats that I'm aware of (except perhaps virtualbox has RCtrl as the "Host Key Combo")
+//
+// old bad:
 // injectShiftTapOnly uses the unassigned vkE8 key to mask the Winkey.
 // It is guaranteed to register as a state change, disarming the Start menu,
 // even if Shift, Ctrl, or Alt are currently held down.
@@ -1198,7 +1227,7 @@ func calculateResize(session *dragSession, currentPt POINT) (x, y, w, h int32) {
 // this doesn't work in this one case only: if(in this order!) LShift was held before winkey down then eg. MMB happened(so a gesture triggers) then you release LShift, it pops startmenu!
 // but it does work if you release winkey first, or if you hold winkey before shift, then you can release either and works!
 //
-// fixed now: using "Unassigned virtual key (vkE8)"(instead of RShift) as per Gemini 3.1 Pro 's suggestion did fix the above case ^!
+// bad: fixed now: using "Unassigned virtual key (vkE8)"(instead of RShift) as per Gemini 3.1 Pro 's suggestion did fix the above case ^!
 func injectShiftTapOnly() {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
@@ -1266,98 +1295,28 @@ func injectShiftTapOnly() {
 	// 	},
 	// }
 
-	inputs := []INPUT{
-		{
-			Type: INPUT_KEYBOARD,
-			Ki: KEYBDINPUT{
-				WScan:   0x1D, //RCtrl DOWN
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED,
-			},
-		},
-		{ // putting this after winUP below has same effect!
-			Type: INPUT_KEYBOARD,
-			Ki: KEYBDINPUT{
-				WScan:   0x1D, //RCtrl UP
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED | KEYEVENTF_KEYUP,
-			},
-		},
-	}
-
-	res1 := procSendInput.Call(
-		uintptr(len(inputs)),
-		uintptr(unsafe.Pointer(&inputs[0])),
-		unsafe.Sizeof(inputs[0]),
+	res := procSendInput.Call(
+		uintptr(len(shiftTapInputs)),
+		uintptr(unsafe.Pointer(&shiftTapInputs[0])),
+		unsafe.Sizeof(shiftTapInputs[0]),
 	)
-	if res1.Failed() {
-		logf("SendInput for injectShiftTapOnly failed: %v", res1.Err)
+	if res.Failed() {
+		logf("SendInput for injectShiftTapOnly failed: %v", res.Err)
 	}
 }
 
-// injectShiftTapThenWinUp injects the vkE8 dummy tap(ie. down then up) [instead of RShift which had an edge case!] followed by the Win UP event.
+// injectShiftTapThenWinUp injects RCtrl tap(ie. down then up) [instead of the vkE8(Unassigned virtual key (vkE8)) dummy tap
+// (ie. down then up) which had an edge case(it would scroll back to bottom if you were scrolled up in cmd.exe)
+// [instead of RShift which had an edge case!]]
+// followed by the Win UP event.
 // This prevents Start Menu from poping/showing up.
 func injectShiftTapThenWinUp(whichWinUp uint16) {
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
-	// inputs := []INPUT{
-	// 	{
-	// 		Type: INPUT_KEYBOARD,
-	// 		Ki: KEYBDINPUT{
-	// 			//WVk: VK_SHIFT, // don't, it's wrong to use vk instead of scancodes for Shift
-	// 			//WVk: VK_E,
-	// 			//WScan:   0x12, // scancode for 'E',
-	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-	// 			DwFlags: KEYEVENTF_SCANCODE,
-	// 		},
-	// 	},
-	// 	{ // putting this after winUP below has same effect!
-	// 		Type: INPUT_KEYBOARD,
-	// 		Ki: KEYBDINPUT{
-	// 			//WVk:     VK_SHIFT,
-	// 			//WVk: VK_E,
-	// 			//DwFlags: KEYEVENTF_KEYUP,
-	// 			//WScan:   0x12, // 'E' key
-	// 			WScan:   0x36, // 0x2A is for Left Shift, and 0x36 is Right Shift scancode.
-	// 			DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
-	// 		},
-	// 	},
-	// 	{
-	// 		Type: INPUT_KEYBOARD,
-	// 		Ki: KEYBDINPUT{
-	// 			WVk:     whichWinUp,
-	// 			DwFlags: KEYEVENTF_KEYUP,
-	// 		},
-	// 	},
-	// }
-	inputs := []INPUT{
-		// {//FIXME: temporarily commented-out during testing!, restore this or somehow DRY it with injectShiftTapOnly!
-		// 	Type: INPUT_KEYBOARD,
-		// 	Ki: KEYBDINPUT{
-		// 		WVk: 0xE8, // Unassigned virtual key (vkE8)
-		// 	},
-		// },
-		// {
-		// 	Type: INPUT_KEYBOARD,
-		// 	Ki: KEYBDINPUT{
-		// 		WVk:     0xE8,
-		// 		DwFlags: KEYEVENTF_KEYUP,
-		// 	},
-		// },
-
-		{
-			Type: INPUT_KEYBOARD,
-			Ki: KEYBDINPUT{
-				WScan:   0x1D, //RCtrl DOWN
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED,
-			},
-		},
-		{ // putting this after winUP below has same effect!
-			Type: INPUT_KEYBOARD,
-			Ki: KEYBDINPUT{
-				WScan:   0x1D, //RCtrl UP
-				DwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED | KEYEVENTF_KEYUP,
-			},
-		},
+	inputs := [3]INPUT{
+		shiftTapInputs[0],
+		shiftTapInputs[1],
 		{
 			Type: INPUT_KEYBOARD,
 			Ki: KEYBDINPUT{
@@ -1367,15 +1326,13 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 		},
 	}
 
-	res1 := procSendInput.Call(
+	res := procSendInput.Call(
 		uintptr(len(inputs)),
 		uintptr(unsafe.Pointer(&inputs[0])),
 		unsafe.Sizeof(inputs[0]),
 	)
-	if res1.Failed() {
-		logf("SendInput for injectShiftTapThenWinUp failed: %v", res1.Err)
-		//} else {
-		//	logf("done injectShiftTapThenWinUp")
+	if res.Failed() {
+		logf("SendInput for injectShiftTapThenWinUp failed: %v", res.Err)
 	}
 }
 
