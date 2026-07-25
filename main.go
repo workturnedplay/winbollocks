@@ -166,6 +166,16 @@ var (
 	winEventCallback = windows.NewCallback(winEventProc)
 )
 
+// lastKnownUserForegroundHwnd tracks the most recent non-shell foreground
+// window, updated from winEventProc's EVENT_SYSTEM_FOREGROUND handling.
+// Needed because right-clicking the tray icon activates Explorer's taskbar
+// (Shell_TrayWnd) as a side effect of the click itself, before WM_MYSYSTRAY
+// is even delivered to us -- a GetForegroundWindow() snapshot taken inside
+// WM_MYSYSTRAY therefore always sees Explorer, never whatever window the
+// user was actually working in. Continuous tracking with a shell-class
+// filter sidesteps that.
+var lastKnownUserForegroundHwnd atomic.Uintptr
+
 var appStartTime = time.Now() //only useful because time.Time keeps track of monotonic clock, good for .Sub() operations!
 
 var (
@@ -998,6 +1008,14 @@ var bringToFrontOnDrag atomic.Bool
 // so the two modes can be configured independently. Toggleable via systray.
 var focusOnResize atomic.Bool
 var bringToFrontOnResize atomic.Bool
+
+// bringToFrontOnBackgroundClick, when true, restores a focused-but-
+// backgrounded window (e.g. one previously sent to the back of the
+// Z-order via winkey+MMB) to the top of the Z-order the moment the user
+// clicks on it with LMB/MMB/RMB while winkey isn't held -- see
+// tryBringForegroundToFrontAt, called from mouseProc's
+// WM_LBUTTONDOWN/WM_RBUTTONDOWN/WM_MBUTTONDOWN handling. Toggleable via
+// systray.
 var bringToFrontOnBackgroundClick atomic.Bool
 
 // unfocusSentToBackWindow, when true, shifts keyboard focus away from a
@@ -4962,8 +4980,21 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// 	}
 			// }
 
+			prevForegroundBeforeTrayMenu := windows.Handle(lastKnownUserForegroundHwnd.Load())
+			restoreForegroundAfterTrayMenu := func() {
+				if prevForegroundBeforeTrayMenu == 0 || prevForegroundBeforeTrayMenu == windows.Handle(hwnd) {
+					return
+				}
+				if resIsWin := procIsWindow.Call(uintptr(prevForegroundBeforeTrayMenu)); resIsWin.Failed() {
+					return
+				}
+				if resRestore := procSetForegroundWindow.Call(uintptr(prevForegroundBeforeTrayMenu)); resRestore.Failed() {
+					logf("WM_MYSYSTRAY: failed to restore foreground to pre-tray-menu HWND=0x%X, err=%v callStatus=%v", prevForegroundBeforeTrayMenu, resRestore.Err, resRestore.CallStatus)
+				}
+			}
+
 			setForegroundWindow(windows.Handle(hwnd), "WM_MYSYSTRAY: SetForegroundWindow(self) failed")
-			// logf("Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
+			logf("DEBUG: Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
 
 			res2 := procTrackPopupMenu.Call(
 				hMenu,
@@ -4976,13 +5007,13 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			)
 			if res2.Failed() {
 				logf("in wndProc, WM_MYSYSTRAY, failed to TrackPopupMenu, err=%v", res2.Err)
-				// restoreForegroundAfterTrayMenu()
+				restoreForegroundAfterTrayMenu()
 				return 0 // Handled
 			}
 			cmd := res2.R1
 			// Required by MSDN to dismiss menu correctly
 			_ = procSendMessage.Call(hwnd, WM_NULL, 0, 0) // Send WM_NULL, cannot fail, it's also CheckNone
-			// restoreForegroundAfterTrayMenu()
+			restoreForegroundAfterTrayMenu()
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
@@ -5912,11 +5943,13 @@ func init() {
 
 	//defaults:
 	const bringToFrontByDefaultOnGesture = true
-	focusOnDrag.Store(bringToFrontByDefaultOnGesture)        // focus window when gesture applies on it, ie. on drag-Move (but TODO: ? this doesn't apply to on-resize hmm)
-	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture) // default to same as above ^ TODO: should I make this apply to resize as well?
-	focusOnResize.Store(bringToFrontByDefaultOnGesture)
-	bringToFrontOnResize.Store(bringToFrontByDefaultOnGesture)
-	//Default to true for the LMB click fallback
+	focusOnDrag.Store(bringToFrontByDefaultOnGesture)          // focus window when gesture applies on it, ie. on drag-Move
+	bringToFrontOnDrag.Store(bringToFrontByDefaultOnGesture)   // bring dragged window to front of Z-order, same default as focus above
+	focusOnResize.Store(bringToFrontByDefaultOnGesture)        // resize's independent counterpart to focusOnDrag
+	bringToFrontOnResize.Store(bringToFrontByDefaultOnGesture) // resize's independent counterpart to bringToFrontOnDrag
+	// Default to true: clicking a focused-but-backgrounded window (e.g. one
+	// sent to back via winkey+MMB) should bring it back to the top of the
+	// Z-order rather than leaving it stuck behind everything else.
 	bringToFrontOnBackgroundClick.Store(true)
 
 	unfocusSentToBackWindow.Store(true) // default on;-- see its doc comment
@@ -7386,6 +7419,13 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			eventName, targetHwnd, rootHwnd, idObject, idChild, title, class, pid, procName)
 	}
 
+	if event == EVENT_SYSTEM_FOREGROUND && targetHwnd != 0 && !isOwnWindow(targetHwnd) {
+		if class := getClassName(targetHwnd); class != "Shell_TrayWnd" && class != "Shell_SecondaryTrayWnd" {
+			//"Caveat: Shell_TrayWnd/Shell_SecondaryTrayWnd cover the normal taskbar; I'm not fully certain of the class name Win11 uses for the "show hidden icons" overflow flyout if your icon ever lives there, so this may need a tweak if you test it and it still shows Explorer in that case. Flagging this as something to actively decide on rather than silently reinstating." - Claude Sonnet 5 Extra Thinking
+			lastKnownUserForegroundHwnd.Store(uintptr(targetHwnd))
+		}
+	}
+
 	if event == EVENT_SYSTEM_FOREGROUND || forceReconcile {
 		if pid == 0 {
 			badprogramming("pid is 0 here, code logic was changed!")
@@ -7582,7 +7622,8 @@ func injectMouseButtonUp(flag uint32) {
 		},
 	}
 
-	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = flag
+	//	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = flag
+	mouseInputView(&inputs[0]).DwFlags = flag
 
 	res1 := procSendInput.Call(
 		uintptr(len(inputs)),
