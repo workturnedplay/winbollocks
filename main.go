@@ -622,6 +622,7 @@ const (
 	MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE           = 16
 	MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK = 17
 	MENU_TOGGLE_UNFOCUS_SENT_TO_BACK               = 18
+	MENU_SHOW_INPUT_STATE                          = 19
 
 	MF_STRING = 0x0000
 
@@ -886,6 +887,50 @@ var (
 	rmbDownSwallowed atomic.Bool
 	mmbDownSwallowed atomic.Bool
 )
+
+// resetStaleGestureFlags clears winGestureUsed and lmbDownSwallowed/
+// rmbDownSwallowed/mmbDownSwallowed unconditionally.
+//
+// All four flags record "something about the CURRENT gesture/keypress that
+// a LATER event needs to react to" -- winGestureUsed says "the eventual
+// winkey-up should be suppressed (Start menu shouldn't pop)", and the three
+// *Swallowed flags say "the eventual button-up should be swallowed too, to
+// balance the down we already ate". Both kinds of promise are only honored
+// if our hook actually gets to SEE that later up/winkey-up event. Two
+// situations break that assumption, and both call this helper at exactly
+// the moment visibility is lost:
+//
+//  1. WTS lock/unlock (see WM_WTSSESSION_CHANGE in wndProc): input on the
+//     secure desktop is entirely invisible to our hooks.
+//  2. The foreground transitioning to a higher-integrity window (see
+//     winEventProc's EVENT_SYSTEM_FOREGROUND handling): UIPI blocks
+//     delivery of hook callbacks to our (lower-integrity) process for as
+//     long as that window -- or anything else at/above its integrity
+//     level -- stays foreground. Critically, this can be triggered BY a
+//     gesture itself: winkey+MMB's send-to-back, when
+//     unfocusSentToBackWindow is enabled, refocuses whatever window is now
+//     topmost (see findNewForegroundCandidateAfterSendToBack) WITHOUT
+//     checking its integrity level, so a single winkey+MMB (or
+//     winkey+shift+MMB) can hand focus straight to an elevated window
+//     while its own real MMB-up is still physically pending -- exactly the
+//     "MMB stuck down" scenario this was written to fix.
+//
+// Left stuck true across either situation, the eventual real up/winkey-up
+// event -- now invisible to us -- never arrives to naturally flip the flag
+// back, so it stays true indefinitely. The NEXT, entirely unrelated
+// transition of that same button/key (once we're not blind anymore, on
+// some future, unconnected window) then gets incorrectly treated as
+// "belongs to a gesture we're tracking" and gets swallowed/suppressed -- for
+// the *Swallowed flags this means a real button-up never reaches whatever
+// window the user just clicked, desyncing that window's (and potentially
+// the shell's) own button-state tracking exactly the way a physically
+// stuck button would.
+func resetStaleGestureFlags() {
+	winGestureUsed.Store(false)
+	lmbDownSwallowed.Store(false)
+	rmbDownSwallowed.Store(false)
+	mmbDownSwallowed.Store(false)
+}
 
 var (
 	mouseHook windows.Handle
@@ -1922,6 +1967,119 @@ func showTrayInfo(title, msg string) {
 	copyUTF16Truncated(trayIcon.SzInfo[:], msg)
 	if res1 := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon))); res1.Failed() {
 		logf("Failed to update tray icon info: %v", res1.Err)
+	}
+}
+
+// formatHeldInputState reports which of the tracked modifier keys
+// (left/right Win, Shift, Ctrl, Alt) and mouse buttons (LMB/RMB/MMB)
+// GetAsyncKeyState currently reports as held down, as a short
+// comma-separated list, or "none" if nothing is held.
+//
+// Mouse buttons are included alongside the keyboard modifiers because the
+// motivating bug (winkey+MMB / winkey+shift+MMB occasionally leaving MMB
+// looking stuck down after interacting with a higher-UIPI window -- see
+// resetStaleGestureFlags's doc comment) is exactly the kind of thing this
+// is meant to help catch: a physically-released button GetAsyncKeyState
+// still insists is down is the most direct possible confirmation something
+// is actually stuck, versus one of our own internal *Swallowed flags
+// merely being stale.
+func formatHeldInputState() string {
+	type trackedKey struct {
+		vk   uintptr
+		name string
+	}
+	keys := [...]trackedKey{
+		{VK_LWIN, "LWin"},
+		{VK_RWIN, "RWin"},
+		{VK_LSHIFT, "LShift"},
+		{VK_RSHIFT, "RShift"},
+		{VK_LCONTROL, "LCtrl"},
+		{VK_RCONTROL, "RCtrl"},
+		{VK_LMENU, "LAlt"},
+		{VK_RMENU, "RAlt"},
+		{VK_LBUTTON, "LMB"},
+		{VK_RBUTTON, "RMB"},
+		{VK_MBUTTON, "MMB"},
+	}
+
+	var held []string
+	for _, k := range keys {
+		if keyDown(k.vk) {
+			held = append(held, k.name)
+		}
+	}
+	if len(held) == 0 {
+		return "none"
+	}
+	return strings.Join(held, ", ")
+}
+
+// lastTrayTooltipInputStateText caches the formatHeldInputState() text most
+// recently written into a NIM_MODIFY'd tray-icon tooltip, so
+// updateTrayTooltipInputStateIfChanged only calls Shell_NotifyIconW when
+// the text has actually changed rather than on every single
+// WM_MOUSEMOVE-over-the-tray-icon notification. Read/written exclusively
+// from wndProc's WM_MYSYSTRAY handling, which only ever runs on the main
+// thread -- unlike trayIcon itself (guarded by trayIconMu because
+// showTrayInfo can also run from the hook thread), this var needs no
+// synchronization of its own.
+var lastTrayTooltipInputStateText string
+
+// updateTrayTooltipInputStateIfChanged refreshes the tray icon's hover
+// tooltip with the currently-held modifier keys/mouse buttons (see
+// formatHeldInputState), but only issues a Shell_NotifyIconW(NIM_MODIFY)
+// call when that text actually differs from what's already showing.
+//
+// Unlike showTrayInfo's SzInfo/SzInfoTitle (a one-shot balloon/toast), SzTip
+// is what the shell displays for the classic hover tooltip, and the shell
+// has no "ask the app for fresh text right now" callback for it -- it
+// simply redisplays whatever SzTip last held from NIM_ADD/NIM_MODIFY.
+// Refreshing it here, from the WM_MOUSEMOVE sub-message WM_MYSYSTRAY
+// already receives whenever the cursor is over the icon (see wndProc's
+// low==WM_MOUSEMOVE case), means a hover shortly after this call picks up a
+// reasonably fresh snapshot instead of whatever initTray() set once at
+// startup and nothing ever touched again.
+//
+// This deliberately builds and modifies a throwaway COPY of trayIcon for
+// the NIM_MODIFY call rather than mutating the shared, persistent trayIcon
+// struct's own UFlags/SzTip fields in place: showTrayInfo only ever ORs
+// NIF_INFO onto trayIcon.UFlags and never clears it again (see its own doc
+// comment), so if this function reused that same sticky UFlags value
+// as-is, every tooltip refresh after the first showTrayInfo() call anywhere
+// in the app's lifetime would carry NIF_INFO (plus whatever stale
+// SzInfo/SzInfoTitle content was last set) right along with it -- silently
+// re-popping that OLD balloon notification on every single hover-triggered
+// tooltip refresh instead of only updating the hover text. Passing a copy
+// with UFlags narrowed to just NIF_TIP sidesteps that entirely: NIM_MODIFY
+// only touches the fields whose bit is set for THAT specific call, and
+// CbSize/HWnd/UID (needed to identify which icon to modify at all) come
+// along for free via the copy.
+func updateTrayTooltipInputStateIfChanged() {
+	stateText := formatHeldInputState()
+	if stateText == lastTrayTooltipInputStateText {
+		return // nothing changed since we last wrote it; avoid a pointless Shell_NotifyIconW call
+	}
+	if lastTrayTooltipInputStateText != "" {
+		// Skip logging the very first refresh (transitioning from this
+		// var's zero-value "") -- that's just normal startup, not a
+		// genuine change worth a log line.
+		logf("Tray hover tooltip input-state changed: %q -> %q", lastTrayTooltipInputStateText, stateText)
+	}
+	lastTrayTooltipInputStateText = stateText
+
+	trayIconMu.Lock()
+	defer trayIconMu.Unlock()
+
+	if trayIcon.HWnd == 0 {
+		return // tray icon not initialized (or already torn down)
+	}
+
+	tipUpdate := trayIcon
+	tipUpdate.UFlags = NIF_TIP
+	copyUTF16Truncated(tipUpdate.SzTip[:], selfName+" "+GetVersion()+" | Held: "+stateText)
+
+	if res := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&tipUpdate))); res.Failed() {
+		logf("updateTrayTooltipInputStateIfChanged: Shell_NotifyIconW(NIM_MODIFY) failed to refresh tray tooltip, err: %v", res.Err)
 	}
 }
 
@@ -4642,15 +4800,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			// given cycle) purely for defense-in-depth; only UNLOCK is
 			// strictly required, since no further input reaches us at all
 			// while genuinely locked.
-			winGestureUsed.Store(false)
-			// Same reasoning applies to lmbDownSwallowed/rmbDownSwallowed/
-			// mmbDownSwallowed: if the matching real up happened on the
-			// secure desktop, our hook will never see it, and these flags
-			// would otherwise stay stuck true forever -- silently eating
-			// the NEXT, entirely unrelated button-up after unlock.
-			lmbDownSwallowed.Store(false)
-			rmbDownSwallowed.Store(false)
-			mmbDownSwallowed.Store(false)
+			// winGestureUsed and lmbDownSwallowed/rmbDownSwallowed/
+			// mmbDownSwallowed all need clearing here: real key/button-up
+			// events that happen on the secure desktop while locked are
+			// invisible to our hooks, so any of these left stuck true
+			// would silently misfire against some later, entirely
+			// unrelated key/button-up after unlock. See
+			// resetStaleGestureFlags's doc comment (shared with the
+			// higher-integrity-foreground case in winEventProc).
+			resetStaleGestureFlags()
 			if session := activeSession.Load(); session != nil {
 				logf("WTS session %s detected mid-%v; discarding stale drag/resize session for HWND=0x%X", wtsSessionChangeName(wParam), session.mode, session.targetWnd)
 				softReset(true)
@@ -4737,6 +4895,15 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 		// if low != WM_MOUSEMOVE { // any non-mouse_move(0x10200 on v4) events:
 		// 	logf("WM_TRAY received with lParam %x, %x", lParam, low)
 		// }
+
+		if low == WM_MOUSEMOVE {
+			// Opportunistic hover-tooltip refresh -- see
+			// updateTrayTooltipInputStateIfChanged's doc comment for why
+			// this WM_MOUSEMOVE-over-the-tray-icon notification is the only
+			// practical hook point for keeping the tooltip's key/button
+			// state text reasonably fresh.
+			updateTrayTooltipInputStateIfChanged()
+		}
 
 		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
 		if low == WM_RBUTTONUP { // RMB on systray aka RMBUp or RMBUP on systray aka RMB button released
@@ -4959,6 +5126,18 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 
 			{
+				// Read-only diagnostic row, grayed/disabled so it can never
+				// be "selected" -- it's informational only. Recomputed
+				// fresh every time this menu is popped (this whole hMenu is
+				// rebuilt from scratch on each WM_MYSYSTRAY RMB, so there's
+				// no separate refresh mechanism needed here the way the
+				// hover tooltip needs one).
+				var keysHeldFlags uintptr = MF_STRING | MF_GRAYED | MF_DISABLED
+				keysHeldText := "Currently held (GetAsyncKeyState): " + formatHeldInputState()
+				appendMenuChecked(hMenu, keysHeldFlags, MENU_SHOW_INPUT_STATE, keysHeldText)
+			}
+
+			{
 				exitText := "Exit"
 				appendMenuChecked(hMenu, MF_STRING, MENU_EXIT, exitText)
 			}
@@ -4993,6 +5172,14 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 
 			prevForegroundBeforeTrayMenu := windows.Handle(lastKnownUserForegroundHwnd.Load())
 			restoreForegroundAfterTrayMenu := func() {
+				// FIX: Only restore if our hidden window STILL has focus.
+				// If it doesn't, the user dismissed the menu by clicking on (and thus focusing)
+				// another window, or they Alt-Tabbed away. We must leave that new window alone!
+				currentFg := getForegroundWindow()
+				if currentFg != windows.Handle(hwnd) {
+					return
+				}
+
 				if prevForegroundBeforeTrayMenu == 0 || prevForegroundBeforeTrayMenu == windows.Handle(hwnd) {
 					return
 				}
@@ -5000,7 +5187,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 					return
 				}
 				if resRestore := procSetForegroundWindow.Call(uintptr(prevForegroundBeforeTrayMenu)); resRestore.Failed() {
-					logf("WM_MYSYSTRAY: failed to restore foreground to pre-tray-menu HWND=0x%X, err=%v callStatus=%v", prevForegroundBeforeTrayMenu, resRestore.Err, resRestore.CallStatus)
+					logf("WM_MYSYSTRAY: failed to restore foreground to pre-tray-menu HWND=0x%X, err=%v, callStatus=%v", prevForegroundBeforeTrayMenu, resRestore.Err, resRestore.CallStatus)
 				}
 			}
 
@@ -7457,6 +7644,12 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 				logf("Target window HWND=0x%x is higher integrity (0x%x > 0x%x). UIPI will block movement(no key/mouse events will be received while it is focused!thus can't trigger the gesture).", targetHwnd, targetIL, selfIntegrityLevel)
 				softReset(true)
 				foregroundWasHigherIntegrity.Store(true)
+				// Our hooks are about to go blind to all mouse/keyboard
+				// input for as long as this (or any equally-or-more
+				// elevated) window stays foreground -- including when this
+				// very foreground shift was itself caused by an in-flight
+				// gesture. See resetStaleGestureFlags's doc comment.
+				resetStaleGestureFlags()
 			}
 		} else {
 			if shouldLogFocusChanges {

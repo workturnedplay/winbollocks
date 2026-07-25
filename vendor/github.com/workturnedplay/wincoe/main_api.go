@@ -648,6 +648,13 @@ func (r WinResult) CallStatusIs(target error) bool {
 	return errors.Is(r.CallStatus, target)
 }
 
+// Static assertion: CheckWinResult's r1-recovery path (treating a non-zero
+// r1 as an errno when callErr is unavailable) assumes ERROR_SUCCESS == 0,
+// since it only takes that path when r1 != 0. If ERROR_SUCCESS were ever
+// redefined to something else, this fails to compile instead of silently
+// letting CheckWinResult misclassify a success code as a failure.
+var _ = [0 - int(windows.ERROR_SUCCESS)]byte{}
+
 // CheckWinResult processes a Windows API result.
 //
 // It returns nil on success (when isFailure is false).
@@ -685,6 +692,8 @@ func CheckWinResult(
 		// Only treat r1 as an errno if it's non-zero.
 		if r1 != 0 { // 0 here is exactly windows.ERROR_SUCCESS
 			errno := windows.Errno(r1) //doneTODO: see how we can match against this, I doubt errors.Is still works for this! actually, it seems to, based on the below!
+
+			//I keep the redundancy of these 2 compile-time asserts(type and var) here, on purpose(and the package level one before this function there as well):
 
 			// Local compile-time assertion trap(to avoid that inner 'if'):
 			type _ [0 - int(windows.ERROR_SUCCESS)]byte
@@ -1123,7 +1132,7 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 func QueryFullProcessName(pid uint32) (string, error) {
 	hProc, err0 := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err0 != nil {
-		return "", fmt.Errorf("OpenProcess failedfor PID %d: %w", pid, err0)
+		return "", fmt.Errorf("OpenProcess failed for PID %d: %w", pid, err0)
 	}
 	//defer windows.CloseHandle(hProc)
 	defer closeHandleLogged(hProc, "QueryFullProcessName:OpenProcess hProc")
@@ -2763,5 +2772,5 @@ func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backof
 // syscall execution. Always read the 3rd return value (err) from proc.Call().
 // don't use, see: https://github.com/golang/go/issues/41220
 func GetLastError() error {
-	return windows.GetLastError()
+	return windows.GetLastError() //nolint:wrapcheck //on-purpose wrapper over this!
 }
