@@ -4740,7 +4740,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 				logf("WM_MYSYSTRAY: GetCursorPos failed, menu will appear at (0,0): %v", res.Err)
 			}
 
-			logf("popping tray menu")
+			//logf("popping tray menu")
 
 			res1 := procCreatePopupMenu.Call()
 			if res1.Failed() {
@@ -4994,7 +4994,7 @@ var wndProc = windows.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam 
 			}
 
 			setForegroundWindow(windows.Handle(hwnd), "WM_MYSYSTRAY: SetForegroundWindow(self) failed")
-			logf("DEBUG: Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
+			//logf("DEBUG: Currently focused window is 0x%X prev:0x%X", hwnd, prevForegroundBeforeTrayMenu)
 
 			res2 := procTrackPopupMenu.Call(
 				hMenu,
