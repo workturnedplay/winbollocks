@@ -1161,8 +1161,21 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		if res1.Succeeded() { //err == nil {
 			// Success! Convert the returned size to string
 			//UTF16ToString is a function that looks for a 0x0000 (null).
+			//Go's windows.UTF16ToString is safely implemented to stop at the first \x00 it finds, OR the end of the slice provided to it.
 			//size is just a number the API handed back, so let's not trust it, thus use full 'buf'
-			return windows.UTF16ToString(buf), nil
+			// return windows.UTF16ToString(buf), nil
+			// Previously, the code distrusted 'size' and passed the full 'buf'.
+			// However, if the path perfectly hits the buffer boundary (e.g., exactly MaxExtendedPath),
+			// Windows might omit the null terminator entirely.
+			// Slicing to `[:size]` is much safer: it forces `UTF16ToString` to process exactly
+			// the characters Windows explicitly claims to have written, preventing silent
+			// truncation bugs or unnecessary scanning of trailing nulls.
+			// limit := size
+			// if limit > uint32(len(buf)) {
+			// 	limit = uint32(len(buf)) // Defense-in-depth: never out-of-bounds slice if the OS lies
+			// }
+			limit := min(int(size), len(buf))
+			return windows.UTF16ToString(buf[:limit]), nil
 		}
 
 		// Check if the error is specifically "Buffer too small"

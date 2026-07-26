@@ -1,7 +1,5 @@
 todo:
 
-* todo fixes from: https://gemini.google.com/app/6e1c3d86680d8e74 (done: 1a,1b,2a,2b, todo: 2c)
-
 * check this in keyDown "	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos", this is 2a from https://gemini.google.com/app/6e1c3d86680d8e74 
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
@@ -86,3 +84,6 @@ done:
 //* add an entry in systray maybe penultimate one which shows the getasyncstate of all keys like Lwinkey,Rwinkey,LAlt,RAlt,LCtrl,RCtrl,LShift,RShift, which would help see if any are stuck, also report it in the tooltip if possible(or is the tooltip statically generated only one time at init?).
 
 //* if i open systray then LMB on a window that's not been focused before I opened systray, it still focuses the window that was previously focused before I opened systray! But in normal Windows behavior it should focus the LMB-ed one! I know I'm trying to restore the prev. focused one, but this shouldn't happen if I LMB/RMB/MMB, I think, no?! because they are meant to focus whatever the target is (in normal Windows behavior) and I don't know what else, other edge cases like these could be.
+
+//* todo fixes from: https://gemini.google.com/app/6e1c3d86680d8e74 (done: 1a,1b,2a,2b,2c todo: )
+
