@@ -2633,6 +2633,7 @@ func writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, ma
 // distinction to be made explicitly instead of silently following whatever
 // is already there via O_TRUNC.
 func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
+	// 1. First attempt: atomic exclusive creation.
 	f, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err == nil {
 		return f, nil
@@ -2640,6 +2641,9 @@ func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
 	if !os.IsExist(err) {
 		return nil, fmt.Errorf("openStagingFileSafely says that os.OpenFile failed(and not because it doesn't exist) to create %q staging file, with err:%w", tmpName, err) // some other failure (permissions, path issues, etc.) — propagate as-is
 	}
+
+	// 2. Something already exists at tmpName. Inspect it before taking any action.
+	// Only ever safe to reclaim it if it is a plain, empty, regular file with a single hard link.
 
 	// Something already exists at tmpName. Only ever safe to reclaim it if
 	// it is a plain, empty, regular file with a single hard link — exactly
@@ -2653,16 +2657,41 @@ func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
 		return nil, fmt.Errorf("refusing to use staging file %q: %s (possible attack or genuine corruption)", tmpName, reason)
 	}
 
-	// Confirmed benign: remove the empty leftover and retry the exclusive
-	// create so we never write through a pre-existing name.
-	if rmErr := OsRemoveFunc(tmpName); rmErr != nil {
-		return nil, fmt.Errorf("failed to remove confirmed-benign empty staging file %q before recreating it: %w", tmpName, rmErr)
+	// // Confirmed benign: remove the empty leftover and retry the exclusive
+	// // create so we never write through a pre-existing name.
+	// if rmErr := OsRemoveFunc(tmpName); rmErr != nil {
+	// 	return nil, fmt.Errorf("failed to remove confirmed-benign empty staging file %q before recreating it: %w", tmpName, rmErr)
+	// }
+	// if fil, ofErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm); ofErr != nil {
+	// 	return nil, fmt.Errorf("failed to create staging file %q after removed the existing file (so, directory permissions doesn't allow creating new files? and we shoulda just truncated the existing one to keep ACLs?!), err: %w", tmpName, ofErr)
+	// } else {
+	// 	return fil, nil
+	// }
+
+	// 3. Confirmed benign: reuse the existing empty file directly by opening with O_TRUNC.
+	// We DO NOT delete and recreate it (via OsRemoveFunc + O_EXCL) because:
+	//   a) Deleting throws away existing file-level ACLs.
+	//   b) Deleting requires directory-level file creation permissions, which might be restricted.
+	//   c) Re-opening directly avoids an unnecessary delete-recreate window.
+	// 3. Re-assigning 'f' here overwrites a nil pointer, not an open handle.
+	f, err = os.OpenFile(tmpName, os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open confirmed-benign staging file %q for writing: %w", tmpName, err)
 	}
-	if fil, ofErr := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm); ofErr != nil {
-		return nil, fmt.Errorf("failed to create staging file %q after removed the existing file (so, directory permissions doesn't allow creating new files? and we shoulda just truncated the existing one to keep ACLs?!), err: %w", tmpName, ofErr)
-	} else {
-		return fil, nil
+
+	// 4. Post-open safety check: verify the handle itself (closing the tiny TOCTOU race window
+	// between inspectExistingStagingFile and os.OpenFile).
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("failed to stat open staging file handle %q: %w", tmpName, err)
 	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("staging file handle %q is not a regular file after open (mode: %v)", tmpName, fi.Mode())
+	}
+
+	return f, nil
 }
 
 // inspectExistingStagingFile opens path WITHOUT following any reparse point

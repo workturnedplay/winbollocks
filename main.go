@@ -2612,7 +2612,7 @@ func keyDown1(vk uintptr) bool {
 	return (res1.R1 & 0x8000) != 0
 }
 
-// Add this raw proc near your other globals
+// Add this raw proc near your other globals, don't use BoundProc !! XXX: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap.
 var rawGetAsyncKeyState = user32.NewProc("GetAsyncKeyState")
 
 // this is the non-heap allocating one as per Gemini 3.1 Pro
@@ -2620,8 +2620,10 @@ func keyDown(vk uintptr) bool {
 	// By calling rawGetAsyncKeyState.Call directly, we bypass the LazyProcish
 	// interface in BoundProc. The Go compiler's special magic kicks in,
 	// the args stay on the stack, and we drop thousands of heap allocations to ZERO.
+	// XXX: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap.
+	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos
 	ret, _, _ := rawGetAsyncKeyState.Call(vk) //nolint:errcheck // it's void-like?! TODO: double-check
-	_ = ret
+	//_ = ret
 
 	// if ret == 0 {//XXX: actually not sure if R1==0 makes any sense as a failure, seems to mean they're all UP
 	// 	logf("keyDown: rawGetAsyncKeyState failed for vk:%v", vk)
