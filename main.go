@@ -2613,16 +2613,21 @@ func keyDown1(vk uintptr) bool {
 	return (res1.R1 & 0x8000) != 0
 }
 
-// Add this raw proc near your other globals, don't use BoundProc !! XXX: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap.
+// Add this raw proc near your other globals, don't use BoundProc !! XXX: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap. - NOT TRUE, LazyProc.Call still makes it escape, 8 bytes the same as BoundProc.Call
 var rawGetAsyncKeyState = user32.NewProc("GetAsyncKeyState")
 
 // this is the non-heap allocating one as per Gemini 3.1 Pro
 func keyDown(vk uintptr) bool {
 	// By calling rawGetAsyncKeyState.Call directly, we bypass the LazyProcish
 	// interface in BoundProc. The Go compiler's special magic kicks in,
-	// the args stay on the stack, and we drop thousands of heap allocations to ZERO.
-	// XXX: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap.
-	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos
+	// FALSE: the args stay on the stack, and we drop thousands of heap allocations to ZERO.
+	//XXX: false ^, "still performs one heap allocation (8 bytes)." due to LazyProc.Call()
+	// XXX: false: bypassing the LazyProcish interface prevents the variadic ...uintptr slice from escaping to the heap.
+	//wellnevermindTODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos
+	// true: This bypasses BoundProc/WinCall and calls LazyProc directly.
+	// Benchmarking shows this avoids roughly 20 ns of wrapper overhead on
+	// the hot path, although LazyProc.Call itself still performs the same one small
+	// heap allocation(8 bytes) due to its variadic wrapper.
 	ret, _, _ := rawGetAsyncKeyState.Call(vk) //nolint:errcheck // it's void-like?! TODO: double-check
 	//_ = ret
 
