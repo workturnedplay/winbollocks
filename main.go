@@ -255,6 +255,7 @@ var (
 	procGetWindowThreadProcessID = wincoe.NewBoundProc(user32, "GetWindowThreadProcessId", wincoe.CheckZero)
 	procGetWindowPlacement       = wincoe.NewBoundProc(user32, "GetWindowPlacement", wincoe.CheckBool)
 	procGetWindowRect            = wincoe.NewBoundProc(user32, "GetWindowRect", wincoe.CheckBool)
+	procGetClientRect            = wincoe.NewBoundProc(user32, "GetClientRect", wincoe.CheckBool)
 	procShowWindow               = wincoe.NewBoundProc(user32, "ShowWindow", wincoe.CheckNone)
 	procSetWindowPos             = wincoe.NewBoundProc(user32, "SetWindowPos", wincoe.CheckBool)
 
@@ -2823,15 +2824,21 @@ func overlayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr /*
 		}()
 
 		var rect RECT
-		res2 := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+		// res2 := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+		// if res2.Failed() {
+		// 	logf("WM_PAINT in overlayWndProc, GetWindowRect() failed, err: %v, ignoring the rest of the paint.", res2.Err)
+		// 	return 0 //handled
+		// }
+		// rect.Right -= rect.Left
+		// rect.Left = 0
+		// rect.Bottom -= rect.Top
+		// rect.Top = 0
+
+		res2 := procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
 		if res2.Failed() {
-			logf("WM_PAINT in overlayWndProc, GetWindowRect() failed, err: %v, ignoring the rest of the paint.", res2.Err)
+			logf("WM_PAINT in overlayWndProc, GetClientRect() failed, err: %v, ignoring the rest of the paint.", res2.Err)
 			return 0 //handled
 		}
-		rect.Right -= rect.Left
-		rect.Left = 0
-		rect.Bottom -= rect.Top
-		rect.Top = 0
 
 		// 1. Fill background with our global Magenta brush (Transparent Key)
 		res3 := procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), uintptr(magentaBrush))
