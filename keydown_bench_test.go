@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/workturnedplay/wincoe"
+	"golang.org/x/sys/windows"
 	"syscall"
 	"testing"
 )
@@ -34,6 +36,7 @@ func BenchmarkBoundProcKeyDown(b *testing.B) {
 	b.ReportAllocs()
 
 	const vk = uintptr(0x10)
+	var procGetAsyncKeyState = wincoe.NewBoundProc(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -53,5 +56,22 @@ func BenchmarkDirectSyscallNKeyDown(b *testing.B) {
 		r1, _, err := syscall.SyscallN(addr, vk)
 		_ = r1
 		_ = err
+	}
+}
+
+//go:uintptrescapes
+func winCall1(proc *windows.LazyProc, a1 uintptr) uintptr {
+	r1, _, _ := syscall.SyscallN(proc.Addr(), a1)
+	return r1
+}
+
+func BenchmarkWinCall1KeyDown(b *testing.B) {
+	b.ReportAllocs()
+
+	const vk = uintptr(0x10)
+
+	b.ResetTimer()
+	for b.Loop() {
+		_ = winCall1(rawGetAsyncKeyState, vk)
 	}
 }
