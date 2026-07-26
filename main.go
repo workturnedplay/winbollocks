@@ -2279,11 +2279,11 @@ func tryBeginMoveGestureAt(pt POINT, viaMissedGestureRecovery bool) (started, by
 		return false, false
 	}
 	//so startDrag succeeded if we're here
-	session := activeSession.Load()
-	if session == nil {
-		panic("bad coding: nil session after startDrag returned true")
-	}
-	applyFocusAndBringToFrontOnGestureStart(session.targetWnd, pt, &bringToFrontOnDrag, &focusOnDrag, "tryBeginMoveGestureAt")
+	// session := activeSession.Load()
+	// if session == nil {
+	// 	panic("bad coding: nil session after startDrag returned true")
+	// }
+	applyFocusAndBringToFrontOnGestureStart(wantTargetWnd, pt, &bringToFrontOnDrag, &focusOnDrag, "tryBeginMoveGestureAt")
 	return true, false
 }
 
@@ -2386,11 +2386,11 @@ func tryBeginResizeGestureAt(pt POINT, viaMissedGestureRecovery bool) (started, 
 		initialAspectRatio:       float64(w) / float64(h),
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 	})
-	session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
-	if session == nil {
-		panic("bad coding: nil session after storing new resize session")
-	}
-	applyFocusAndBringToFrontOnGestureStart(session.targetWnd, pt, &bringToFrontOnResize, &focusOnResize, "tryBeginResizeGestureAt")
+	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
+	// if session == nil {
+	// 	panic("bad coding: nil session after storing new resize session")
+	// }
+	applyFocusAndBringToFrontOnGestureStart(wantTargetWnd, pt, &bringToFrontOnResize, &focusOnResize, "tryBeginResizeGestureAt")
 	return true, false
 }
 
