@@ -1,5 +1,7 @@
 package main
 
+//GetAsyncKeyState does not need runtime.LockOSThread()
+
 import (
 	"github.com/workturnedplay/wincoe"
 	"golang.org/x/sys/windows"
@@ -36,7 +38,19 @@ func BenchmarkBoundProcKeyDown(b *testing.B) {
 	b.ReportAllocs()
 
 	const vk = uintptr(0x10)
-	var procGetAsyncKeyState = wincoe.NewBoundProc(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
+	var procGetAsyncKeyState = wincoe.NewBoundProcN(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
+
+	b.ResetTimer()
+	for b.Loop() {
+		_ = procGetAsyncKeyState.Call(vk)
+	}
+}
+
+func BenchmarkBoundProcGetAsyncStateArity1(b *testing.B) {
+	b.ReportAllocs()
+
+	const vk = uintptr(0x10)
+	var procGetAsyncKeyState = wincoe.NewBoundProc1(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
 
 	b.ResetTimer()
 	for b.Loop() {

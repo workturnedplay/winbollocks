@@ -1,6 +1,8 @@
 //go:build windows
 // +build windows
 
+//go:generate go run gen_boundproc.go
+
 // Copyright 2026 workturnedplay
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +28,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -35,6 +38,7 @@ import (
 	"golang.org/x/term"
 
 	"net"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -68,7 +72,7 @@ func init() {
 }
 
 var (
-	procSetConsoleTextAttribute = NewBoundProc(Kernel32, "SetConsoleTextAttribute", CheckBool)
+	procSetConsoleTextAttribute = NewBoundProcN(Kernel32, "SetConsoleTextAttribute", CheckBool)
 )
 
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -470,6 +474,10 @@ func Flush() {
 	os.Stdout.Sync() // Tell Windows to flush the file buffers to disk/console
 }
 
+// UnspecifiedWinApi is the string used when empty op name is used
+// const UnspecifiedWinApi string = "unspecified_winapi"
+const THREAD_PRIORITY_ERROR_RETURN int32 = 0x7fffffff
+
 // WinCheckFunc defines a predicate used to determine if a Windows API call failed
 // based on its primary return value (r1). So true means it failed.
 type WinCheckFunc func(r1 uintptr, callErr error) bool
@@ -530,6 +538,13 @@ var (
 	CheckMinusOne WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
 
 	// CheckNone never fails. Used for VOID returns or LRESULTs that require manual checking.
+	// XXX: Using anything other than CheckNone and an error outside the 0..255 range happens,
+	// it will cause the .Call(..) to alloc due to Errno becoming the 'error' interface
+	// and possibly more allocs due to fmt.Errorf formatting
+	//  within the CheckWinResult() call which happens internally when error is sensed!
+	// "Go's runtime uses its static lookup table for integers between 0 and 255.
+	// Returning error codes within this range costs zero heap allocations.
+	// Only error codes >= 256 incur one 8-byte heap allocation to box the syscall.Errno integer into the error interface."
 	CheckNone WinCheckFunc = func(_ uintptr, _ error) bool { return false }
 
 	// CheckNTSTATUS indicates failure if the NTSTATUS code is negative
@@ -629,7 +644,8 @@ func (r WinResult) Succeeded() bool {
 func (r WinResult) ErrIs(target error) bool {
 	if target == nil || target == error(windows.ERROR_SUCCESS) { //nolint:errorlint //we're checking for exactly this, not for one of the wrapped ones being ERROR_SUCCESS! aka // exact sentinel check; wrapped errors are intentionally not matched.
 		GetBugLogger().Error(
-			"BUG: WinResult.ErrIs() cannot be used to test for success; either use WinResult.Succeeded() first then WinResult.ErrIs(target_error) (aka this) to check for exact error, or use WinResult.CallStatusIs(target_error) which allows checking for windows.ERROR_SUCCESS! So, dev. needs to change the callsite!",
+			"BUG: WinResult.ErrIs() cannot be used to test for success; either use WinResult.Succeeded() first then WinResult.ErrIs(target_error) (aka this) to check for exact error, or use WinResult.CallStatusIs(target_error) which allows checking for windows.ERROR_SUCCESS! So, dev. needs to change the callsite! ",
+			slog.Any("stack", debug.Stack()),
 		)
 	}
 	return errors.Is(r.Err, target)
@@ -722,179 +738,228 @@ func CheckWinResult(
 	return fmt.Errorf("%q windows call failed with error: %w", operationNameToIncludeInErrorMessages, callErr)
 }
 
-// UnspecifiedWinApi is the string used when empty op name is used
-const UnspecifiedWinApi string = "unspecified_winapi"
-const THREAD_PRIORITY_ERROR_RETURN int32 = 0x7fffffff
+// // LazyProcishWrapperForMocksN is the minimal interface that WinCall needs from a windows.LazyProc-like object.
+// //
+// // We deliberately avoid the full *windows.LazyProc type to enable mocking.
+// type LazyProcishWrapperForMocksN interface { //formerly named LazyProcish
+// 	// Name returns the name of the procedure (used in error messages).
+// 	//Why Name() instead of a field? Because interfaces in Go cannot require fields — only methods
+// 	Name() string
 
-// LazyProcish is the minimal interface that WinCall needs from a LazyProc-like object.
-//
-// We deliberately avoid the full *windows.LazyProc type to enable mocking.
-type LazyProcish interface {
-	// Name returns the name of the procedure (used in error messages).
-	//Why Name() instead of a field? Because interfaces in Go cannot require fields — only methods
-	Name() string
+// 	// Call invokes the Windows procedure with the given arguments.
+// 	// Signature must match windows.LazyProc.Call exactly.
+// 	Call(a ...uintptr) (r1, r2 uintptr, lastErr error)
+// 	Find() error
+// 	Addr() uintptr
+// }
 
-	// Call invokes the Windows procedure with the given arguments.
-	// Signature must match windows.LazyProc.Call exactly.
-	Call(a ...uintptr) (r1, r2 uintptr, lastErr error)
-	Find() error
-}
+// // realLazyProc wraps *windows.LazyProc to satisfy LazyProcish.
+// //
+// // Embedding gives us .Call() for free via promotion.
+// type realLazyProc struct {
+// 	*windows.LazyProc
+// }
 
-// realLazyProc wraps *windows.LazyProc to satisfy LazyProcish.
-//
-// Embedding gives us .Call() for free via promotion.
-type realLazyProc struct {
-	*windows.LazyProc
-}
+// // Name implements LazyProcish.
+// //
+// // Returns the procedure name for use in error messages.
+// func (r *realLazyProc) Name() string {
+// 	return r.LazyProc.Name
+// }
 
-// Name implements LazyProcish.
-//
-// Returns the procedure name for use in error messages.
-func (r *realLazyProc) Name() string {
-	return r.LazyProc.Name
-}
+// // RealProc wraps a *windows.LazyProc into the testable interface.
+// //
+// // Use this at all production call sites instead of passing *windows.LazyProc directly.
+// //
+// // The real production code that previously called WinCall(&proc, ...) now becomes WinCall(&realLazyProc{LazyProc: &proc}, ...) or you use this tiny helper like:
+// //
+// // r1, r2, err := WinCall(RealProc(proc), CheckBool, uintptr(unsafe.Pointer(&something)), ...)
+// func RealProc(p *windows.LazyProc) LazyProcishWrapperForMocksN {
+// 	return &realLazyProcN{LazyProc: p}
+// }
 
-// RealProc wraps a *windows.LazyProc into the testable interface.
-//
-// Use this at all production call sites instead of passing *windows.LazyProc directly.
-//
-// The real production code that previously called WinCall(&proc, ...) now becomes WinCall(&realLazyProc{LazyProc: &proc}, ...) or you use this tiny helper like:
-//
-// r1, r2, err := WinCall(RealProc(proc), CheckBool, uintptr(unsafe.Pointer(&something)), ...)
-func RealProc(p *windows.LazyProc) LazyProcish {
-	return &realLazyProc{LazyProc: p}
-}
+// // MustLoadProc eagerly resolves a procedure from the given DLL and wraps it into a LazyProcish.
+// // it loads the DLL and resolves the proc, so it unlazifies the whole thing, thus it can panic if DLL or proc cannot be loaded or found
+// //
+// // It is a thin, validated convenience over dll.NewProc(name) + RealProc(...).
+// // This function enforces basic invariants early:
+// //   - dll must be non-nil
+// //
+// // The returned LazyProcish is suitable for use with WinCall or higher-level
+// // binding helpers such as BindFunc.
+// //
+// // MustLoadProc does NOT attach any failure semantics (WinCheckFunc). Callers must
+// // explicitly provide the appropriate check strategy (e.g. CheckBool, CheckHandle)
+// // when invoking the procedure via WinCall or when binding it.
+// //
+// // Panics:
+// //   - if dll is nil
+// func MustLoadProc(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocksN {
+// 	if dll == nil {
+// 		panic2("MustLoadProc: nil dll")
+// 	}
+// 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
+// 	// name = strings.TrimSpace(name)
+// 	// if name == "" {
+// 	// 	panic2("MustLoadProc: empty proc name")
+// 	// }
+// 	lp := dll.NewProc(name)
+// 	// Force resolution now. Find() returns the address or an error.
+// 	if err := lp.Find(); err != nil {
+// 		panic2(fmt.Sprintf("MustLoadProc: unable to find windows API function named %q, err: %v", name, err.Error()))
+// 	}
+// 	return RealProc(lp)
+// }
 
-// RealProc2 resolves a procedure from the given DLL and wraps it into a LazyProcish.
-//
-// It is a thin, validated convenience over dll.NewProc(name) + RealProc(...).
-// This function enforces basic invariants early:
-//   - dll must be non-nil
-//   - name must be non-empty (after trimming whitespace)
-//
-// The returned LazyProcish is suitable for use with WinCall or higher-level
-// binding helpers such as BindFunc.
-//
-// RealProc2 does NOT attach any failure semantics (WinCheckFunc). Callers must
-// explicitly provide the appropriate check strategy (e.g. CheckBool, CheckHandle)
-// when invoking the procedure via WinCall or when binding it.
-//
-// Panics:
-//   - if dll is nil
-//   - if name is empty or whitespace-only
-func RealProc2(dll *windows.LazyDLL, name string) LazyProcish {
-	if dll == nil {
-		panic2("RealProc2: nil dll")
+// // BoundProc
+// // By making this a struct with a method, we can apply //go:uintptrescapes to it.
+
+// // BoundProcN represents a Windows API procedure permanently bound to a
+// // specific failure-checking strategy.
+// //
+// // It wraps a LazyProcish (usually a windows.LazyProc) and a WinCheckFunc.
+// // By using BoundProcN instead of raw Syscall/Call, you centralize error
+// // handling logic for the specific API while maintaining the ability to
+// // use //go:uintptrescapes for memory safety.
+// type BoundProcN struct {
+// 	Proc  LazyProcishWrapperForMocksN
+// 	Check WinCheckFunc
+// }
+
+// // Call executes the underlying Windows procedure with the provided arguments.
+// //
+// // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
+// // To ensure memory safety and prevent "0xc0000005 Access Violation" crashes,
+// // any Go pointer passed as an argument MUST be converted to uintptr using
+// // uintptr(unsafe.Pointer(&x)) directly within the argument list of the
+// // call site.
+// // So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
+// // The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
+// // for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
+// //
+// // Example:
+// //
+// //	var size uint32
+// //	proc.Call(handle, uintptr(unsafe.Pointer(&size)))
+// //
+// // This direct conversion signals the Go compiler to move the variable to
+// // the heap, ensuring its memory address remains stable even if the stack grows.
+// //
+// //go:uintptrescapes
+// func (b *BoundProcN) Call(args ...uintptr) WinResult {
+// 	return WinCallN(b.Proc, b.Check, args...)
+// }
+
+// // Find attempts to locate the procedure in the DLL.
+// // Returns nil if the procedure is successfully found, or an error if it is not.
+// func (b *BoundProcN) Find() error {
+// 	err := b.Proc.Find()
+// 	if err == nil {
+// 		return nil
+// 	} else {
+// 		return fmt.Errorf("BoundProc:Find says that LazyProcish/LaziProc.Find() failed, err: %w", err)
+// 	}
+// }
+
+// // NewBoundProcN initializes a BoundProc by resolving a procedure from the
+// // provided DLL and attaching a result-checking function.
+// // It eagerly resolves the DLL and proc's address so it won't have to do it on the first .Call(..)
+// // Each .Call(..) causes 1 heap alloc of 8 bytes due to variadic args, just like LazyProc.Call(..) does!
+// //
+// // Parameters:
+// //   - dll: A pointer to a windows.LazyDLL (e.g., kernel32, user32).
+// //   - name: The exact string name of the procedure (e.g., "GetProcessId").
+// //   - check: A WinCheckFunc (e.g., CheckBool) used to determine if the
+// //     API call failed based on its return value.
+// //
+// // It panics if the check function is nil.
+// func NewBoundProcN(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProcN {
+// 	if check == nil {
+// 		panic2("NewBoundProc: nil WinCheckFunc passed as arg")
+// 	}
+
+// 	return &BoundProcN{
+// 		Proc:  MustLoadProc(dll, name),
+// 		Check: check,
+// 	}
+// }
+
+// // WinCallN is the low-level engine that executes the syscall and performs
+// // automated error checking.
+// //
+// // It leverages //go:uintptrescapes to signal to the compiler that arguments
+// // may be pointers converted to integers. It calls the procedure, captures
+// // the return values (r1, r2) and the system error, then passes them to
+// // CheckWinResult to produce a clean Go error if the call failed.
+// //
+// // WARNING: you must do the uintptr casting at the args call place (for pointers on stack!) for this to work and not crash randomly because the stack got moved by Go.
+// // The price of absolute memory safety in Go is that you must write uintptr(unsafe.Pointer(...)) explicitly at the exact call site.
+// // This tells the compiler, "Pin this variable right now."
+// //
+// // Use this directly only if you need to bypass the BoundProc abstraction.
+// // Otherwise, use BoundProc.Call for better type organization.
+// //
+// //go:uintptrescapes
+// func WinCallN(proc LazyProcishWrapperForMocksN, check WinCheckFunc, args ...uintptr) WinResult {
+// 	op := validateAndGetOp(proc)
+// 	// if proc == nil {
+// 	// 	panic2("WinCall: nil proc")
+// 	// }
+
+// 	// //op := strings.TrimSpace(proc.Name())
+// 	// op := proc.Name()
+// 	// if op == "" {
+// 	// 	//op = UnspecifiedWinApi
+// 	// 	panic2("BUG: impossible to have empty name in proc/LazyProc/LazyProcish/BoundProc, unless it was overwritten after which shouldn't have been!")
+// 	// }
+// 	// return internalWinCall(op, proc, check, args...)
+
+// 	// args is a []uintptr, but because of //go:uintptrescapes, the caller
+// 	// has already pinned the memory safely before we get here.
+// 	//"Go's proc.Call() always atomcially captures LastError immediately after the C code finishes." as 3rd arg aka CallStatus(should rename to lastError ?! or not it's more confusing!)
+// 	r1, r2, callStatus := proc.Call(args...) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests
+// 	//r1, r2, callStatus := syscall.SyscallN(proc.Addr(), args...) // this is one less wrapper but only 1ns faster than above but fails all tests since they're not mocked!
+// 	//XXX: don't put anything here, which might call a syscall or it might delete the last error for a potential future GetLastError() call, actually it won't because each syscall does atomically setlasterror(0),callapi,getlasterror as 3rd return arg!
+// 	// return WinResult{
+// 	// 	R1:         r1,
+// 	// 	R2:         r2,
+// 	// 	CallStatus: callStatus,
+// 	// 	Err:        CheckWinResult(op, check, r1, callStatus),
+// 	// }
+// 	return makeWinResult(op, check, r1, r2, callStatus)
+// }
+
+// validateAndGetOp handles the nil check and empty name check for any proc wrapper.
+// Any type with a Name() string method satisfies this interface implicitly.
+func validateAndGetOp(proc interface{ Name() string }) string {
+	/*
+		An interface is only equal to nil (proc == nil) if both the Type and the Value are nil:
+		 (nil, nil) --> proc == nil is true
+		However, if someone passes a nil pointer of a concrete struct into your function:
+		 var p *realLazyProc0 = nil
+		 WinCall0(p, check) // 'p' gets implicitly converted to interface{ Name() string }
+		Inside validateAndGetOp(proc interface{ Name() string }):
+		 Interface representation: (*realLazyProc0, nil)
+		 proc == nil evaluates to false because the Type field is *realLazyProc0, not nil.
+		If you only used proc == nil, execution would continue, and as soon as you tried calling proc.Name(),
+		Go would panic with a nil pointer dereference.
+	*/
+	// Robust nil check handling both untyped nil and typed nil interface pointers
+	//if proc == nil || (reflect.ValueOf(proc).Kind() == reflect.Ptr && reflect.ValueOf(proc).IsNil()) {
+	if proc == nil || (reflect.ValueOf(proc).Kind() == reflect.Pointer && reflect.ValueOf(proc).IsNil()) {
+		panic2(fmt.Sprintf("validateAndGetOp: nil proc (type: %T)", proc))
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
-		panic2("RealProc2: empty proc name")
-	}
-	return RealProc(dll.NewProc(name))
-}
-
-// BoundProc
-// By making this a struct with a method, we can apply //go:uintptrescapes to it.
-
-// BoundProc represents a Windows API procedure permanently bound to a
-// specific failure-checking strategy.
-//
-// It wraps a LazyProcish (usually a windows.LazyProc) and a WinCheckFunc.
-// By using BoundProc instead of raw Syscall/Call, you centralize error
-// handling logic for the specific API while maintaining the ability to
-// use //go:uintptrescapes for memory safety.
-type BoundProc struct {
-	Proc  LazyProcish
-	Check WinCheckFunc
-}
-
-// Call executes the underlying Windows procedure with the provided arguments.
-//
-// SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
-// To ensure memory safety and prevent "0xc0000005 Access Violation" crashes,
-// any Go pointer passed as an argument MUST be converted to uintptr using
-// uintptr(unsafe.Pointer(&x)) directly within the argument list of the
-// call site.
-// So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
-// The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
-// for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
-//
-// Example:
-//
-//	var size uint32
-//	proc.Call(handle, uintptr(unsafe.Pointer(&size)))
-//
-// This direct conversion signals the Go compiler to move the variable to
-// the heap, ensuring its memory address remains stable even if the stack grows.
-//
-//go:uintptrescapes
-func (b *BoundProc) Call(args ...uintptr) WinResult {
-	return WinCall(b.Proc, b.Check, args...)
-}
-
-// Find attempts to locate the procedure in the DLL.
-// Returns nil if the procedure is successfully found, or an error if it is not.
-func (b *BoundProc) Find() error {
-	err := b.Proc.Find()
-	if err == nil {
-		return nil
-	} else {
-		return fmt.Errorf("BoundProc:Find says that LazyProcish/LaziProc.Find() failed, err: %w", err)
-	}
-}
-
-// NewBoundProc initializes a BoundProc by resolving a procedure from the
-// provided DLL and attaching a result-checking function.
-//
-// Parameters:
-//   - dll: A pointer to a windows.LazyDLL (e.g., kernel32, user32).
-//   - name: The exact string name of the procedure (e.g., "GetProcessId").
-//   - check: A WinCheckFunc (e.g., CheckBool) used to determine if the
-//     API call failed based on its return value.
-//
-// It panics if the check function is nil.
-func NewBoundProc(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc {
-	if check == nil {
-		panic2("NewBoundProc: nil WinCheckFunc passed as arg")
-	}
-
-	return &BoundProc{
-		Proc:  RealProc2(dll, name),
-		Check: check,
-	}
-}
-
-// WARNING: you must do the uintptr casting at the args call place (for pointers on stack!) for this to work and not crash randomly because the stack got moved by Go.
-// The price of absolute memory safety in Go is that you must write uintptr(unsafe.Pointer(...)) explicitly at the exact call site.
-// This tells the compiler, "Pin this variable right now."
-//
-
-// WinCall is the low-level engine that executes the syscall and performs
-// automated error checking.
-//
-// It leverages //go:uintptrescapes to signal to the compiler that arguments
-// may be pointers converted to integers. It calls the procedure, captures
-// the return values (r1, r2) and the system error, then passes them to
-// CheckWinResult to produce a clean Go error if the call failed.
-//
-// Use this directly only if you need to bypass the BoundProc abstraction.
-// Otherwise, use BoundProc.Call for better type organization.
-//
-//go:uintptrescapes
-func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) WinResult {
-	if proc == nil {
-		panic2("WinCall: nil proc")
-	}
-
-	op := strings.TrimSpace(proc.Name())
+	name := proc.Name()
+	op := strings.TrimSpace(name)
 	if op == "" {
-		op = UnspecifiedWinApi
+		panic2(fmt.Sprintf("Shouldn't have empty name in proc (type: %T) unless you set it afterwards by mistake directly via `LazyProc.Name=`, you had %q", proc, name))
+		//panic2("BUG: impossible to have empty name in proc/LazyProc/LazyProcish/BoundProc, unless it was overwritten after which shouldn't have been!")
 	}
-	// args is a []uintptr, but because of //go:uintptrescapes, the caller
-	// has already pinned the memory safely before we get here.
-	//"Go's proc.Call() always atomcially captures LastError immediately after the C code finishes." as 3rd arg aka CallStatus(should rename to lastError ?! or not it's more confusing!)
-	r1, r2, callStatus := proc.Call(args...)
-	//XXX: don't put anything here, which might call a syscall or it might delete the last error for a potential future GetLastError() call.
+	return op
+}
+
+// makeWinResult packages raw call outputs into a WinResult using your check function.
+func makeWinResult(op string, check WinCheckFunc, r1, r2 uintptr, callStatus error) WinResult {
 	return WinResult{
 		R1:         r1,
 		R2:         r2,
@@ -905,25 +970,27 @@ func WinCall(proc LazyProcish, check WinCheckFunc, args ...uintptr) WinResult {
 
 var (
 	Iphlpapi                = windows.NewLazySystemDLL("iphlpapi.dll")
-	procGetExtendedUdpTable = NewBoundProc(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
-	procGetExtendedTcpTable = NewBoundProc(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
+	procGetExtendedUdpTable = NewBoundProcN(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
+	procGetExtendedTcpTable = NewBoundProcN(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
 
 	// Secure: restricts DLL search path strictly to %SystemRoot%\System32
 	Kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 	// Note: QueryFullProcessNameW expects 'size' to include the null terminator
 	// on input, and returns the length WITHOUT the null terminator on success.
-	procQueryFullProcessName     = NewBoundProc(Kernel32, "QueryFullProcessImageNameW", CheckBool)
-	procCreateToolhelp32Snapshot = NewBoundProc(Kernel32, "CreateToolhelp32Snapshot", CheckHandle)
-	procProcess32First           = NewBoundProc(Kernel32, "Process32FirstW", CheckBool)
-	procProcess32Next            = NewBoundProc(Kernel32, "Process32NextW", CheckBool)
+	procQueryFullProcessName     = NewBoundProcN(Kernel32, "QueryFullProcessImageNameW", CheckBool)
+	procCreateToolhelp32Snapshot = NewBoundProcN(Kernel32, "CreateToolhelp32Snapshot", CheckHandle)
+	procProcess32First           = NewBoundProcN(Kernel32, "Process32FirstW", CheckBool)
+	procProcess32Next            = NewBoundProcN(Kernel32, "Process32NextW", CheckBool)
 
 	//procWriteConsoleInputW = Kernel32.NewProc("WriteConsoleInputW")
-	procWriteConsoleInputW = NewBoundProc(Kernel32, "WriteConsoleInputW", CheckBool)
+	procWriteConsoleInputW = NewBoundProcN(Kernel32, "WriteConsoleInputW", CheckBool)
 
 	//procReadConsoleInputW = Kernel32.NewProc("ReadConsoleInputW")
 	//procPeekConsoleInputW = Kernel32.NewProc("PeekConsoleInputW")
-	procPeekConsoleInputW = NewBoundProc(Kernel32, "PeekConsoleInputW", CheckBool)
-	procReadConsoleInputW = NewBoundProc(Kernel32, "ReadConsoleInputW", CheckBool)
+	procPeekConsoleInputW = NewBoundProcN(Kernel32, "PeekConsoleInputW", CheckBool)
+	procReadConsoleInputW = NewBoundProcN(Kernel32, "ReadConsoleInputW", CheckBool)
+
+	User32 = windows.NewLazySystemDLL("user32.dll")
 )
 
 // auto runs before main(), loads the DLLs non-lazily.
@@ -935,6 +1002,7 @@ func init() {
 func loadDll(dll *windows.LazyDLL) {
 	err := dll.Load()
 	if err != nil {
+		//TODO: technically not a "BUG: " yet using panic2 means it will use GetBugLogger() to log it!
 		panic2("critical system dll " + dll.Name + " not found, error: " + err.Error())
 	}
 }
@@ -2068,7 +2136,7 @@ func InjectConsoleKey(vkCode, scanCode uint16, char rune) error {
 }
 
 var (
-	procReplaceFileW = NewBoundProc(Kernel32, "ReplaceFileW", CheckBool)
+	procReplaceFileW = NewBoundProcN(Kernel32, "ReplaceFileW", CheckBool)
 )
 
 // Add this to your wincoe bindings / main_api.go
