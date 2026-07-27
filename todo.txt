@@ -1,5 +1,7 @@
 todo:
 
+* during resize if I add/hold shift it should resize the opposite corner ie. without me moving to it, so eg. I'm resizing horizontally on the right by dragging(left or right, no matter) and then i hold shift and drag it should act as if i'm at the opposite corner so left side and resizing there; however I'm unsure what should the mouse do, stay frozen in place during? or jump to left side and sync with the resizing there(and if shift becomes unheld so UP then jump back to where it was (on the right side) before shift got held down)?
+
 * check this in keyDown "	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos", this is 2a from https://gemini.google.com/app/6e1c3d86680d8e74 
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
