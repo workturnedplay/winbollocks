@@ -75,18 +75,39 @@ func MustLoadProcN(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProcN: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProcN: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProcN(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProcN: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProcN: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProcN lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocksN
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProcN(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocksN {
+	if dll == nil {
+		panic2("LazyLoadProcN: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProcN: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProcN{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -157,6 +178,23 @@ func NewBoundProcN(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProcN initializes a BoundProcN without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProcN(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProcN {
+	if check == nil {
+		panic2("NewLazyBoundProcN: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProcN{
+		Proc:  LazyLoadProcN(dll, name),
+		Check: check,
+	}
+}
+
 // WinCallN is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -177,17 +215,17 @@ func NewBoundProcN(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCallN(proc LazyProcishWrapperForMocksN, check WinCheckFunc, args ...uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCallN(proc, check, args...)
 }
 
 //go:uintptrescapes
 func internalWinCallN(proc LazyProcishWrapperForMocksN, check WinCheckFunc, args ...uintptr) WinResult {
-	r1, r2, callStatus := proc.Call(args...) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests; so this means it will do 1 alloc of 8 bytes for the variadic slice of args
+	r1, r2, callStatus := proc.Call(args...) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests; so this means it will do a total of 1 alloc of 8 bytes for the variadic slice of args(The only allocation happens at the very top call site when the user calls BoundProcN.Call(a, b, c))
 	return makeWinResult(proc.Name(), check, r1, r2, callStatus)
 }
 
@@ -256,18 +294,39 @@ func MustLoadProc0(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc0: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc0: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc0(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc0: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc0: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc0 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks0
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc0(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks0 {
+	if dll == nil {
+		panic2("LazyLoadProc0: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc0: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc0{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -338,6 +397,23 @@ func NewBoundProc0(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc0 initializes a BoundProc0 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc0(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc0 {
+	if check == nil {
+		panic2("NewLazyBoundProc0: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc0{
+		Proc:  LazyLoadProc0(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall0 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -356,11 +432,11 @@ func NewBoundProc0(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 
 func WinCall0(proc LazyProcishWrapperForMocks0, check WinCheckFunc) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall0(proc, check)
 }
 
@@ -435,18 +511,39 @@ func MustLoadProc1(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc1: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc1: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc1(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc1: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc1: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc1 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks1
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc1(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks1 {
+	if dll == nil {
+		panic2("LazyLoadProc1: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc1: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc1{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -517,6 +614,23 @@ func NewBoundProc1(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc1 initializes a BoundProc1 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc1(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc1 {
+	if check == nil {
+		panic2("NewLazyBoundProc1: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc1{
+		Proc:  LazyLoadProc1(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall1 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -537,11 +651,11 @@ func NewBoundProc1(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall1(proc LazyProcishWrapperForMocks1, check WinCheckFunc, a1 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall1(proc, check, a1)
 }
 
@@ -617,18 +731,39 @@ func MustLoadProc2(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc2: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc2: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc2(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc2: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc2: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc2 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks2
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc2(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks2 {
+	if dll == nil {
+		panic2("LazyLoadProc2: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc2: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc2{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -699,6 +834,23 @@ func NewBoundProc2(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc2 initializes a BoundProc2 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc2(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc2 {
+	if check == nil {
+		panic2("NewLazyBoundProc2: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc2{
+		Proc:  LazyLoadProc2(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall2 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -719,11 +871,11 @@ func NewBoundProc2(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall2(proc LazyProcishWrapperForMocks2, check WinCheckFunc, a1, a2 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall2(proc, check, a1, a2)
 }
 
@@ -799,18 +951,39 @@ func MustLoadProc3(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc3: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc3: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc3(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc3: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc3: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc3 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks3
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc3(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks3 {
+	if dll == nil {
+		panic2("LazyLoadProc3: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc3: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc3{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -881,6 +1054,23 @@ func NewBoundProc3(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc3 initializes a BoundProc3 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc3(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc3 {
+	if check == nil {
+		panic2("NewLazyBoundProc3: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc3{
+		Proc:  LazyLoadProc3(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall3 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -901,11 +1091,11 @@ func NewBoundProc3(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall3(proc LazyProcishWrapperForMocks3, check WinCheckFunc, a1, a2, a3 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall3(proc, check, a1, a2, a3)
 }
 
@@ -981,18 +1171,39 @@ func MustLoadProc4(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc4: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc4: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc4(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc4: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc4: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc4 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks4
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc4(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks4 {
+	if dll == nil {
+		panic2("LazyLoadProc4: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc4: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc4{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1063,6 +1274,23 @@ func NewBoundProc4(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc4 initializes a BoundProc4 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc4(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc4 {
+	if check == nil {
+		panic2("NewLazyBoundProc4: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc4{
+		Proc:  LazyLoadProc4(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall4 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1083,11 +1311,11 @@ func NewBoundProc4(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall4(proc LazyProcishWrapperForMocks4, check WinCheckFunc, a1, a2, a3, a4 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall4(proc, check, a1, a2, a3, a4)
 }
 
@@ -1163,18 +1391,39 @@ func MustLoadProc5(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc5: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc5: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc5(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc5: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc5: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc5 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks5
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc5(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks5 {
+	if dll == nil {
+		panic2("LazyLoadProc5: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc5: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc5{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1245,6 +1494,23 @@ func NewBoundProc5(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc5 initializes a BoundProc5 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc5(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc5 {
+	if check == nil {
+		panic2("NewLazyBoundProc5: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc5{
+		Proc:  LazyLoadProc5(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall5 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1265,11 +1531,11 @@ func NewBoundProc5(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall5(proc LazyProcishWrapperForMocks5, check WinCheckFunc, a1, a2, a3, a4, a5 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall5(proc, check, a1, a2, a3, a4, a5)
 }
 
@@ -1345,18 +1611,39 @@ func MustLoadProc6(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc6: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc6: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc6(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc6: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc6: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc6 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks6
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc6(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks6 {
+	if dll == nil {
+		panic2("LazyLoadProc6: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc6: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc6{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1427,6 +1714,23 @@ func NewBoundProc6(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc6 initializes a BoundProc6 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc6(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc6 {
+	if check == nil {
+		panic2("NewLazyBoundProc6: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc6{
+		Proc:  LazyLoadProc6(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall6 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1447,11 +1751,11 @@ func NewBoundProc6(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall6(proc LazyProcishWrapperForMocks6, check WinCheckFunc, a1, a2, a3, a4, a5, a6 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall6(proc, check, a1, a2, a3, a4, a5, a6)
 }
 
@@ -1527,18 +1831,39 @@ func MustLoadProc7(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc7: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc7: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc7(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc7: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc7: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc7 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks7
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc7(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks7 {
+	if dll == nil {
+		panic2("LazyLoadProc7: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc7: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc7{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1609,6 +1934,23 @@ func NewBoundProc7(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc7 initializes a BoundProc7 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc7(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc7 {
+	if check == nil {
+		panic2("NewLazyBoundProc7: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc7{
+		Proc:  LazyLoadProc7(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall7 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1629,11 +1971,11 @@ func NewBoundProc7(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall7(proc LazyProcishWrapperForMocks7, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall7(proc, check, a1, a2, a3, a4, a5, a6, a7)
 }
 
@@ -1709,18 +2051,39 @@ func MustLoadProc8(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc8: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc8: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc8(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc8: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc8: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc8 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks8
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc8(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks8 {
+	if dll == nil {
+		panic2("LazyLoadProc8: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc8: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc8{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1791,6 +2154,23 @@ func NewBoundProc8(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc8 initializes a BoundProc8 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc8(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc8 {
+	if check == nil {
+		panic2("NewLazyBoundProc8: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc8{
+		Proc:  LazyLoadProc8(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall8 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1811,11 +2191,11 @@ func NewBoundProc8(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall8(proc LazyProcishWrapperForMocks8, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall8(proc, check, a1, a2, a3, a4, a5, a6, a7, a8)
 }
 
@@ -1891,18 +2271,39 @@ func MustLoadProc9(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks
 		panic2("MustLoadProc9: nil dll")
 	}
 	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
-	lp := dll.NewProc(name)
-	if lp == nil {
-		panic2(fmt.Sprintf("MustLoadProc9: LazyProc was nil for proc %q in dll %v, this never happens here even if the name isn't found", name, dll))
-	}
+
+	proc := LazyLoadProc9(dll, name)
 
 	// Force resolution now. Find() returns the address or an error.
-	if err := lp.Find(); err != nil {
-		panic2(fmt.Sprintf("MustLoadProc9: unable to find windows API function named %q, err: %v", name, err.Error()))
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc9: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
 	}
 
+	return proc
+}
+
+// LazyLoadProc9 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks9
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc9(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks9 {
+	if dll == nil {
+		panic2("LazyLoadProc9: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc9: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
 	rlp := &realLazyProc9{LazyProc: lp}
-	_ = validateAndGetOp(rlp) //FIXME: this is quite useless here, should happen after NewProc time above! but that one doesn't have Name() function only Name field, so pass name as string?
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
 	return rlp
 }
 
@@ -1973,6 +2374,23 @@ func NewBoundProc9(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 	}
 }
 
+// NewLazyBoundProc9 initializes a BoundProc9 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc9(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc9 {
+	if check == nil {
+		panic2("NewLazyBoundProc9: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc9{
+		Proc:  LazyLoadProc9(dll, name),
+		Check: check,
+	}
+}
+
 // WinCall9 is the low-level engine that executes the syscall and performs
 // automated error checking.
 //
@@ -1993,16 +2411,676 @@ func NewBoundProc9(dll *windows.LazyDLL, name string, check WinCheckFunc) *Bound
 //
 //go:uintptrescapes
 func WinCall9(proc LazyProcishWrapperForMocks9, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) WinResult {
-	name := validateAndGetOp(proc)
-	pname := proc.Name()
-	if name != pname {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
-	}
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
 	return internalWinCall9(proc, check, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 }
 
 //go:uintptrescapes
 func internalWinCall9(proc LazyProcishWrapperForMocks9, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) WinResult {
 	r1, r2, callStatus := proc.Call(a1, a2, a3, a4, a5, a6, a7, a8, a9) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests
+	return makeWinResult(proc.Name(), check, r1, r2, callStatus)
+}
+
+// ----------------------------------------------------------------------------
+// Arity 10
+// ----------------------------------------------------------------------------
+
+// LazyProcishWrapperForMocks10 is the minimal interface that WinCall10 needs from a windows.LazyProc-like object.
+//
+// We deliberately avoid the full *windows.LazyProc type to enable mocking.
+type LazyProcishWrapperForMocks10 interface {
+	// Name returns the name of the procedure (used in error messages).
+	//Why Name() instead of a field? Because interfaces in Go cannot require fields — only methods
+	Name() string
+
+	// Call invokes the Windows procedure with the given arguments.
+	// Signature must match windows.LazyProc.Call exactly.
+	Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) (r1, r2 uintptr, lastErr error)
+
+	Find() error
+	Addr() uintptr
+}
+
+// realLazyProc10 wraps *windows.LazyProc to satisfy interface LazyProcishWrapperForMocks10.
+//
+// Embedding gives us .Call() for free via promotion.
+type realLazyProc10 struct {
+	*windows.LazyProc
+}
+
+// Name implements LazyProcishWrapperForMocks10.
+//
+// Returns the procedure name for use in error messages.
+func (r *realLazyProc10) Name() string {
+	return r.LazyProc.Name
+}
+
+//go:uintptrescapes
+func (r *realLazyProc10) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) (r1, r2 uintptr, lastErr error) {
+	// Calling syscall.SyscallN directly with discrete(or variadic) arguments triggers a Go 1.18+
+	// compiler intrinsic that entirely avoids variadic slice allocation because SyscallN is compiler-special.
+	// so zero allocations instead of 1 of 8 bytes which LazyProc.Call(..) would cause
+	r1, r2, errno := syscall.SyscallN(r.LazyProc.Addr(), a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
+	// SyscallN returns syscall.Errno, which satisfies the error interface.
+	// CheckWinResult handles ERROR_SUCCESS (0) correctly as success.
+	return r1, r2, errno
+}
+
+// MustLoadProc10 eagerly resolves a procedure from the given DLL and wraps it into a LazyProcishWrapperForMocks10.
+// it loads the DLL and resolves the proc, so it unlazifies the whole thing, thus it can panic if DLL or proc cannot be loaded or found
+//
+// It is a thin, validated convenience over dll.NewProc(name) + RealProc(...).
+// This function enforces basic invariants early:
+//   - dll must be non-nil
+//
+// The returned LazyProcishWrapperForMocks10 is suitable for use with WinCall or higher-level
+// binding helpers such as BindFunc. //FIXME: outdated, BindFunc?!
+//
+// MustLoadProc10 does NOT attach any failure semantics (WinCheckFunc). Callers must
+// explicitly provide the appropriate check strategy (e.g. CheckBool, CheckHandle)
+// when invoking the procedure via WinCall10 or when binding it.
+//
+// Panics:
+//   - if dll is nil
+func MustLoadProc10(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks10 {
+	if dll == nil {
+		panic2("MustLoadProc10: nil dll")
+	}
+	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
+
+	proc := LazyLoadProc10(dll, name)
+
+	// Force resolution now. Find() returns the address or an error.
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc10: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
+	}
+
+	return proc
+}
+
+// LazyLoadProc10 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks10
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc10(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks10 {
+	if dll == nil {
+		panic2("LazyLoadProc10: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc10: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
+	rlp := &realLazyProc10{LazyProc: lp}
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
+	return rlp
+}
+
+// BoundProcN represents a Windows API procedure permanently bound to a
+// specific failure-checking strategy.
+//
+// It wraps a LazyProcishWrapperForMocks10 (usually a windows.LazyProc or a mock for tests) and a WinCheckFunc.
+// By using BoundProcN instead of raw Syscall/Call, you centralize error
+// handling logic for the specific API while maintaining the ability to
+// use //go:uintptrescapes for memory safety.
+type BoundProc10 struct {
+	Proc  LazyProcishWrapperForMocks10
+	Check WinCheckFunc
+}
+
+// Call executes the underlying Windows procedure with the provided arguments.
+//
+// SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
+// To ensure memory safety and prevent "0xc0000005 Access Violation" crashes,
+// any Go pointer passed as an argument MUST be converted to uintptr using
+// uintptr(unsafe.Pointer(&x)) directly within the argument list of the
+// call site.
+// So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
+// The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
+// for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
+//
+// Example:
+//
+//	var size uint32
+//	proc.Call(handle, uintptr(unsafe.Pointer(&size)))
+//
+// This direct conversion signals the Go compiler to move the variable to
+// the heap, ensuring its memory address remains stable even if the stack grows.
+//
+//go:uintptrescapes
+func (b *BoundProc10) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) WinResult {
+	return internalWinCall10(b.Proc, b.Check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
+}
+
+// Find attempts to locate the procedure in the DLL.
+// Returns nil if the procedure is successfully found, or an error if it is not.
+func (b *BoundProc10) Find() error {
+	if err := b.Proc.Find(); err != nil {
+		return fmt.Errorf("BoundProc10:Find says that LazyProcishWrapperForMocks10/LazyProc.Find() failed, err: %w", err)
+	}
+	return nil
+}
+
+// NewBoundProc10 initializes a BoundProc10 by resolving a procedure from the
+// provided DLL and attaching a result-checking function.
+// It eagerly resolves the DLL and proc's address so it won't have to do it on the first .Call(..)
+// Each .Call(..) causes 1 heap alloc of 8 bytes due to variadic args, just like LazyProc.Call(..) does!
+//
+// Parameters:
+//   - dll: A pointer to a windows.LazyDLL (e.g., kernel32, user32).
+//   - name: The exact string name of the procedure (e.g., "GetProcessId").
+//   - check: A WinCheckFunc (e.g., CheckBool) used to determine if the
+//     API call failed based on its return value.
+//
+// It panics if the check function is nil.
+func NewBoundProc10(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc10 {
+	if check == nil {
+		panic2("NewBoundProc10: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc10{
+		Proc:  MustLoadProc10(dll, name),
+		Check: check,
+	}
+}
+
+// NewLazyBoundProc10 initializes a BoundProc10 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc10(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc10 {
+	if check == nil {
+		panic2("NewLazyBoundProc10: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc10{
+		Proc:  LazyLoadProc10(dll, name),
+		Check: check,
+	}
+}
+
+// WinCall10 is the low-level engine that executes the syscall and performs
+// automated error checking.
+//
+// It leverages //go:uintptrescapes to signal to the compiler that arguments
+// may be pointers converted to integers. It calls the procedure, captures
+// the return values (r1, r2) and the system error(actually it's GetLastError() and a SetLastError(0) was called before calling the procedure, this is auto-done atomically by Go via SyscallN()),
+//
+//	then passes them to
+//
+// CheckWinResult to produce a clean Go error if the call failed.
+//
+// WARNING: you must do the uintptr casting at the args call place (for pointers on stack!) for this to work and not crash randomly because the stack got moved by Go.
+// The price of absolute memory safety in Go is that you must write uintptr(unsafe.Pointer(...)) explicitly at the exact call site.
+// This tells the compiler, "Pin this variable right now."
+//
+// Use this directly only if you need to bypass the BoundProc abstraction.
+// Otherwise, use BoundProc.Call for better type organization.
+//
+//go:uintptrescapes
+func WinCall10(proc LazyProcishWrapperForMocks10, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) WinResult {
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
+	return internalWinCall10(proc, check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
+}
+
+//go:uintptrescapes
+func internalWinCall10(proc LazyProcishWrapperForMocks10, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) WinResult {
+	r1, r2, callStatus := proc.Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests
+	return makeWinResult(proc.Name(), check, r1, r2, callStatus)
+}
+
+// ----------------------------------------------------------------------------
+// Arity 11
+// ----------------------------------------------------------------------------
+
+// LazyProcishWrapperForMocks11 is the minimal interface that WinCall11 needs from a windows.LazyProc-like object.
+//
+// We deliberately avoid the full *windows.LazyProc type to enable mocking.
+type LazyProcishWrapperForMocks11 interface {
+	// Name returns the name of the procedure (used in error messages).
+	//Why Name() instead of a field? Because interfaces in Go cannot require fields — only methods
+	Name() string
+
+	// Call invokes the Windows procedure with the given arguments.
+	// Signature must match windows.LazyProc.Call exactly.
+	Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) (r1, r2 uintptr, lastErr error)
+
+	Find() error
+	Addr() uintptr
+}
+
+// realLazyProc11 wraps *windows.LazyProc to satisfy interface LazyProcishWrapperForMocks11.
+//
+// Embedding gives us .Call() for free via promotion.
+type realLazyProc11 struct {
+	*windows.LazyProc
+}
+
+// Name implements LazyProcishWrapperForMocks11.
+//
+// Returns the procedure name for use in error messages.
+func (r *realLazyProc11) Name() string {
+	return r.LazyProc.Name
+}
+
+//go:uintptrescapes
+func (r *realLazyProc11) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) (r1, r2 uintptr, lastErr error) {
+	// Calling syscall.SyscallN directly with discrete(or variadic) arguments triggers a Go 1.18+
+	// compiler intrinsic that entirely avoids variadic slice allocation because SyscallN is compiler-special.
+	// so zero allocations instead of 1 of 8 bytes which LazyProc.Call(..) would cause
+	r1, r2, errno := syscall.SyscallN(r.LazyProc.Addr(), a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+	// SyscallN returns syscall.Errno, which satisfies the error interface.
+	// CheckWinResult handles ERROR_SUCCESS (0) correctly as success.
+	return r1, r2, errno
+}
+
+// MustLoadProc11 eagerly resolves a procedure from the given DLL and wraps it into a LazyProcishWrapperForMocks11.
+// it loads the DLL and resolves the proc, so it unlazifies the whole thing, thus it can panic if DLL or proc cannot be loaded or found
+//
+// It is a thin, validated convenience over dll.NewProc(name) + RealProc(...).
+// This function enforces basic invariants early:
+//   - dll must be non-nil
+//
+// The returned LazyProcishWrapperForMocks11 is suitable for use with WinCall or higher-level
+// binding helpers such as BindFunc. //FIXME: outdated, BindFunc?!
+//
+// MustLoadProc11 does NOT attach any failure semantics (WinCheckFunc). Callers must
+// explicitly provide the appropriate check strategy (e.g. CheckBool, CheckHandle)
+// when invoking the procedure via WinCall11 or when binding it.
+//
+// Panics:
+//   - if dll is nil
+func MustLoadProc11(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks11 {
+	if dll == nil {
+		panic2("MustLoadProc11: nil dll")
+	}
+	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
+
+	proc := LazyLoadProc11(dll, name)
+
+	// Force resolution now. Find() returns the address or an error.
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc11: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
+	}
+
+	return proc
+}
+
+// LazyLoadProc11 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks11
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc11(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks11 {
+	if dll == nil {
+		panic2("LazyLoadProc11: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc11: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
+	rlp := &realLazyProc11{LazyProc: lp}
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
+	return rlp
+}
+
+// BoundProcN represents a Windows API procedure permanently bound to a
+// specific failure-checking strategy.
+//
+// It wraps a LazyProcishWrapperForMocks11 (usually a windows.LazyProc or a mock for tests) and a WinCheckFunc.
+// By using BoundProcN instead of raw Syscall/Call, you centralize error
+// handling logic for the specific API while maintaining the ability to
+// use //go:uintptrescapes for memory safety.
+type BoundProc11 struct {
+	Proc  LazyProcishWrapperForMocks11
+	Check WinCheckFunc
+}
+
+// Call executes the underlying Windows procedure with the provided arguments.
+//
+// SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
+// To ensure memory safety and prevent "0xc0000005 Access Violation" crashes,
+// any Go pointer passed as an argument MUST be converted to uintptr using
+// uintptr(unsafe.Pointer(&x)) directly within the argument list of the
+// call site.
+// So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
+// The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
+// for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
+//
+// Example:
+//
+//	var size uint32
+//	proc.Call(handle, uintptr(unsafe.Pointer(&size)))
+//
+// This direct conversion signals the Go compiler to move the variable to
+// the heap, ensuring its memory address remains stable even if the stack grows.
+//
+//go:uintptrescapes
+func (b *BoundProc11) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) WinResult {
+	return internalWinCall11(b.Proc, b.Check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+}
+
+// Find attempts to locate the procedure in the DLL.
+// Returns nil if the procedure is successfully found, or an error if it is not.
+func (b *BoundProc11) Find() error {
+	if err := b.Proc.Find(); err != nil {
+		return fmt.Errorf("BoundProc11:Find says that LazyProcishWrapperForMocks11/LazyProc.Find() failed, err: %w", err)
+	}
+	return nil
+}
+
+// NewBoundProc11 initializes a BoundProc11 by resolving a procedure from the
+// provided DLL and attaching a result-checking function.
+// It eagerly resolves the DLL and proc's address so it won't have to do it on the first .Call(..)
+// Each .Call(..) causes 1 heap alloc of 8 bytes due to variadic args, just like LazyProc.Call(..) does!
+//
+// Parameters:
+//   - dll: A pointer to a windows.LazyDLL (e.g., kernel32, user32).
+//   - name: The exact string name of the procedure (e.g., "GetProcessId").
+//   - check: A WinCheckFunc (e.g., CheckBool) used to determine if the
+//     API call failed based on its return value.
+//
+// It panics if the check function is nil.
+func NewBoundProc11(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc11 {
+	if check == nil {
+		panic2("NewBoundProc11: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc11{
+		Proc:  MustLoadProc11(dll, name),
+		Check: check,
+	}
+}
+
+// NewLazyBoundProc11 initializes a BoundProc11 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc11(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc11 {
+	if check == nil {
+		panic2("NewLazyBoundProc11: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc11{
+		Proc:  LazyLoadProc11(dll, name),
+		Check: check,
+	}
+}
+
+// WinCall11 is the low-level engine that executes the syscall and performs
+// automated error checking.
+//
+// It leverages //go:uintptrescapes to signal to the compiler that arguments
+// may be pointers converted to integers. It calls the procedure, captures
+// the return values (r1, r2) and the system error(actually it's GetLastError() and a SetLastError(0) was called before calling the procedure, this is auto-done atomically by Go via SyscallN()),
+//
+//	then passes them to
+//
+// CheckWinResult to produce a clean Go error if the call failed.
+//
+// WARNING: you must do the uintptr casting at the args call place (for pointers on stack!) for this to work and not crash randomly because the stack got moved by Go.
+// The price of absolute memory safety in Go is that you must write uintptr(unsafe.Pointer(...)) explicitly at the exact call site.
+// This tells the compiler, "Pin this variable right now."
+//
+// Use this directly only if you need to bypass the BoundProc abstraction.
+// Otherwise, use BoundProc.Call for better type organization.
+//
+//go:uintptrescapes
+func WinCall11(proc LazyProcishWrapperForMocks11, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) WinResult {
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
+	return internalWinCall11(proc, check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
+}
+
+//go:uintptrescapes
+func internalWinCall11(proc LazyProcishWrapperForMocks11, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) WinResult {
+	r1, r2, callStatus := proc.Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests
+	return makeWinResult(proc.Name(), check, r1, r2, callStatus)
+}
+
+// ----------------------------------------------------------------------------
+// Arity 12
+// ----------------------------------------------------------------------------
+
+// LazyProcishWrapperForMocks12 is the minimal interface that WinCall12 needs from a windows.LazyProc-like object.
+//
+// We deliberately avoid the full *windows.LazyProc type to enable mocking.
+type LazyProcishWrapperForMocks12 interface {
+	// Name returns the name of the procedure (used in error messages).
+	//Why Name() instead of a field? Because interfaces in Go cannot require fields — only methods
+	Name() string
+
+	// Call invokes the Windows procedure with the given arguments.
+	// Signature must match windows.LazyProc.Call exactly.
+	Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) (r1, r2 uintptr, lastErr error)
+
+	Find() error
+	Addr() uintptr
+}
+
+// realLazyProc12 wraps *windows.LazyProc to satisfy interface LazyProcishWrapperForMocks12.
+//
+// Embedding gives us .Call() for free via promotion.
+type realLazyProc12 struct {
+	*windows.LazyProc
+}
+
+// Name implements LazyProcishWrapperForMocks12.
+//
+// Returns the procedure name for use in error messages.
+func (r *realLazyProc12) Name() string {
+	return r.LazyProc.Name
+}
+
+//go:uintptrescapes
+func (r *realLazyProc12) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) (r1, r2 uintptr, lastErr error) {
+	// Calling syscall.SyscallN directly with discrete(or variadic) arguments triggers a Go 1.18+
+	// compiler intrinsic that entirely avoids variadic slice allocation because SyscallN is compiler-special.
+	// so zero allocations instead of 1 of 8 bytes which LazyProc.Call(..) would cause
+	r1, r2, errno := syscall.SyscallN(r.LazyProc.Addr(), a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+	// SyscallN returns syscall.Errno, which satisfies the error interface.
+	// CheckWinResult handles ERROR_SUCCESS (0) correctly as success.
+	return r1, r2, errno
+}
+
+// MustLoadProc12 eagerly resolves a procedure from the given DLL and wraps it into a LazyProcishWrapperForMocks12.
+// it loads the DLL and resolves the proc, so it unlazifies the whole thing, thus it can panic if DLL or proc cannot be loaded or found
+//
+// It is a thin, validated convenience over dll.NewProc(name) + RealProc(...).
+// This function enforces basic invariants early:
+//   - dll must be non-nil
+//
+// The returned LazyProcishWrapperForMocks12 is suitable for use with WinCall or higher-level
+// binding helpers such as BindFunc. //FIXME: outdated, BindFunc?!
+//
+// MustLoadProc12 does NOT attach any failure semantics (WinCheckFunc). Callers must
+// explicitly provide the appropriate check strategy (e.g. CheckBool, CheckHandle)
+// when invoking the procedure via WinCall12 or when binding it.
+//
+// Panics:
+//   - if dll is nil
+func MustLoadProc12(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks12 {
+	if dll == nil {
+		panic2("MustLoadProc12: nil dll")
+	}
+	loadDll(dll) // make it non-lazy, load it now if not loaded! or panic if loading fails!
+
+	proc := LazyLoadProc12(dll, name)
+
+	// Force resolution now. Find() returns the address or an error.
+	if err := proc.Find(); err != nil {
+		panic2(fmt.Sprintf("MustLoadProc12: unable to find windows API function named %q actual %q, err: %v", name, proc.Name(), err.Error()))
+	}
+
+	return proc
+}
+
+// LazyLoadProc12 lazily wraps a procedure from the given DLL into a LazyProcishWrapperForMocks12
+// without loading the DLL or resolving the symbol eagerly.
+//
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if dll is nil
+func LazyLoadProc12(dll *windows.LazyDLL, name string) LazyProcishWrapperForMocks12 {
+	if dll == nil {
+		panic2("LazyLoadProc12: nil dll")
+	}
+	lp := dll.NewProc(name)
+	if lp == nil {
+		panic2(fmt.Sprintf("BUG: unexpected in LazyLoadProc12: LazyProc was nil for proc %q in dll %v", name, dll))
+	}
+
+	//validateProcName(lp) // can't, it's LazyProc.Name as field not Name() as func.!
+
+	rlp := &realLazyProc12{LazyProc: lp}
+
+	validateProcName(rlp) //FIXME: this is quite useless here, well it's just late, it should happen after NewProc time above! but that one aka LazyProc doesn't have Name() function only Name field, so pass name as string?
+
+	return rlp
+}
+
+// BoundProcN represents a Windows API procedure permanently bound to a
+// specific failure-checking strategy.
+//
+// It wraps a LazyProcishWrapperForMocks12 (usually a windows.LazyProc or a mock for tests) and a WinCheckFunc.
+// By using BoundProcN instead of raw Syscall/Call, you centralize error
+// handling logic for the specific API while maintaining the ability to
+// use //go:uintptrescapes for memory safety.
+type BoundProc12 struct {
+	Proc  LazyProcishWrapperForMocks12
+	Check WinCheckFunc
+}
+
+// Call executes the underlying Windows procedure with the provided arguments.
+//
+// SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
+// To ensure memory safety and prevent "0xc0000005 Access Violation" crashes,
+// any Go pointer passed as an argument MUST be converted to uintptr using
+// uintptr(unsafe.Pointer(&x)) directly within the argument list of the
+// call site.
+// So //go:uintptrescapes = escape to heap + keep-alive for the duration of the call.
+// The compiler inserts the necessary liveness (equivalent to an implicit KeepAlive across the entire function call)
+// for any argument passed as uintptr(unsafe.Pointer(...)) to a function marked //go:uintptrescapes.
+//
+// Example:
+//
+//	var size uint32
+//	proc.Call(handle, uintptr(unsafe.Pointer(&size)))
+//
+// This direct conversion signals the Go compiler to move the variable to
+// the heap, ensuring its memory address remains stable even if the stack grows.
+//
+//go:uintptrescapes
+func (b *BoundProc12) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) WinResult {
+	return internalWinCall12(b.Proc, b.Check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+}
+
+// Find attempts to locate the procedure in the DLL.
+// Returns nil if the procedure is successfully found, or an error if it is not.
+func (b *BoundProc12) Find() error {
+	if err := b.Proc.Find(); err != nil {
+		return fmt.Errorf("BoundProc12:Find says that LazyProcishWrapperForMocks12/LazyProc.Find() failed, err: %w", err)
+	}
+	return nil
+}
+
+// NewBoundProc12 initializes a BoundProc12 by resolving a procedure from the
+// provided DLL and attaching a result-checking function.
+// It eagerly resolves the DLL and proc's address so it won't have to do it on the first .Call(..)
+// Each .Call(..) causes 1 heap alloc of 8 bytes due to variadic args, just like LazyProc.Call(..) does!
+//
+// Parameters:
+//   - dll: A pointer to a windows.LazyDLL (e.g., kernel32, user32).
+//   - name: The exact string name of the procedure (e.g., "GetProcessId").
+//   - check: A WinCheckFunc (e.g., CheckBool) used to determine if the
+//     API call failed based on its return value.
+//
+// It panics if the check function is nil.
+func NewBoundProc12(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc12 {
+	if check == nil {
+		panic2("NewBoundProc12: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc12{
+		Proc:  MustLoadProc12(dll, name),
+		Check: check,
+	}
+}
+
+// NewLazyBoundProc12 initializes a BoundProc12 without eagerly resolving the procedure or DLL.
+// DLL loading and symbol resolution are deferred until the first .Find() or .Call(...) invocation.
+// Use this for optional Windows APIs that may not exist on older Windows versions.
+//
+// Panics:
+//   - if check is nil
+//   - if dll is nil
+func NewLazyBoundProc12(dll *windows.LazyDLL, name string, check WinCheckFunc) *BoundProc12 {
+	if check == nil {
+		panic2("NewLazyBoundProc12: nil WinCheckFunc passed as arg")
+	}
+	return &BoundProc12{
+		Proc:  LazyLoadProc12(dll, name),
+		Check: check,
+	}
+}
+
+// WinCall12 is the low-level engine that executes the syscall and performs
+// automated error checking.
+//
+// It leverages //go:uintptrescapes to signal to the compiler that arguments
+// may be pointers converted to integers. It calls the procedure, captures
+// the return values (r1, r2) and the system error(actually it's GetLastError() and a SetLastError(0) was called before calling the procedure, this is auto-done atomically by Go via SyscallN()),
+//
+//	then passes them to
+//
+// CheckWinResult to produce a clean Go error if the call failed.
+//
+// WARNING: you must do the uintptr casting at the args call place (for pointers on stack!) for this to work and not crash randomly because the stack got moved by Go.
+// The price of absolute memory safety in Go is that you must write uintptr(unsafe.Pointer(...)) explicitly at the exact call site.
+// This tells the compiler, "Pin this variable right now."
+//
+// Use this directly only if you need to bypass the BoundProc abstraction.
+// Otherwise, use BoundProc.Call for better type organization.
+//
+//go:uintptrescapes
+func WinCall12(proc LazyProcishWrapperForMocks12, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) WinResult {
+	validateProcName(proc)
+	// pname:=proc.Name()
+	// if name != pname {
+	// 	panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!", pname, name))
+	// }
+	return internalWinCall12(proc, check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
+}
+
+//go:uintptrescapes
+func internalWinCall12(proc LazyProcishWrapperForMocks12, check WinCheckFunc, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) WinResult {
+	r1, r2, callStatus := proc.Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12) // this is one more wrapper ie. windows.LazyProc.Call() but I need it to can use mocked tests
 	return makeWinResult(proc.Name(), check, r1, r2, callStatus)
 }

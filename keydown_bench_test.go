@@ -38,11 +38,11 @@ func BenchmarkBoundProcKeyDown(b *testing.B) {
 	b.ReportAllocs()
 
 	const vk = uintptr(0x10)
-	var procGetAsyncKeyState = wincoe.NewBoundProcN(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
+	var procGetAsyncKeyStateN = wincoe.NewBoundProcN(wincoe.User32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
 
 	b.ResetTimer()
 	for b.Loop() {
-		_ = procGetAsyncKeyState.Call(vk)
+		_ = procGetAsyncKeyStateN.Call(vk)
 	}
 }
 
@@ -50,11 +50,11 @@ func BenchmarkBoundProcGetAsyncStateArity1(b *testing.B) {
 	b.ReportAllocs()
 
 	const vk = uintptr(0x10)
-	var procGetAsyncKeyState = wincoe.NewBoundProc1(user32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
+	var procGetAsyncKeyState1 = wincoe.NewBoundProc1(wincoe.User32, "GetAsyncKeyState", wincoe.CheckNone) // returns short
 
 	b.ResetTimer()
 	for b.Loop() {
-		_ = procGetAsyncKeyState.Call(vk)
+		_ = procGetAsyncKeyState1.Call(vk)
 	}
 }
 
@@ -63,6 +63,7 @@ func BenchmarkDirectSyscallNKeyDown(b *testing.B) {
 
 	const vk = uintptr(0x10) // VK_SHIFT
 
+	var rawGetAsyncKeyState = wincoe.User32.NewProc("GetAsyncKeyState")
 	addr := rawGetAsyncKeyState.Addr()
 
 	b.ResetTimer()
@@ -83,6 +84,7 @@ func BenchmarkWinCall1KeyDown(b *testing.B) {
 	b.ReportAllocs()
 
 	const vk = uintptr(0x10)
+	var rawGetAsyncKeyState = wincoe.User32.NewProc("GetAsyncKeyState")
 
 	b.ResetTimer()
 	for b.Loop() {

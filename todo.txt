@@ -1,10 +1,20 @@
 todo:
 
-* switch to fixed arity NewBoundProcX
+* these may be too spammy:
+ [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
+ [Wed Jul 29 22:23:16.291664700 CEST 2026] hideOverlay() executed while overlay was already hidden!
+ 
+* the hideOverlay() getting executed during winkey+LMB drag-move is to be avoided perhaps?!
+
+* move consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
+
+* if during drag-move gesture, or drag-resize gesture, while i still hold the winkey and the relevant mouse button, and I press ESC, then, act as an undo and move(or resize) back to original position(or size), but unsure if I should also move mouse cursor/pointer back too(probably should!); why? because sometimes I drag-move by accident the wrong big ass window and I just wanna undo it instead of carefully place it back where it was. This probably also means, restore the maximization if it were maximized initially (because once the move/resize gesture starts I do a Restore if it was maximized, so if i undo, i wanna undo the move/resize and then re-maximize after if it were maximized)
+
+* ensure the ctrlc handler aka the 'ctrlHandler' var can only run once? or if it runs again (which is gonna be on a new thread due to how windows runs it(assuming Gemini 3.6 Flash Thinking wasn't wrong about this)) then make sure it won't crash.
+
+* check for things that should be atomic like mainMsgHwnd since it's used in ctrlc handler aka 'ctrlHandler' and deinitMainMsgHwnd() is checking it then setting it to 0 (we should make this atomic in a way that we still get the original value to use in the 'if' block for 'procDestroyWindow' and the potential 'logf' call in there.
 
 * during resize if I add/hold shift it should resize the opposite corner ie. without me moving to it, so eg. I'm resizing horizontally on the right by dragging(left or right, no matter) and then i hold shift and drag it should act as if i'm at the opposite corner so left side and resizing there; however I'm unsure what should the mouse do, stay frozen in place during? or jump to left side and sync with the resizing there(and if shift becomes unheld so UP then jump back to where it was (on the right side) before shift got held down)?
-
-* check this in keyDown "	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos", this is 2a from https://gemini.google.com/app/6e1c3d86680d8e74 
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
 
@@ -30,6 +40,14 @@ dontdothis:
 
 //failedtodo//* other gestures like at least winkey+MMB should work when coming from higher UIPI and doing the MMB on the lower/normal UIPI window, currently only winkey+LMB and winkey+RMB have this feature.
 
+//* find out which proc*.Call() functions, well more their wrappers, should take/return windows.Handle and which windows.HWND !! look in main_api.go mostly and see how they're called/used in main.go ! Gemini 3.1 Pro says: "4. windows.Handle vs windows.HWND
+ This is a classic Go Win32 dilemma.
+ Under the hood in golang.org/x/sys/windows:
+    Handle is an alias for uintptr.
+    HWND is an alias for Handle.
+ At runtime, they are identical. However, the x/sys/windows library itself is incredibly inconsistent. Some of its own native structs use Handle, and some use HWND.
+ The Recommendation: Standardize entirely on windows.Handle across your codebase.
+ If you try to strictly use HWND for windows and Handle for Mutexes/DCs/Processes, you will end up fighting Go's strong typing. You'll constantly be doing windows.HWND(myHandle) or windows.Handle(myHwnd) just to pass variables into basic functions like SetWindowPos, because Go does not allow implicit conversion between defined types, even if their underlying types are identical."
 
 worksasintended(don't fix):
 
@@ -63,6 +81,8 @@ worksasintended(don't fix):
  logQuitClosed only becomes true from closeAndFlushLog(), which runs from primary_defer()/secondary_defer()/hookWorkerSecondaryDefer() — all of which only fire after deinit() has sent WM_QUIT to the hook thread and its GetMessage loop has already broken. mouseProc/keyboardProc only get invoked reentrant during that loop, so by the time logQuitClosed is set, they shouldn't be firing anymore regardless of whether UnhookWindowsHookEx has literally completed yet — the loop not calling GetMessage anymore is what actually stops callback delivery. The bounded 2s timeout in primary_defer()'s wait doesn't change this, since it's the loop-exit (not the unhook call) that matters. Given the fix here already recommended in item 5 (the watchdog), I don't think a further change is warranted." But I didn't do the watchdog because I don't want an os.Exit and clear/lose the console after 10 minutes of waiting at 'press a key' so... but I do want a thread exit ie. thread/goroutine is done and just exits as in "return", which shouldn't cause the whole program to exit.
 
 
+
+
 hallucinated/hand-waved:
 
 //* **The Issue (`slog` Key-Value signature risk):** You call `log.Warn(..., SafeErr(ondeleteErr))`.
@@ -91,3 +111,12 @@ done:
 
 //* todo fixes from: https://gemini.google.com/app/6e1c3d86680d8e74 (done: 1a,1b,2a,2b,2c todo: )
 
+//* switch to fixed arity NewBoundProcX
+
+//* check this in keyDown "	//TODO: find out which others would benefit from this same treatment by being in the hot path eg. procSetWindowPos", this is 2a from https://gemini.google.com/app/6e1c3d86680d8e74 
+
+//* RootWindowFromPoint seems kinda ugly due to the need to check both .Failed() and hwnd==0 to know it's no good. I mean, if hwnd==0 it coulda failed, must check .Failed() to know for sure, else it coulda ligit returned 0. Unsure if to keep it this way or what. // "Keep it this way. It explicitly separates System Failures (res.Failed()) from State/Logic Results (hwnd == 0)." - Gemini 3.1 Pro
+
+//* try to avoid casting R1 to windows.Handle in the return of SetWinEventHook at call-site, maybe by returning two args: R1 (properly cast) and WinResult. Same problem with: LoadIconByID, GetTopWindow, maybe also CreateMutex, 
+
+//* ensure the main_api.go wrappers of proc*.Call() which accept function are using the expected signature for them, maybe? else if they use too many args or too few it would crash at runtime. Like for those proc* that set hooks. I think I may have done that already, currently, but worth a double-check! Gotta be sure no uintptr or 'any' args are accepting functions or accepting windows.NewCallback(func) but all accept only predefined function sigs.
