@@ -293,6 +293,7 @@ const (
 	WM_BRING_TO_FRONT              = WM_USER + 206
 	WM_DO_RELEASE_CAPTURE          = WM_USER + 215
 	WM_CANCEL_GESTURE              = WM_USER + 220
+	WM_APPLY_SHIFT_MIRROR          = WM_USER + 225
 )
 const (
 	MENU_EXIT                                      = 1
@@ -599,6 +600,45 @@ type dragSession struct {
 	// began on a maximized window leaves it maximized again instead of
 	// stranding it at its aligned-under-cursor restored size/position.
 	wasMaximizedAtStart bool
+
+	// originalRect/originalPt record the window's rect and the cursor's
+	// position at the very moment THIS gesture began -- set once, in
+	// startManualDrag (ModeMove) or tryBeginResizeGestureAt (ModeResize),
+	// and never touched again for the rest of the gesture's lifetime,
+	// unlike state.startRect/startPt (which handleShiftMirrorToggle DOES
+	// replace, every time Shift is pressed/released, to rebaseline resize
+	// math against the window's live size at each toggle -- see its doc
+	// comment). cancelActiveGesture (the ESC-to-undo feature) deliberately
+	// reads THESE fields instead of state.startRect/startPt, so an ESC
+	// press always restores the window to how it looked before ANY part of
+	// the gesture happened, regardless of how many times Shift was toggled
+	// in between.
+	originalRect wincoe.RECT
+	originalPt   wincoe.POINT
+
+	// shiftMirrorActive, mirrorReturnZone, and mirrorReturnPt implement the
+	// Shift-held resize accelerator (see handleShiftMirrorToggle, triggered
+	// from keyboardProc's real Shift key-down/key-up events via
+	// postShiftMirrorToggleIfNeeded/WM_APPLY_SHIFT_MIRROR -- NOT lazily
+	// discovered on the next mouse move, so the cursor warp below happens
+	// instantly on the key transition with no mouse movement required):
+	// holding Shift mid-resize warps the cursor to the point-reflected
+	// position in the diametrically-opposite resize zone and replaces
+	// activeSession with a fresh *dragSession rebaselined there (size
+	// frozen at whatever it currently is), so the resize continues exactly
+	// as if it had started fresh from that opposite zone -- letting one
+	// gesture push/pull both edges instead of requiring two separate ones.
+	// shiftMirrorActive is true only on such a mirrored session (always
+	// false for ModeMove, and false for an ordinary non-mirrored
+	// ModeResize session). mirrorReturnZone/mirrorReturnPt only have
+	// meaningful values when shiftMirrorActive is true: they record the
+	// ORIGINAL (pre-mirror) zone and the cursor's exact screen position
+	// immediately before the mirror warp, so releasing Shift can warp the
+	// cursor back and rebaseline back to that original zone (against the
+	// window's live rect at release time, not the pre-mirror rect).
+	shiftMirrorActive bool
+	mirrorReturnZone  int
+	mirrorReturnPt    wincoe.POINT
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -759,8 +799,172 @@ func oppositeResizeZone(zone int) int {
 	}
 }
 
-// const minimumW = 300
-// const minimumH = 300
+// mirrorPointInRect reflects pt through the center of r -- a combined
+// horizontal AND vertical point-reflection (equivalent to a 180-degree
+// rotation about r's center). Reflecting the raw cursor position through
+// the whole window's center this way is self-similar at any granularity:
+// it simultaneously (a) moves the cursor into the diametrically-opposite
+// resize zone and (b) mirrors its relative position within that zone --
+// both horizontally and vertically -- without needing to reason about
+// zones or sub-grids explicitly.
+func mirrorPointInRect(pt wincoe.POINT, r wincoe.RECT) wincoe.POINT {
+	return wincoe.POINT{
+		X: r.Left + r.Right - pt.X,
+		Y: r.Top + r.Bottom - pt.Y,
+	}
+}
+
+// handleShiftMirrorToggle implements the Shift-held resize accelerator: it
+// lets a single resize gesture push/pull BOTH edges/corners of a window
+// without the cursor ever needing to physically travel between them.
+//
+// shiftDown is the caller's already-determined target state -- NOT
+// re-derived here via keyDown(VK_SHIFT)/GetAsyncKeyState. This is called
+// from wndProc's WM_APPLY_SHIFT_MIRROR handler, itself triggered the
+// instant keyboardProc sees a real WM_KEYDOWN/WM_KEYUP transition for
+// VK_SHIFT/VK_LSHIFT/VK_RSHIFT (see postShiftMirrorToggleIfNeeded) --
+// deliberately NOT discovered lazily by polling Shift's state on the next
+// WM_MOUSEMOVE, so the cursor warp happens immediately on the key
+// transition itself, with no mouse movement required to trigger it. On a
+// transition (shiftDown != session.shiftMirrorActive), it:
+//
+//  1. Reads the window's LIVE rect via GetWindowRect -- deliberately NOT
+//     session.state.startRect -- so the window's size at the exact moment
+//     of the toggle is preserved unchanged; only the baseline used for
+//     FUTURE resize computation changes.
+//  2. Point-reflects the current cursor position through that live rect's
+//     center (see mirrorPointInRect) and warps the OS cursor there via
+//     SetCursorPos.
+//  3. Replaces activeSession with a brand-new *dragSession whose
+//     state.startRect/startPt are the live rect/warped cursor position and
+//     whose resizeZone is the opposite zone (pressing Shift) or the
+//     original zone again (releasing Shift) -- so calculateResize treats
+//     this exactly as if a fresh resize gesture had just started from
+//     there. originalRect/originalPt are carried through UNCHANGED from
+//     the prior session (see their doc comment on dragSession -- ESC-
+//     cancel depends on these staying fixed across any number of mirror
+//     toggles).
+//
+// Releasing Shift warps the cursor back to mirrorReturnPt (its exact
+// screen position immediately before the mirror-triggered warp) and
+// rebaselines back to mirrorReturnZone, again against the window's live
+// rect at release time -- so resizing continues seamlessly from the
+// original edge/corner using whatever size resulted from the mirrored
+// phase, rather than snapping back to the pre-mirror size.
+//
+// Returns the new session if a transition was applied (callers should log
+// its target/zone if they need to; the session is already published via
+// activeSession.Store internally), or nil if shiftDown already matched
+// session.shiftMirrorActive (a redundant call -- e.g. a duplicate
+// WM_APPLY_SHIFT_MIRROR queued during Shift's OS key-repeat before the
+// first one was processed; see postShiftMirrorToggleIfNeeded's doc
+// comment).
+func handleShiftMirrorToggle(session *dragSession, cursorPt wincoe.POINT, shiftDown bool) *dragSession {
+	if shiftDown == session.shiftMirrorActive {
+		return nil // already in the requested state
+	}
+
+	var liveRect wincoe.RECT
+	if res := wincoe.GetWindowRect(session.targetWnd, &liveRect); res.Failed() {
+		logf("handleShiftMirrorToggle: GetWindowRect on HWND=0x%X failed, err: %v; skipping shift-mirror toggle for this event", session.targetWnd, res.Err)
+		return nil
+	}
+	w := liveRect.Right - liveRect.Left
+	h := liveRect.Bottom - liveRect.Top
+	if w <= 0 || h <= 0 {
+		logf("handleShiftMirrorToggle: invalid live window size %dx%d for HWND=0x%X; skipping toggle", w, h, session.targetWnd)
+		return nil
+	}
+
+	next := &dragSession{
+		targetWnd:                session.targetWnd,
+		mode:                     ModeResize,
+		viaMissedGestureRecovery: session.viaMissedGestureRecovery,
+		wasMaximizedAtStart:      session.wasMaximizedAtStart,
+		initialAspectRatio:       float64(w) / float64(h),
+		originalRect:             session.originalRect, // carried through unchanged, see doc comment
+		originalPt:               session.originalPt,
+	}
+
+	if shiftDown {
+		// Entering mirrored mode: freeze current size, warp cursor to the
+		// point-reflection of its current position, resize fresh from the
+		// diametrically opposite zone.
+		mirroredPt := mirrorPointInRect(cursorPt, liveRect)
+		if res := wincoe.SetCursorPos(mirroredPt.X, mirroredPt.Y); res.Failed() {
+			logf("handleShiftMirrorToggle: SetCursorPos (mirror warp) failed: %v", res.Err)
+		}
+		next.state = dragState{startPt: mirroredPt, startRect: liveRect}
+		next.resizeZone = oppositeResizeZone(session.resizeZone)
+		next.shiftMirrorActive = true
+		next.mirrorReturnZone = session.resizeZone
+		next.mirrorReturnPt = cursorPt
+		logf("Shift held during resize of HWND=0x%X: mirroring from zone %d to zone %d, cursor warped from (%d,%d) to (%d,%d)",
+			session.targetWnd, session.resizeZone, next.resizeZone, cursorPt.X, cursorPt.Y, mirroredPt.X, mirroredPt.Y)
+	} else {
+		// Releasing mirrored mode: warp the cursor back to exactly where it
+		// was right before the mirror warp, and rebaseline back to the
+		// original zone against the window's live (post-mirror-resize) rect.
+		if res := wincoe.SetCursorPos(session.mirrorReturnPt.X, session.mirrorReturnPt.Y); res.Failed() {
+			logf("handleShiftMirrorToggle: SetCursorPos (mirror restore) failed: %v", res.Err)
+		}
+		next.state = dragState{startPt: session.mirrorReturnPt, startRect: liveRect}
+		next.resizeZone = session.mirrorReturnZone
+		next.shiftMirrorActive = false
+		logf("Shift released during resize of HWND=0x%X: returning to zone %d, cursor warped back to (%d,%d)",
+			session.targetWnd, next.resizeZone, session.mirrorReturnPt.X, session.mirrorReturnPt.Y)
+	}
+
+	activeSession.Store(next)
+	return next
+}
+
+// postShiftMirrorToggleIfNeeded is keyboardProc's entry point into the
+// Shift-mirror resize accelerator (see handleShiftMirrorToggle). Called on
+// every real (non-injected) WM_KEYDOWN/WM_SYSKEYDOWN or
+// WM_KEYUP/WM_SYSKEYUP transition of a Shift key, with intendedShiftDown
+// set directly from which of those two event kinds fired -- true for
+// down, false for up -- rather than by reading keyDown(VK_SHIFT)/
+// GetAsyncKeyState afterward, which the hook callback can observe as
+// stale relative to the very transition currently being handled (the
+// identical caveat this file's own winkey-up handling already documents
+// for GetAsyncKeyState during a hook callback).
+//
+// If a ModeResize gesture is active and its shiftMirrorActive state
+// doesn't already match intendedShiftDown, posts WM_APPLY_SHIFT_MIRROR to
+// the main thread, which performs the actual GetWindowRect/SetCursorPos/
+// session-swap work (see wndProc's WM_APPLY_SHIFT_MIRROR case) -- none of
+// that runs directly on the hook thread here, consistent with every other
+// window-mutating action in this codebase.
+//
+// The session != nil / mode==ModeResize / shiftMirrorActive-mismatch check
+// here is a plain, unsynchronized read of an already-loaded activeSession
+// snapshot -- safe per activeSession's own "fields never altered after
+// storing, RCU-style" invariant -- and exists purely to avoid spamming
+// PostMessage on every auto-repeated WM_KEYDOWN while a physical Shift key
+// stays held. It is NOT the authoritative check: wndProc's handler
+// reloads activeSession fresh and re-verifies via
+// handleShiftMirrorToggle's own comparison, so a benign race here (e.g.
+// several auto-repeat events queued before the first WM_APPLY_SHIFT_MIRROR
+// is processed) produces at most a couple of harmless no-op duplicate
+// posts, never an incorrect or missed toggle.
+func postShiftMirrorToggleIfNeeded(intendedShiftDown bool) {
+	session := activeSession.Load()
+	if session == nil || session.mode != ModeResize {
+		return // no active resize gesture; nothing to mirror
+	}
+	if session.shiftMirrorActive == intendedShiftDown {
+		return // already in the requested state, or OS key-repeat; avoid a redundant post
+	}
+
+	var shiftFlag uintptr
+	if intendedShiftDown {
+		shiftFlag = 1
+	}
+	if res := wincoe.PostMessage(loadMainMsgHwnd(), WM_APPLY_SHIFT_MIRROR, uintptr(session.targetWnd), shiftFlag); res.Failed() {
+		logf("postShiftMirrorToggleIfNeeded: PostMessage WM_APPLY_SHIFT_MIRROR (intendedShiftDown=%v) failed: %v", intendedShiftDown, res.Err)
+	}
+}
 
 func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x, y, w, h int32) {
 	drag := session.state
@@ -1773,6 +1977,8 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		state:                    dragState{startPt: pt, startRect: r},
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 		wasMaximizedAtStart:      wasMaximized,
+		originalRect:             r,
+		originalPt:               pt,
 	})
 	return true
 }
@@ -2049,6 +2255,8 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (st
 		initialAspectRatio:       float64(w) / float64(h),
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 		wasMaximizedAtStart:      wasMaximized,
+		originalRect:             r,
+		originalPt:               pt,
 	})
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
@@ -2360,7 +2568,7 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 			logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
 		}
 	} else {
-		logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
+		logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0")
 	}
 }
 
@@ -2387,7 +2595,14 @@ func hardReset(releaseCapture bool) {
 // directly.
 func cancelActiveGesture(session *dragSession) {
 	target := session.targetWnd
-	r := session.state.startRect
+	// Deliberately session.originalRect, NOT session.state.startRect: the
+	// Shift-mirror accelerator (see handleShiftMirrorToggle) replaces
+	// state.startRect/startPt every time Shift is toggled mid-resize, but
+	// originalRect/originalPt are set once at gesture start and never
+	// touched again -- so ESC always undoes all the way back to how the
+	// window looked before this gesture began, no matter how many mirror
+	// toggles happened since.
+	r := session.originalRect
 	w := r.Right - r.Left
 	h := r.Bottom - r.Top
 
@@ -2409,7 +2624,7 @@ func cancelActiveGesture(session *dragSession) {
 		_ = wincoe.ShowWindow(target, wincoe.SW_MAXIMIZE)
 	}
 
-	if res := wincoe.SetCursorPos(session.state.startPt.X, session.state.startPt.Y); res.Failed() {
+	if res := wincoe.SetCursorPos(session.originalPt.X, session.originalPt.Y); res.Failed() {
 		logf("cancelActiveGesture: SetCursorPos (restore cursor to gesture-start position) failed: %v", res.Err)
 	}
 
@@ -3671,20 +3886,18 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
+
+			// Shift-held resize mirroring (see handleShiftMirrorToggle) is
+			// now triggered directly from keyboardProc's real Shift
+			// key-transition events -- posted via WM_APPLY_SHIFT_MIRROR to
+			// the main thread the instant the key transitions, with no
+			// dependency on a mouse-move event arriving first -- rather
+			// than being detected here by polling keyDown(VK_SHIFT) on
+			// every move. session.resizeZone always reflects whichever
+			// zone (original or mirrored) is currently active by the time
+			// any WM_MOUSEMOVE is processed.
 			if !ShouldThrottle() {
-				// Holding Shift mirrors which edge/corner the drag affects
-				// (see oppositeResizeZone's doc comment) without moving the
-				// cursor or session.resizeZone itself -- the underlying
-				// session/gesture is unaffected, only which zone THIS
-				// resize computation (and its anti-slide correction in
-				// handleActualMoveOrResize, which also reads
-				// data.ResizeZone below) treats as "being dragged" right
-				// now.
-				effectiveZone := session.resizeZone
-				if keyDown(VK_SHIFT) {
-					effectiveZone = oppositeResizeZone(session.resizeZone)
-				}
-				nx, ny, nw, nh := calculateResize(session, info.Pt, effectiveZone) //TODO: move this into wndProc aka into handleActualMove() ?!
+				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone) //TODO: move this into wndProc aka into handleActualMove() ?!
 				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 				if asyncResize.Load() {
 					flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -3696,7 +3909,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					W:          nw,
 					H:          nh,
 					Flags:      flags,
-					ResizeZone: effectiveZone,
+					ResizeZone: session.resizeZone,
 				}
 
 				// Send to your mover channel
@@ -4655,6 +4868,29 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			return 0
 		}
 		cancelActiveGesture(session)
+		return 0
+
+	case WM_APPLY_SHIFT_MIRROR:
+		expectedTarget := windows.Handle(wParam)
+		shiftDown := lParam != 0
+
+		session := activeSession.Load()
+		if session == nil || session.mode != ModeResize {
+			logf("WM_APPLY_SHIFT_MIRROR: no active ModeResize session by the time this was processed; ignoring (shiftDown=%v)", shiftDown)
+			return 0
+		}
+		if session.targetWnd != expectedTarget {
+			logf("WM_APPLY_SHIFT_MIRROR: active session's target HWND=0x%X no longer matches the one this toggle was posted for (0x%X); a new gesture must've started since, ignoring", session.targetWnd, expectedTarget)
+			return 0
+		}
+
+		var cursorPt wincoe.POINT
+		if res := wincoe.GetCursorPos(&cursorPt); res.Failed() {
+			logf("WM_APPLY_SHIFT_MIRROR: GetCursorPos failed: %v; skipping this toggle", res.Err)
+			return 0
+		}
+
+		handleShiftMirrorToggle(session, cursorPt, shiftDown)
 		return 0
 
 	case WM_WTSSESSION_CHANGE:
@@ -5878,10 +6114,21 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// about this gesture ever having reached it.
 			return 1
 		}
+		if vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT {
+			// Checking all three: the low-level keyboard hook has, across
+			// different Windows versions/input paths, been observed to
+			// report either the left/right-specific VK code or the
+			// generic VK_SHIFT for a physical Shift press -- react to
+			// whichever one actually arrives rather than assuming one.
+			postShiftMirrorToggleIfNeeded(true)
+		}
 	}
 
 	// Key UP
 	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
+		if vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT {
+			postShiftMirrorToggleIfNeeded(false)
+		}
 		switch vk {
 		case VK_LWIN, VK_RWIN:
 			//logf("winUP")

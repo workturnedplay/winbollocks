@@ -19,8 +19,6 @@ todo:
 
 * move consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
 
-* during resize if I add/hold shift it should resize the opposite corner ie. without me moving to it, so eg. I'm resizing horizontally on the right by dragging(left or right, no matter) and then i hold shift and drag it should act as if i'm at the opposite corner so left side and resizing there; however I'm unsure what should the mouse do, stay frozen in place during? or jump to left side and sync with the resizing there(and if shift becomes unheld so UP then jump back to where it was (on the right side) before shift got held down)?
-
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
 
 * as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
@@ -131,3 +129,5 @@ done:
 //* ensure the ctrlc handler aka the 'ctrlHandler' var can only run once? or if it runs again (which is gonna be on a new thread due to how windows runs it(assuming Gemini 3.6 Flash Thinking wasn't wrong about this)) then make sure it won't crash.
 
 //* check for things that should be atomic like mainMsgHwnd since it's used in ctrlc handler aka 'ctrlHandler' and deinitMainMsgHwnd() is checking it then setting it to 0 (we should make this atomic in a way that we still get the original value to use in the 'if' block for 'procDestroyWindow' and the potential 'logf' call in there.
+
+//* during resize if I add/hold shift it should resize the opposite corner ie. without me moving to it, so eg. I'm resizing horizontally on the right by dragging(left or right, no matter) and then i hold shift and drag it should act as if i'm at the opposite corner so left side and resizing there; however I'm unsure what should the mouse do, stay frozen in place during? or jump to left side and sync with the resizing there(and if shift becomes unheld so UP then jump back to where it was (on the right side) before shift got held down)?
