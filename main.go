@@ -1727,11 +1727,39 @@ func initTray() error {
 	// res1 := procLoadIcon.Call(0, wincoe.IDI_APPLICATION)
 	// res1 := wincoe.LoadIcon(0, wincoe.IDI_APPLICATION_RESOURCE)
 
-	if tempH, res1 := wincoe.LoadIconByID(0, wincoe.IDI_APPLICATION); res1.Failed() {
-		return fmt.Errorf("LoadIcon IDI_APPLICATION failed, err: %w", res1.Err)
+	// // Load the default embedded icon (resource ID #1 created by go-winres)
+	// if tempH, res1 := wincoe.LoadIconByID(selfHInstance, 1 /*#1 resource!*/); res1.Failed() {
+	// 	logf("LoadIcon of the first resource in the .exe file failed, res: %v", res1)
+	// 	//load an icon that looks like the same one from cmd.exe
+	// 	if tempHfallback, res1 := wincoe.LoadIconByID(0, wincoe.IDI_APPLICATION); res1.Failed() {
+	// 		return fmt.Errorf("LoadIcon IDI_APPLICATION failed, err: %w", res1.Err)
+	// 	} else {
+	// 		trayIcon.HIcon = tempHfallback
+	// 	}
+	// } else {
+	// 	trayIcon.HIcon = tempH
+	// }
+
+	// Fetch the exact dimensions expected for a system tray icon
+	cxSmIcon := wincoe.GetSystemMetrics(wincoe.SM_CXSMICON)
+	cySmIcon := wincoe.GetSystemMetrics(wincoe.SM_CYSMICON)
+
+	// Load the default embedded icon (resource ID #1 created by go-winres)
+	// We use LoadImageByID to explicitly extract the 16x16 (or DPI scaled) variant
+	// rather than letting Windows dynamically squash the 32x32 variant.
+	if tempH, res1 := wincoe.LoadImageByID(selfHInstance, 1 /*#1 resource!*/, wincoe.IMAGE_ICON, cxSmIcon, cySmIcon, 0); res1.Failed() {
+		logf("LoadImageByID of the first resource in the .exe file failed, res: %v", res1)
+
+		// Fallback to the standard application icon if custom load fails
+		if tempHfallback, res1 := wincoe.LoadImageByID(0, wincoe.IDI_APPLICATION, wincoe.IMAGE_ICON, cxSmIcon, cySmIcon, wincoe.LR_SHARED); res1.Failed() {
+			return fmt.Errorf("LoadImageByID IDI_APPLICATION failed, err: %w", res1.Err)
+		} else {
+			trayIcon.HIcon = tempHfallback
+		}
 	} else {
 		trayIcon.HIcon = tempH
 	}
+
 	trayIcon.UCallbackMessage = WM_MYSYSTRAY
 
 	// Notice: We completely removed trayIcon.UTimeoutOrVersion = NOTIFYICON_VERSION_4

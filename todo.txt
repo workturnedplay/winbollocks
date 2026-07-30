@@ -1,7 +1,5 @@
 todo:
 
-* try to use an own-designed icon for the .exe which presumably can be shown as such in explorer but mainly in systray! currently has same icon as the console cmd.exe has.
-
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
  //done//[Wed Jul 29 22:23:16.291664700 CEST 2026] hideOverlay() executed while overlay was already hidden!
@@ -133,3 +131,5 @@ done:
  ".\winbollocks.exe" exited with error code "128"
 
 //* the hideOverlay() getting executed during winkey+LMB drag-move is to be avoided perhaps?! this is due to softReset() doing it unconditionally, see if maybe we can call it only if the overlay is/was showing, which probably means we'd have to keep track of it somehow (in an atomic?) ?
+
+//* try to use an own-designed icon for the .exe which presumably can be shown as such in explorer but mainly in systray! currently has same icon as the console cmd.exe has.
