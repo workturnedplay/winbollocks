@@ -4703,24 +4703,25 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			logf("WM_BRING_TO_FRONT: received with zero HWND; ignoring")
 			return 0
 		}
-		// The real race-closer: check actual Z-order position, not just
-		// foreground identity. See WM_BRING_TO_FRONT's doc comment for why
-		// this catches the case a foreground-only check misses (a new
-		// window already created and already above target, but not yet
-		// foreground).
 		if isAlreadyTopmostInZOrder(target) {
 			logf("WM_BRING_TO_FRONT: HWND=0x%X is already topmost; nothing to promote (skipping SetWindowPos)", target)
 			return 0
 		}
+		// Fetch the current foreground window once and reuse it below for
+		// both the owner-chain check and the optional lParam staleness
+		// recheck, rather than querying GetForegroundWindow() twice for
+		// what is, within this single message handler, the same
+		// point-in-time snapshot.
+		fg := getForegroundWindow()
 		// target may legitimately NOT be topmost while still being exactly
-		// where it should be: if it currently owns the foreground window
-		// (see windowOwnsCurrentForeground's doc comment), that owned
-		// window is correctly sitting above it per Win32's owner/owned
-		// Z-order invariant. Promoting target itself above HWND_TOP here
-		// (with SWP_NOACTIVATE, bypassing the activation path that would
-		// normally keep that invariant intact) would incorrectly shove the
-		// still-focused owned window behind its own owner.
-		if windowOwnsCurrentForeground(target) {
+		// where it should be: if it currently owns fg (see
+		// windowOwnsForeground's doc comment), fg is correctly sitting
+		// above it per Win32's owner/owned Z-order invariant. Promoting
+		// target itself above HWND_TOP here (with SWP_NOACTIVATE, bypassing
+		// the activation path that would normally keep that invariant
+		// intact) would incorrectly shove the still-focused owned window
+		// behind its own owner.
+		if windowOwnsForeground(target, fg) {
 			logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; it currently owns the foreground window, so promoting it would push its own active owned dialog behind it", target)
 			return 0
 		}
@@ -4729,12 +4730,15 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		// point-in-time foreground snapshot and wants us to double-check
 		// it's still accurate before acting -- acting on a stale snapshot
 		// here would silently bury whatever window is ACTUALLY foreground
-		// now underneath 'target'.
-		if lParam != 0 {
-			if current := getForegroundWindow(); current != target {
-				logf("WM_BRING_TO_FRONT: skipping stale request for HWND=0x%X; foreground changed to HWND=0x%X by the time this was processed", target, current)
-				return 0
-			}
+		// now underneath 'target'. This is a plain equality check (NOT
+		// "does target own fg", already handled above): target simply being
+		// focused (fg == target) is exactly the state
+		// tryBringForegroundToFrontAt's whole feature exists to promote out
+		// of the background, so equality here must be treated as "still
+		// valid, proceed" rather than "nothing to do".
+		if lParam != 0 && fg != target {
+			logf("WM_BRING_TO_FRONT: skipping stale request for HWND=0x%X; foreground changed to HWND=0x%X by the time this was processed", target, fg)
+			return 0
 		}
 		if res := wincoe.SetWindowPos(target, wincoe.HWND_TOP, 0, 0, 0, 0,
 			wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
@@ -8218,21 +8222,31 @@ func isAlreadyTopmostInZOrder(hwnd windows.Handle) bool {
 	return res.R1 == 0 // no predecessor in Z-order => hwnd is already topmost
 }
 
-// windowOwnsCurrentForeground reports whether target is the direct or
-// indirect owner of the current foreground window (walking the foreground
-// window's owner chain via GW_OWNER), or is the foreground window itself.
+// windowOwnsForeground reports whether target is the direct or indirect
+// owner of fg (the current foreground window), by walking fg's owner chain
+// via GW_OWNER. Deliberately does NOT treat target == fg itself as
+// "owning" -- fg is passed in by the caller (see WM_BRING_TO_FRONT's
+// handler, which fetches it once via GetForegroundWindow() and reuses it
+// here and for its own separate lParam staleness recheck) specifically so
+// callers can distinguish "target simply IS the focused window" (not
+// necessarily anything to do with Z-order position -- a focused window can
+// still be sitting behind others, which is exactly the state
+// bringToFrontOnBackgroundClick's whole feature exists to promote out of)
+// from "target is the OWNER of whatever dialog currently has focus" (a
+// completely different, Z-order-invariant-driven reason to skip -- see
+// below).
 //
 // This guards WM_BRING_TO_FRONT's HWND_TOP promotion against a specific
 // Win32 Z-order invariant: an owned window (WS_POPUP with its owner set via
 // GWL_HWNDPARENT, e.g. a modal-ish dialog spawned by another dialog -- NOT
-// a WS_CHILD) is always kept above its owner in normal Z-order maintenance,
-// and Windows re-asserts that automatically whenever the OWNED window
-// itself is activated. But SetWindowPos(owner, HWND_TOP, SWP_NOACTIVATE)
-// does not go through that activation path at all -- it can genuinely
-// place the owner ABOVE its own currently-foreground owned window, an
-// inconsistent state (the owned window keeps keyboard focus/an active
-// title bar, yet sits BEHIND its owner in Z-order) that Windows does not
-// auto-correct until something else forces re-activation.
+// a WS_CHILD) is always kept above its owner in Z-order, and Windows
+// re-asserts that automatically whenever the OWNED window itself is
+// activated. But SetWindowPos(owner, HWND_TOP, SWP_NOACTIVATE) does not go
+// through that activation path at all -- it can genuinely place the owner
+// ABOVE its own currently-foreground owned window, an inconsistent state
+// (the owned window keeps keyboard focus/an active title bar, yet sits
+// BEHIND its owner in Z-order) that Windows does not auto-correct until
+// something else forces re-activation.
 //
 // Concretely: Control Panel's Network Connections -> adapter Properties ->
 // double-clicking "Internet Protocol Version 4 (TCP/IPv4)" in the list
@@ -8250,22 +8264,22 @@ func isAlreadyTopmostInZOrder(hwnd windows.Handle) bool {
 // Bounded to maxOwnerChainSteps as a defensive measure; a real owner chain
 // is never remotely that deep. Returns false (never block a legitimate
 // promotion) if the GetWindow(GW_OWNER) walk itself fails partway through.
-func windowOwnsCurrentForeground(target windows.Handle) bool {
-	if target == 0 {
+func windowOwnsForeground(target, fg windows.Handle) bool {
+	if target == 0 || fg == 0 {
 		return false
 	}
-	cur := getForegroundWindow()
+	cur := fg
 	const maxOwnerChainSteps = 32
 	for i := 0; cur != 0 && i < maxOwnerChainSteps; i++ {
-		if cur == target {
-			return true
-		}
 		res := wincoe.GetWindow(cur, wincoe.GW_OWNER)
 		if res.Failed() {
-			logf("windowOwnsCurrentForeground: GetWindow(GW_OWNER) failed for HWND=0x%X while walking owner chain from foreground, res:%v; treating as not-owned so the promotion isn't incorrectly blocked", cur, res)
+			logf("windowOwnsForeground: GetWindow(GW_OWNER) failed for HWND=0x%X while walking owner chain from foreground, res:%v; treating as not-owned so the promotion isn't incorrectly blocked", cur, res)
 			return false
 		}
 		cur = windows.Handle(res.R1)
+		if cur == target {
+			return true
+		}
 	}
 	return false
 }

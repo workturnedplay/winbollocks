@@ -1,5 +1,7 @@
 todo:
 
+* weird focusing bug: I go to Control Panel\Network and Internet\Network Connections right click my network adapter then pick Properties, then i double click "Internet protocol version 4 (TCP/IPv4)" from that list of "This connection uses the following items:" and the Properties for it mini-window thingy appears then immediately goes away , confirmed it goes to back somehow, but if i LMB again (since the one behind is now visible) then it becomes focused and shows itself again. This happens only when bringToFrontOnBackgroundClick is true, not when it's false and not when program isn't running.
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
  
@@ -132,6 +134,4 @@ done:
 //* try to use an own-designed icon for the .exe which presumably can be shown as such in explorer but mainly in systray! currently has same icon as the console cmd.exe has.
 
 //* move the relevant consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
-
-//* weird focusing bug: I go to Control Panel\Network and Internet\Network Connections right click my network adapter then pick Properties, then i double click "Internet protocol version 4 (TCP/IPv4)" from that list of "This connection uses the following items:" and the Properties for it mini-window thingy appears then immediatelly goes away , confirmed it goes to back somehow, but if i LMB again (since the one behind is now visible) then it becomes focused and shows itself again. This happens only when bringToFrontOnBackgroundClick is true, not when it's false and not when program isn't running.
 
