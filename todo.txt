@@ -19,12 +19,6 @@ todo:
 
 * move consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
 
-* if during drag-move gesture, or drag-resize gesture, while i still hold the winkey and the relevant mouse button, and I press ESC, then, act as an undo and move(or resize) back to original position(or size), but unsure if I should also move mouse cursor/pointer back too(probably should!); why? because sometimes I drag-move by accident the wrong big ass window and I just wanna undo it instead of carefully place it back where it was. This probably also means, restore the maximization if it were maximized initially (because once the move/resize gesture starts I do a Restore if it was maximized, so if i undo, i wanna undo the move/resize and then re-maximize after if it were maximized)
-
-* ensure the ctrlc handler aka the 'ctrlHandler' var can only run once? or if it runs again (which is gonna be on a new thread due to how windows runs it(assuming Gemini 3.6 Flash Thinking wasn't wrong about this)) then make sure it won't crash.
-
-* check for things that should be atomic like mainMsgHwnd since it's used in ctrlc handler aka 'ctrlHandler' and deinitMainMsgHwnd() is checking it then setting it to 0 (we should make this atomic in a way that we still get the original value to use in the 'if' block for 'procDestroyWindow' and the potential 'logf' call in there.
-
 * during resize if I add/hold shift it should resize the opposite corner ie. without me moving to it, so eg. I'm resizing horizontally on the right by dragging(left or right, no matter) and then i hold shift and drag it should act as if i'm at the opposite corner so left side and resizing there; however I'm unsure what should the mouse do, stay frozen in place during? or jump to left side and sync with the resizing there(and if shift becomes unheld so UP then jump back to where it was (on the right side) before shift got held down)?
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
@@ -131,3 +125,9 @@ done:
 //* try to avoid casting R1 to windows.Handle in the return of SetWinEventHook at call-site, maybe by returning two args: R1 (properly cast) and WinResult. Same problem with: LoadIconByID, GetTopWindow, maybe also CreateMutex, 
 
 //* ensure the main_api.go wrappers of proc*.Call() which accept function are using the expected signature for them, maybe? else if they use too many args or too few it would crash at runtime. Like for those proc* that set hooks. I think I may have done that already, currently, but worth a double-check! Gotta be sure no uintptr or 'any' args are accepting functions or accepting windows.NewCallback(func) but all accept only predefined function sigs.
+
+//* if during drag-move gesture, or drag-resize gesture, while i still hold the winkey and the relevant mouse button, and I press ESC, then, act as an undo and move(or resize) back to original position(or size), but unsure if I should also move mouse cursor/pointer back too(probably should!); why? because sometimes I drag-move by accident the wrong big ass window and I just wanna undo it instead of carefully place it back where it was. This probably also means, restore the maximization if it were maximized initially (because once the move/resize gesture starts I do a Restore if it was maximized, so if i undo, i wanna undo the move/resize and then re-maximize after if it were maximized)
+
+//* ensure the ctrlc handler aka the 'ctrlHandler' var can only run once? or if it runs again (which is gonna be on a new thread due to how windows runs it(assuming Gemini 3.6 Flash Thinking wasn't wrong about this)) then make sure it won't crash.
+
+//* check for things that should be atomic like mainMsgHwnd since it's used in ctrlc handler aka 'ctrlHandler' and deinitMainMsgHwnd() is checking it then setting it to 0 (we should make this atomic in a way that we still get the original value to use in the 'if' block for 'procDestroyWindow' and the potential 'logf' call in there.

@@ -271,7 +271,6 @@ const (
 
 // Win32 message constants missing from x/sys/windows
 const (
-	WM_USER  = 0x0400
 	WM_CLOSE = 0x0010
 )
 
@@ -283,17 +282,17 @@ const (
 )
 
 const (
-	WM_NULL      = 0
-	WM_MYSYSTRAY = WM_USER + 2
-	//WM_WAKE_UP           = WM_USER + 3
+	WM_NULL                        = 0
+	WM_USER                        = 0x0400
+	WM_MYSYSTRAY                   = WM_USER + 2
 	WM_INJECT_SEQUENCE             = WM_USER + 100
 	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
 	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
 	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = WM_USER + 205
 	WM_BRING_TO_FRONT              = WM_USER + 206
-	// WM_DO_SET_CAPTURE              = WM_USER + 210
-	WM_DO_RELEASE_CAPTURE = WM_USER + 215
+	WM_DO_RELEASE_CAPTURE          = WM_USER + 215
+	WM_CANCEL_GESTURE              = WM_USER + 220
 )
 const (
 	MENU_EXIT                                      = 1
@@ -359,10 +358,10 @@ const (
 	VK_LMENU    = 0xA4 // Left Alt
 	VK_RMENU    = 0xA5 // Right Alt
 
-	VK_E   = 0x45
-	VK_F   = 0x46
-	VK_F12 = 0x7B // F12
-
+	VK_E      = 0x45
+	VK_F      = 0x46
+	VK_F12    = 0x7B // F12
+	VK_ESCAPE = 0x1B
 )
 
 const (
@@ -534,8 +533,7 @@ var (
 	// mouseHook windows.Handle
 	// kbdHook   windows.Handle
 
-	trayIcon    wincoe.NOTIFYICONDATA
-	mainMsgHwnd windows.Handle
+	trayIcon wincoe.NOTIFYICONDATA
 )
 
 // trayIconMu guards all reads/writes to trayIcon (including the
@@ -590,6 +588,17 @@ type dragSession struct {
 	// in case the target ignored our synthetic one, and so whatever window
 	// is now under the cursor gets a normal release.
 	viaMissedGestureRecovery bool
+
+	// wasMaximizedAtStart records whether targetWnd was maximized at the
+	// moment this gesture began (see startManualDrag / tryBeginResizeGestureAt,
+	// both of which SW_RESTORE the window before the drag/resize actually
+	// starts). Consulted only by cancelActiveGesture (triggered by pressing
+	// ESC mid-gesture -- see tryCancelActiveGestureViaEsc and
+	// WM_CANCEL_GESTURE), which re-maximizes the window after undoing the
+	// move/resize back to state.startRect, so cancelling a gesture that
+	// began on a maximized window leaves it maximized again instead of
+	// stranding it at its aligned-under-cursor restored size/position.
+	wasMaximizedAtStart bool
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -718,12 +727,49 @@ func getResizeZone(pt wincoe.POINT, r wincoe.RECT) int {
 	return row*3 + col
 }
 
+// oppositeResizeZone returns the "opposite" resize zone for zone, used when
+// Shift is held during an in-progress drag-resize gesture (see the
+// ModeResize case in mouseProc's WM_MOUSEMOVE handling) so the same raw
+// cursor movement that would normally drag the original edge/corner instead
+// drags the diametrically-opposite one -- e.g. holding Shift while resizing
+// from the right edge makes further right-drags now push/pull the LEFT
+// edge instead, without requiring the cursor to actually move there.
+// ZONE_CENTER has no opposite (it already resizes symmetrically from all
+// sides at once) and mirrors to itself.
+func oppositeResizeZone(zone int) int {
+	switch zone {
+	case ZONE_TOP_LEFT:
+		return ZONE_BOT_RIGHT
+	case ZONE_TOP_CENTER:
+		return ZONE_BOT_CENTER
+	case ZONE_TOP_RIGHT:
+		return ZONE_BOT_LEFT
+	case ZONE_MID_LEFT:
+		return ZONE_MID_RIGHT
+	case ZONE_MID_RIGHT:
+		return ZONE_MID_LEFT
+	case ZONE_BOT_LEFT:
+		return ZONE_TOP_RIGHT
+	case ZONE_BOT_CENTER:
+		return ZONE_TOP_CENTER
+	case ZONE_BOT_RIGHT:
+		return ZONE_TOP_LEFT
+	default: // ZONE_CENTER, or any unexpected value
+		return zone
+	}
+}
+
 // const minimumW = 300
 // const minimumH = 300
 
-func calculateResize(session *dragSession, currentPt wincoe.POINT) (x, y, w, h int32) {
+func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x, y, w, h int32) {
 	drag := session.state
-	zone := session.resizeZone
+	// zone is passed explicitly (rather than read from session.resizeZone
+	// directly) so callers can supply a Shift-mirrored zone (see
+	// oppositeResizeZone) without mutating the otherwise-immutable session
+	// struct (see dragSession's/activeSession's own "fields are never
+	// altered" invariant).
+
 	//Since session.initialAspectRatio is a primitive float64 only utilized within one localized aspect-ratio conditional block, leaving it as a direct property read is both perfectly idiomatic and prevents an unnecessary stack allocation!
 	//var initialAspectRatio float64 = session.initialAspectRatio
 
@@ -1458,13 +1504,14 @@ func copyUTF16Truncated(dst []uint16, s string) {
 }
 
 func initTray() error {
-	if mainMsgHwnd == 0 {
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
 		return fmt.Errorf("main message window is not initialized")
 	}
 	trayIconMu.Lock()
 	defer trayIconMu.Unlock()
 
-	trayIcon.HWnd = mainMsgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
+	trayIcon.HWnd = msgHwnd //doneFIXME: need to put this in a diff. variable so it doesn't depend on systray being inited! since it's used in other things!
 	trayIcon.CbSize = uint32(unsafe.Sizeof(trayIcon))
 	trayIcon.UID = 1
 
@@ -1725,6 +1772,7 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		mode:                     ModeMove,
 		state:                    dragState{startPt: pt, startRect: r},
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
+		wasMaximizedAtStart:      wasMaximized,
 	})
 	return true
 }
@@ -1770,12 +1818,17 @@ func startDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery bo
 // callerName is only used to identify the caller in the WM_BRING_TO_FRONT
 // failure log.
 func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe.POINT, bringToFront, focus *atomic.Bool, callerName string) {
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		logf("%s: applyFocusAndBringToFrontOnGestureStart failed due to mainMsgHwnd is 0", callerName)
+		return
+	}
 	if bringToFront.Load() {
 		// Post a dedicated bring-to-front message rather than routing through
 		// the move channel, which would be coalesced away by move events for
 		// the same HWND.
 		//if res := wincoe.PostMessage(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
-		if res := wincoe.PostMessage(mainMsgHwnd, WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
+		if res := wincoe.PostMessage(msgHwnd, WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
 			logf("%s: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", callerName, targetWnd, res.Err)
 		}
 	}
@@ -1783,7 +1836,7 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe
 		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
 
 		if res := wincoe.PostMessage(
-			mainMsgHwnd,
+			msgHwnd,
 			WM_FOCUS_TARGET_WINDOW_SOMEHOW,
 			uintptr(targetWnd),     // wParam
 			makeLParam(pt.X, pt.Y), // lParam contains X and Y
@@ -1995,6 +2048,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (st
 		resizeZone:               getResizeZone(pt, r),
 		initialAspectRatio:       float64(w) / float64(h),
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
+		wasMaximizedAtStart:      wasMaximized,
 	})
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
@@ -2275,6 +2329,7 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	//do this first
 	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
 	captureHeldForSession.Store(nil)
+	msgHwnd := loadMainMsgHwnd()
 	/*
 		The Problem: If you call it in the hook, you are releasing capture on the Hook Thread. But window capture is thread-specific.
 		If your SetCapture was originally called by the Main Thread (which is usually where windows and UI live),
@@ -2284,8 +2339,8 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		actually it is my hook thread that calls SetCapture in 2 places one for move and one for resize!
 	*/
 	if releaseCapture {
-		if mainMsgHwnd != 0 {
-			if res := wincoe.PostMessage(mainMsgHwnd, WM_DO_RELEASE_CAPTURE, 0, 0); res.Failed() {
+		if msgHwnd != 0 {
+			if res := wincoe.PostMessage(msgHwnd, WM_DO_RELEASE_CAPTURE, 0, 0); res.Failed() {
 				logf("softReset: PostMessage WM_DO_RELEASE_CAPTURE failed: %v", res.Err)
 			}
 		} else {
@@ -2300,12 +2355,12 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
 	// Instead of calling hideOverlay() synchronously on the hook thread,
 	// post it asynchronously to your main thread's message window loop.
-	if mainMsgHwnd != 0 {
-		if res := wincoe.PostMessage(mainMsgHwnd, WM_HIDE_OVERLAY, 0, 0); res.Failed() {
+	if msgHwnd != 0 {
+		if res := wincoe.PostMessage(msgHwnd, WM_HIDE_OVERLAY, 0, 0); res.Failed() {
 			logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
 		}
-		// } else {
-		// 	logf("unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
+	} else {
+		logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0, this gets hit if it's already running.")
 	}
 }
 
@@ -2317,6 +2372,82 @@ func hardReset(releaseCapture bool) {
 		winGestureUsed.Store(false)
 	}
 	softReset(releaseCapture)
+}
+
+// cancelActiveGesture undoes an in-progress winkey+LMB/RMB drag-move or
+// drag-resize gesture -- triggered by pressing ESC while it's still active
+// (see tryCancelActiveGestureViaEsc and wndProc's WM_CANCEL_GESTURE case) --
+// by restoring session.targetWnd to session.state.startRect, re-maximizing
+// it if it was maximized when the gesture began
+// (session.wasMaximizedAtStart), and moving the cursor back to
+// session.state.startPt so the whole action looks like it never happened.
+// Must run on the main thread (it calls SetWindowPos/ShowWindow/SetCursorPos
+// directly) -- see tryCancelActiveGestureViaEsc's doc comment for why the
+// hook thread only ever posts a message here instead of calling this
+// directly.
+func cancelActiveGesture(session *dragSession) {
+	target := session.targetWnd
+	r := session.state.startRect
+	w := r.Right - r.Left
+	h := r.Bottom - r.Top
+
+	logf("Cancelling in-progress %v gesture on HWND=0x%X via ESC; restoring to original rect (%d,%d)-(%d,%d), wasMaximizedAtStart=%v",
+		session.mode, target, r.Left, r.Top, r.Right, r.Bottom, session.wasMaximizedAtStart)
+
+	if res := wincoe.SetWindowPos(target, 0, r.Left, r.Top, w, h,
+		wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
+	); res.Failed() {
+		logf("cancelActiveGesture: SetWindowPos (restore original rect) on HWND=0x%X failed: %v", target, res.Err)
+	}
+
+	if session.wasMaximizedAtStart {
+		// See startDrag/tryBeginResizeGestureAt's identical
+		// "_ = wincoe.ShowWindow(hwnd, wincoe.SW_RESTORE)" pattern -- the
+		// return value only reports the window's PRIOR visibility state,
+		// not whether the maximize request itself succeeded, so there's
+		// nothing meaningful to check or log here.
+		_ = wincoe.ShowWindow(target, wincoe.SW_MAXIMIZE)
+	}
+
+	if res := wincoe.SetCursorPos(session.state.startPt.X, session.state.startPt.Y); res.Failed() {
+		logf("cancelActiveGesture: SetCursorPos (restore cursor to gesture-start position) failed: %v", res.Err)
+	}
+
+	// End the gesture entirely -- ESC is a hard "undo and stop", not merely
+	// a snap-back that keeps tracking further mouse movement.
+	softReset(true)
+}
+
+// tryCancelActiveGestureViaEsc checks whether a winkey+LMB/RMB drag-move or
+// drag-resize gesture is currently in progress and, if so, posts
+// WM_CANCEL_GESTURE to the main thread to undo it (see cancelActiveGesture)
+// and reports true so the caller (keyboardProc) swallows the originating
+// ESC key event. Returns false -- ESC should pass through normally -- if no
+// ModeMove/ModeResize session is active.
+//
+// Deliberately does no Win32 UI work itself: this runs on the hook thread
+// (keyboardProc), and SetWindowPos/ShowWindow/SetCursorPos must only ever
+// be called from the main thread, same as every other gesture-driven
+// window change in this codebase (see e.g. handleActualMoveOrResize).
+func tryCancelActiveGestureViaEsc() bool {
+	session := activeSession.Load()
+	if session == nil {
+		return false // no active drag/resize gesture to cancel; let ESC through
+	}
+
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		logf("tryCancelActiveGestureViaEsc: mainMsgHwnd is 0, can't post WM_CANCEL_GESTURE; letting ESC through instead")
+		//FIXME: re-check this, doesn't seem like a good idea to let it thru!
+		return false
+	}
+
+	if res := wincoe.PostMessage(msgHwnd, WM_CANCEL_GESTURE, uintptr(session.targetWnd), 0); res.Failed() {
+		logf("tryCancelActiveGestureViaEsc: PostMessage WM_CANCEL_GESTURE failed: %v; letting ESC through instead", res.Err)
+		//FIXME: re-check this, doesn't seem like a good idea to let it thru!
+		return false
+	}
+	return true
 }
 
 // Define the overlay window class name as a constant
@@ -3541,7 +3672,19 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			//if resizing.Load() && currentDrag != nil {
 			//if time.Since(lastResize) >= forceMoveOrResizeActionsToBeThisManyMSApart*time.Millisecond {
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(session, info.Pt) //TODO: move this into wndProc aka into handleActualMove() ?!
+				// Holding Shift mirrors which edge/corner the drag affects
+				// (see oppositeResizeZone's doc comment) without moving the
+				// cursor or session.resizeZone itself -- the underlying
+				// session/gesture is unaffected, only which zone THIS
+				// resize computation (and its anti-slide correction in
+				// handleActualMoveOrResize, which also reads
+				// data.ResizeZone below) treats as "being dragged" right
+				// now.
+				effectiveZone := session.resizeZone
+				if keyDown(VK_SHIFT) {
+					effectiveZone = oppositeResizeZone(session.resizeZone)
+				}
+				nx, ny, nw, nh := calculateResize(session, info.Pt, effectiveZone) //TODO: move this into wndProc aka into handleActualMove() ?!
 				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 				if asyncResize.Load() {
 					flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -3553,7 +3696,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					W:          nw,
 					H:          nh,
 					Flags:      flags,
-					ResizeZone: session.resizeZone,
+					ResizeZone: effectiveZone,
 				}
 
 				// Send to your mover channel
@@ -3782,6 +3925,35 @@ var (
 	// Optional: prepare a mutex for later when we secure 'currentDrag'
 	// dragStateMutex sync.RWMutex
 )
+
+// mainMsgHwndAtomic holds the current value of the hidden main message
+// window handle (see createMessageWindow / runApplication), guarded by
+// atomic ops instead of a plain windows.Handle because it's read from
+// three distinct thread contexts -- the main thread itself; the dedicated
+// hook thread (hookWorker's mouseProc/keyboardProc, e.g.
+// enqueueMoveOrResize, softReset, WM_INJECT_SEQUENCE posting, and the
+// panic-bridge's WM_CLOSE post); and the separate OS thread Windows spawns
+// for every single invocation of ctrlCHandler (see SetConsoleCtrlHandler's
+// documented per-event-new-thread model) -- while it's only ever WRITTEN
+// from the main thread (once at startup in runApplication via
+// storeMainMsgHwnd, once at shutdown in deinitMainMsgHwnd via the atomic
+// Swap).
+var mainMsgHwndAtomic atomic.Uintptr
+
+// loadMainMsgHwnd is the sole safe way to read the current main message
+// window handle from any thread. Returns 0 before runApplication has
+// created the window, or after deinitMainMsgHwnd has torn it down.
+func loadMainMsgHwnd() windows.Handle {
+	return windows.Handle(mainMsgHwndAtomic.Load())
+}
+
+// storeMainMsgHwnd is the sole safe way to set the main message window
+// handle. Must only ever be called from the main thread (see deinit()'s
+// own "runs only on main()" invariant, which this shares).
+func storeMainMsgHwnd(h windows.Handle) {
+	mainMsgHwndAtomic.Store(uintptr(h))
+}
+
 var hookPanicPayload atomic.Value // We use atomic for thread-safety
 var mainAcknowledgedShutdown = make(chan struct{})
 
@@ -3878,12 +4050,14 @@ func hookWorker() {
 			}
 			//doneFIXME: what if main is dead too, and would ignore the signal or what, then we exit here? sure after X seconds
 
-			if mainMsgHwnd != 0 {
+			if msgHwnd := loadMainMsgHwnd(); msgHwnd != 0 {
 				// Post to the Window Handle, NOT the Thread ID.
 				// This cuts through modal menus like the systray popup menu!
-				if res := wincoe.PostMessage(mainMsgHwnd, WM_CLOSE, 0, 0); res.Failed() {
-					logf("hookWorker panic-bridge: PostMessage(WM_CLOSE) to mainMsgHwnd=0x%X failed, err: %v", mainMsgHwnd, res.Err)
+				if res := wincoe.PostMessage(msgHwnd, WM_CLOSE, 0, 0); res.Failed() {
+					logf("hookWorker panic-bridge: PostMessage(WM_CLOSE) to mainMsgHwnd=0x%X failed, err: %v", msgHwnd, res.Err)
 				}
+			} else {
+				logf("hookWorker panic-bridge: won't PostMessage(WM_CLOSE) because mainMsgHwnd is 0")
 			}
 			/* When you right-click your tray icon and the menu appears, the code is stuck inside the TrackPopupMenu Win32 call.
 				That function runs its own private message loop.
@@ -4059,7 +4233,13 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	// We are guaranteed to be on the main thread here (wndProc context).
 	if cur := activeSession.Load(); cur != nil && captureHeldForSession.Load() != cur {
 		//_ = procSetCapture.Call(uintptr(mainMsgHwnd))
-		_ = wincoe.SetCapture(mainMsgHwnd)
+		if msgHwnd := loadMainMsgHwnd(); msgHwnd != 0 {
+			_ = wincoe.SetCapture(msgHwnd)
+		} else {
+			logf("handleActualMoveOrResize:SetCapture couldn't setcapture because mainMsgHwnd was 0")
+			droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action, maybe we need a diff. counter for each kind of dropped type/reason?
+			return
+		}
 		/*
 			One caveat worth stating: since you're using WH_MOUSE_LL, you receive all mouse events globally regardless of capture.
 			 SetCapture here is about preventing other windows from acting on cursor interactions during a drag, not about receiving events yourself.
@@ -4455,11 +4635,26 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		// Normal case (prev=1 or 0, current=0) → completely silent
 		if current != 0 {
 			logf("in wndProc part2of2, WM_DO_RELEASE_CAPTURE says the current capture (after releasing) is still 0x%X instead of none aka 0", current)
-		} else if prev != 0 && prev != mainMsgHwnd && prev != 1 { // 1 is the common "desktop" value
+		} else if prev != 0 && prev != hwnd && prev != 1 { // 1 is the common "desktop" value
+			//hwnd is mainMsgHwnd as per Claude: "Bonus fix found along the way: wndProc's WM_DO_RELEASE_CAPTURE handler also reads mainMsgHwnd, but since wndProc is only ever invoked as the main message window's own procedure, its hwnd parameter already is that value — no atomic load needed there at all, just use the parameter:"
 			// Only log unusual previous owners (debug only)
-			logf("in wndProc, WM_DO_RELEASE_CAPTURE: previous owner was unexpected 0x%X (mainMsgHwnd=0x%X)", prev, mainMsgHwnd)
+			logf("in wndProc, WM_DO_RELEASE_CAPTURE: previous owner was unexpected 0x%X (mainMsgHwnd=0x%X)", prev, hwnd)
 		}
 
+		return 0
+
+	case WM_CANCEL_GESTURE:
+		expectedTarget := windows.Handle(wParam)
+		session := activeSession.Load()
+		if session == nil {
+			logf("WM_CANCEL_GESTURE: no active drag/resize session by the time this was processed (already ended); ignoring")
+			return 0
+		}
+		if session.targetWnd != expectedTarget {
+			logf("WM_CANCEL_GESTURE: active session's target HWND=0x%X no longer matches the one ESC was pressed for (0x%X); a new gesture must've started since, ignoring", session.targetWnd, expectedTarget)
+			return 0
+		}
+		cancelActiveGesture(session)
 		return 0
 
 	case WM_WTSSESSION_CHANGE:
@@ -5154,11 +5349,10 @@ func deinitOverlayClass() {
 }
 
 func deinitMainMsgHwnd() {
-	if mainMsgHwnd != 0 {
-		if res1 := wincoe.DestroyWindow(mainMsgHwnd); res1.Failed() {
-			logf("DestroyWindow failed of HWND=0x%X, (probably already destroyed or invalid) actual res: %v", mainMsgHwnd, res1)
+	if prev := windows.Handle(mainMsgHwndAtomic.Swap(0)); prev != 0 {
+		if res1 := wincoe.DestroyWindow(prev); res1.Failed() {
+			logf("DestroyWindow failed of HWND=0x%X, (probably already destroyed or invalid) actual res: %v", prev, res1)
 		}
-		mainMsgHwnd = 0
 	}
 
 	if hiddenClassRegistered.Load() { //deinit it only if it was inited ever
@@ -5188,6 +5382,22 @@ const CTRL_C_EVENT = 0
 const CTRL_BREAK_EVENT = 1
 const CTRL_CLOSE_EVENT = 2
 
+// ctrlCHandlerFired guards ctrlCHandler so that only the FIRST invocation
+// posts WM_EXIT_VIA_CTRL_C to the main thread. Per SetConsoleCtrlHandler's
+// documented threading model, Windows spawns a brand-new OS thread for
+// EVERY console control event delivered to a registered handler, so a
+// user hammering Ctrl+C (or Ctrl+C immediately followed by closing the
+// console window) can genuinely invoke ctrlCHandler concurrently from
+// multiple threads while the first invocation's WM_EXIT_VIA_CTRL_C is
+// still sitting in the queue or being processed. Nothing downstream of
+// this function actually crashes on repeat invocations -- PostMessage is
+// safe to call any number of times, and wndProc's WM_EXIT_VIA_CTRL_C
+// handler's exitf() panics and unwinds the main message loop the first
+// time it runs, so a second queued copy would never even be dispatched --
+// but there's no reason to post (or log) more than once, so this makes
+// "only react to the first control event" explicit rather than accidental.
+var ctrlCHandlerFired atomic.Bool
+
 // done: keep this for the devbuild.bat mode?! ie. when having console!
 func ctrlCHandler(ctrlType uint32) uintptr {
 	/*
@@ -5210,8 +5420,17 @@ func ctrlCHandler(ctrlType uint32) uintptr {
 		ok So u can't attempt to destroy hwnd from this thread, it will 'access denied' !
 		so we don't exit from here, we tell message window to exit for us.
 	*/
-	now := mainMsgHwnd
-	if now != 0 {
+	if !ctrlCHandlerFired.CompareAndSwap(false, true) {
+		// Already handled a prior control event; this one arrived on its
+		// own new OS thread (see doc comment above). Still report
+		// "handled" (return 1) so Windows doesn't fall through to default
+		// handling -- e.g. an unhandled CTRL_CLOSE_EVENT would terminate
+		// the process immediately, bypassing our own graceful shutdown
+		// already in flight from the first invocation.
+		return 1
+	}
+
+	if now := loadMainMsgHwnd(); now != 0 {
 		if res := wincoe.PostMessage(
 			now,
 			WM_EXIT_VIA_CTRL_C,
@@ -5647,6 +5866,20 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		- chatgpt 5.2
 	*/
 
+	// Key DOWN
+	if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
+		if vk == VK_ESCAPE && tryCancelActiveGestureViaEsc() {
+			// Swallow ESC entirely: the target window under an in-progress
+			// winkey+LMB/RMB gesture never saw the original button-down (it
+			// was swallowed at gesture start -- see mouseProc's
+			// WM_LBUTTONDOWN/WM_RBUTTONDOWN handling), so letting it see a
+			// bare ESC now could trigger unrelated behavior (e.g. canceling
+			// a text selection or closing a dialog) despite nothing else
+			// about this gesture ever having reached it.
+			return 1
+		}
+	}
+
 	// Key UP
 	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
 		switch vk {
@@ -5732,15 +5965,20 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					• If the queue is full or the window is gone, the post can fail, but it does not block.
 					chatgpt5.2
 				*/
-				if res := wincoe.PostMessage(
-					mainMsgHwnd,
-					WM_INJECT_SEQUENCE,
-					uintptr(vk), // VK_LWIN or VK_RWIN,
-					0,
-				); res.Failed() {
-					// Can't recover from inside this low-level keyboard hook; the shift-tap
-					// injection that suppresses Start menu simply won't happen this time.
-					logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, err: %v; Start menu may(unlikely tho) pop up, but probably won't because the vkE8 was injected when gesture started", res.Err)
+
+				if main := loadMainMsgHwnd(); main != 0 {
+					if res := wincoe.PostMessage(
+						main,
+						WM_INJECT_SEQUENCE,
+						uintptr(vk), // VK_LWIN or VK_RWIN,
+						0,
+					); res.Failed() {
+						// Can't recover from inside this low-level keyboard hook; the shift-tap
+						// injection that suppresses Start menu simply won't happen this time.
+						logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, err: %v; Start menu may(unlikely tho) pop up, but probably won't because the vkE8 was injected when gesture started", res.Err)
+					}
+				} else {
+					logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, mainMsgHwnd was 0")
 				}
 
 				return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
@@ -6529,24 +6767,24 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	mainThreadID = windows.GetCurrentThreadId() //XXX: it's set before 'go hookWorker()' below
 	logf("main loop thread started. ThreadID: %d", mainThreadID)
 
-	hwnd, err3 := createMessageWindow() //TODO: how to undo this via defer or something?!
+	hwnd, err3 := createMessageWindow() //doneTODO: how to undo this via defer or something?!
 	if err3 != nil {
 		//exitf(1, "Failed to create message window: %v", err)
 		return fmt.Errorf("failed to create message window: %w", err3)
 	}
-	mainMsgHwnd = hwnd
+	storeMainMsgHwnd(hwnd)
 
 	if err4 := initTray(); err4 != nil {
 		return fmt.Errorf("failed to init tray: %w", err4)
 	}
 
 	// if res := procWTSRegisterSessionNotification.Call(uintptr(mainMsgHwnd), NOTIFY_FOR_THIS_SESSION); res.Failed() {
-	if res := wincoe.WTSRegisterSessionNotification(mainMsgHwnd, wincoe.NOTIFY_FOR_THIS_SESSION); res.Failed() {
+	if res := wincoe.WTSRegisterSessionNotification(hwnd, wincoe.NOTIFY_FOR_THIS_SESSION); res.Failed() {
 		logf("WTSRegisterSessionNotification failed, err: %v; lock/unlock-triggered stale-session cleanup (see WM_WTSSESSION_CHANGE in wndProc) will be unavailable this run.", res.Err)
 	} else {
 		defer func() {
 			// if res2 := procWTSUnRegisterSessionNotification.Call(uintptr(mainMsgHwnd)); res2.Failed() {
-			if res2 := wincoe.WTSUnRegisterSessionNotification(mainMsgHwnd); res2.Failed() {
+			if res2 := wincoe.WTSUnRegisterSessionNotification(hwnd); res2.Failed() {
 				logf("WTSUnRegisterSessionNotification failed, err: %v", res2.Err)
 			}
 		}()
@@ -7638,8 +7876,13 @@ func enqueueMoveOrResize(data WindowMoveData, context3 string) {
 			// Now we ring the "Doorbell" to wake up the Main Thread.
 			// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
 			//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
-			if res := wincoe.PostMessage(mainMsgHwnd, WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
-				logf("PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
+
+			if main := loadMainMsgHwnd(); main != 0 {
+				if res := wincoe.PostMessage(main, WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
+					logf("enqueueMoveOrResize:PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
+				}
+			} else {
+				logf("enqueueMoveOrResize:PostMessage of WM_DO_SETWINDOWPOS for %s failed because mainMsgHwnd was 0", context3)
 			}
 		}
 	default:
@@ -7769,8 +8012,12 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) {
 		// It's the foreground window. Fire an async message to bring it to top.
 		// We DO NOT swallow the click (we let it fall through to CallNextHookEx)
 		// so the target window still receives the actual mouse click!
-		if res := wincoe.PostMessage(mainMsgHwnd, WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
-			logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
+		if main := loadMainMsgHwnd(); main != 0 {
+			if res := wincoe.PostMessage(main, WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
+				logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
+			}
+		} else {
+			logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed because mainMsgHwnd is 0")
 		}
 	} else if res0.Failed() {
 		logf("tryBringForegroundToFrontAt:RootWindowFromPoint failed, res:%v", res0)
