@@ -4,11 +4,9 @@ todo:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
  //done//[Wed Jul 29 22:23:16.291664700 CEST 2026] hideOverlay() executed while overlay was already hidden!
  
-* move the relevant consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
-
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
 
-* as the user, I could maybe manually check if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
+* as the user, I could maybe manually check(ie. practically test/try) if "crossing DPI monitors mid-drag (system handles)" messes up the coords during drag, for manual or native move. If so find a fix.
   Claude says: "DPI monitors mid-drag
   Since initDPIAwareness() sets winbollocks itself to Per-Monitor-V2 DPI awareness before any window creation, our own process gets real, unvirtualized physical-pixel coordinates from GetCursorPos/the mouse hook/GetWindowRect/SetWindowPos uniformly across all monitors, regardless of each monitor's scale factor or the target window's own DPI-awareness level — that's the entire point of being Per-Monitor-aware. So for ModeMove, newX = startRect.Left + (cursor.X - startCursor.X) stays internally consistent crossing DPI boundaries: nothing in that formula depends on scale factor, and SWP_NOSIZE means we never fight width/height regardless of what a monitor-crossing auto-DPI-resize (Windows does this transparently for DPI-unaware target apps) might do to the window's dimensions mid-drag.
   ModeResize is where there's a genuine, narrow exposure: calculateResize() always computes off the one session.state.startRect/initialAspectRatio captured at gesture start, never re-baselined against a live GetWindowRect mid-drag. If the target is itself DPI-unaware and Windows auto-resizes it when it crosses onto a differently-scaled monitor mid-resize-drag, our math would keep computing offsets against a now-stale baseline for the remainder of that drag, until you finish and start a fresh gesture.
@@ -133,3 +131,5 @@ done:
 //* the hideOverlay() getting executed during winkey+LMB drag-move is to be avoided perhaps?! this is due to softReset() doing it unconditionally, see if maybe we can call it only if the overlay is/was showing, which probably means we'd have to keep track of it somehow (in an atomic?) ?
 
 //* try to use an own-designed icon for the .exe which presumably can be shown as such in explorer but mainly in systray! currently has same icon as the console cmd.exe has.
+
+//* move the relevant consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go

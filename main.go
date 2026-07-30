@@ -211,91 +211,20 @@ var (
 	blackBrush   windows.Handle
 )
 
-const (
-	PM_NOREMOVE = 0x0000
-	PM_REMOVE   = 0x0001
-	PM_NOYIELD  = 0x0002
-)
-
-const GUI_INMOVESIZE = 0x00000002
-
-const (
-	MOUSEEVENTF_LEFTDOWN   = 0x0002
-	MOUSEEVENTF_LEFTUP     = 0x0004
-	MOUSEEVENTF_RIGHTDOWN  = 0x0008
-	MOUSEEVENTF_RIGHTUP    = 0x0010
-	MOUSEEVENTF_MIDDLEDOWN = 0x0020
-	MOUSEEVENTF_MIDDLEUP   = 0x0040
-)
-
-const (
-
-	// Low-level keyboard hook flag
-	LLKHF_INJECTED = 0x00000010
-	// mouse:
-	LLMHF_INJECTED = 0x00000001
-)
-
-const (
-	NOTIFYICON_VERSION_4 = 4
-	NIM_SETVERSION       = 0x00000004
-)
-
-const (
-	WM_QUERYENDSESSION = 0x0011
-	WM_ENDSESSION      = 0x0016
-)
-
-const (
-	WM_WTSSESSION_CHANGE = 0x02B1
-
-	WTS_SESSION_LOCK   = 0x7
-	WTS_SESSION_UNLOCK = 0x8
-)
-
-const (
-	WM_MOUSEMOVE   = 0x0200
-	WM_LBUTTONDOWN = 0x0201
-	WM_LBUTTONUP   = 0x0202
-	WM_RBUTTONDOWN = 0x0204 //guessed
-	WM_RBUTTONUP   = 0x0205 // even winxp would have this
-	WM_CONTEXTMENU = 0x007B // winxp won't have this tho
-
-	WM_NCLBUTTONDOWN = 0x00A1
-
-	HTCAPTION = 2
-)
-
-const (
-	WM_SYSCOMMAND = 0x0112
-	SC_MOVE       = 0xF010
-)
-
-// Win32 message constants missing from x/sys/windows
-const (
-	WM_CLOSE = 0x0010
-)
-
 // HungWindowTimeout if target window doesn't respond in 150ms we consider it hung and don't attempt to attach our input thread to it in an attempt to succeed at focusing it because it would also hang us.
 const HungWindowTimeout = 150 // ms
-const (
-	SMTO_NORMAL      = 0x0000
-	SMTO_ABORTIFHUNG = 0x0002
-)
 
 const (
-	WM_NULL                        = 0
-	WM_USER                        = 0x0400
-	WM_MYSYSTRAY                   = WM_USER + 2
-	WM_INJECT_SEQUENCE             = WM_USER + 100
-	WM_FOCUS_TARGET_WINDOW_SOMEHOW = WM_USER + 101
-	WM_EXIT_VIA_CTRL_C             = WM_USER + 150
-	WM_DO_SETWINDOWPOS             = WM_USER + 200 // arbitrary, just unique
-	WM_HIDE_OVERLAY                = WM_USER + 205
-	WM_BRING_TO_FRONT              = WM_USER + 206
-	WM_DO_RELEASE_CAPTURE          = WM_USER + 215
-	WM_CANCEL_GESTURE              = WM_USER + 220
-	WM_APPLY_SHIFT_MIRROR          = WM_USER + 225
+	WM_MYSYSTRAY                   = wincoe.WM_USER + 2
+	WM_INJECT_SEQUENCE             = wincoe.WM_USER + 100
+	WM_FOCUS_TARGET_WINDOW_SOMEHOW = wincoe.WM_USER + 101
+	WM_EXIT_VIA_CTRL_C             = wincoe.WM_USER + 150
+	WM_DO_SETWINDOWPOS             = wincoe.WM_USER + 200 // arbitrary, just unique
+	WM_HIDE_OVERLAY                = wincoe.WM_USER + 205
+	WM_BRING_TO_FRONT              = wincoe.WM_USER + 206
+	WM_DO_RELEASE_CAPTURE          = wincoe.WM_USER + 215
+	WM_CANCEL_GESTURE              = wincoe.WM_USER + 220
+	WM_APPLY_SHIFT_MIRROR          = wincoe.WM_USER + 225
 )
 const (
 	MENU_EXIT                                      = 1
@@ -317,54 +246,6 @@ const (
 	MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK = 17
 	MENU_TOGGLE_UNFOCUS_SENT_TO_BACK               = 18
 	MENU_SHOW_INPUT_STATE                          = 19
-
-	MF_STRING = 0x0000
-
-	MF_GRAYED   = 0x00000001
-	MF_DISABLED = 0x00000002
-	MF_CHECKED  = 0x00000008
-)
-
-const (
-	WM_KEYDOWN    = 0x0100
-	WM_KEYUP      = 0x0101
-	WM_SYSKEYDOWN = 0x0104
-	WM_SYSKEYUP   = 0x0105
-)
-
-const (
-	INPUT_MOUSE        = 0
-	INPUT_KEYBOARD     = 1
-	KEYEVENTF_KEYUP    = 0x0002
-	KEYEVENTF_SCANCODE = 0x0008
-	KEYEVENTF_EXTENDED = 0x0001
-
-	// Modifier virtual keys
-	VK_SHIFT   = 0x10
-	VK_CONTROL = 0x11
-	VK_MENU    = 0x12 // Alt key
-	//no VK_WIN exists, must OR the two manually
-
-	VK_LBUTTON = 0x01
-	VK_RBUTTON = 0x02
-	VK_MBUTTON = 0x04
-	//left winkey
-	VK_LWIN = 0x5B
-	//right winkey
-	VK_RWIN = 0x5C
-
-	VK_LSHIFT = 0xA0
-	VK_RSHIFT = 0xA1
-
-	VK_LCONTROL = 0xA2
-	VK_RCONTROL = 0xA3
-	VK_LMENU    = 0xA4 // Left Alt
-	VK_RMENU    = 0xA5 // Right Alt
-
-	VK_E      = 0x45
-	VK_F      = 0x46
-	VK_F12    = 0x7B // F12
-	VK_ESCAPE = 0x1B
 )
 
 const (
@@ -1085,24 +966,24 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x,
 }
 
 const (
-	shiftScanCode = 0x1D //Ctrl key
+	shiftScanCode = 0x1D //Ctrl key actually, not Shift (we switched to avoid an edgecase with RShift)
 
-	shiftFlags = KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDED // make it RCtrl aka Right Ctrl key(with that KEYEVENTF_EXTENDED) instead of LCtrl
+	shiftFlags = wincoe.KEYEVENTF_SCANCODE | wincoe.KEYEVENTF_EXTENDED // make it RCtrl aka Right Ctrl key(with that KEYEVENTF_EXTENDED) instead of LCtrl
 )
 
 var shiftTapInputs = [...]wincoe.KEYANDMOUSE_INPUT{
 	{
-		Type: INPUT_KEYBOARD,
+		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
 			WScan:   shiftScanCode,
 			DwFlags: shiftFlags,
 		},
 	},
 	{
-		Type: INPUT_KEYBOARD,
+		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
 			WScan:   shiftScanCode,
-			DwFlags: shiftFlags | KEYEVENTF_KEYUP,
+			DwFlags: shiftFlags | wincoe.KEYEVENTF_KEYUP,
 		},
 	},
 }
@@ -1205,10 +1086,10 @@ var shitTapThenLWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 	shiftTapInputs[0],
 	shiftTapInputs[1],
 	{
-		Type: INPUT_KEYBOARD,
+		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WVk:     VK_LWIN,
-			DwFlags: KEYEVENTF_KEYUP,
+			WVk:     wincoe.VK_LWIN,
+			DwFlags: wincoe.KEYEVENTF_KEYUP,
 		},
 	},
 }
@@ -1218,10 +1099,10 @@ var shitTapThenRWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 	shiftTapInputs[0],
 	shiftTapInputs[1],
 	{
-		Type: INPUT_KEYBOARD,
+		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WVk:     VK_RWIN,
-			DwFlags: KEYEVENTF_KEYUP,
+			WVk:     wincoe.VK_RWIN,
+			DwFlags: wincoe.KEYEVENTF_KEYUP,
 		},
 	},
 }
@@ -1238,9 +1119,9 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 
 	var inputs *[3]wincoe.KEYANDMOUSE_INPUT
 	switch whichWinUp {
-	case VK_LWIN:
+	case wincoe.VK_LWIN:
 		inputs = &shitTapThenLWinKeyUp
-	case VK_RWIN:
+	case wincoe.VK_RWIN:
 		inputs = &shitTapThenRWinKeyUp
 	default:
 		panic2(fmt.Sprintf("BUG: unexpected non-winkey(left or right) arg passed to injectShiftTapThenWinUp(), passed: %d", whichWinUp))
@@ -1293,12 +1174,12 @@ func mouseInputView(input *wincoe.KEYANDMOUSE_INPUT) *wincoe.MOUSEINPUT {
 var lmbClickInputs = func() [2]wincoe.KEYANDMOUSE_INPUT {
 	var inputs [2]wincoe.KEYANDMOUSE_INPUT
 
-	inputs[0].Type = INPUT_MOUSE
-	inputs[1].Type = INPUT_MOUSE
+	inputs[0].Type = wincoe.INPUT_MOUSE
+	inputs[1].Type = wincoe.INPUT_MOUSE
 
 	// Fill the union as MOUSEINPUT
-	mouseInputView(&inputs[0]).DwFlags = MOUSEEVENTF_LEFTDOWN
-	mouseInputView(&inputs[1]).DwFlags = MOUSEEVENTF_LEFTUP
+	mouseInputView(&inputs[0]).DwFlags = wincoe.MOUSEEVENTF_LEFTDOWN
+	mouseInputView(&inputs[1]).DwFlags = wincoe.MOUSEEVENTF_LEFTUP
 
 	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
 
@@ -1313,19 +1194,6 @@ func injectLMBClick() {
 		logf("Used LMB click to focus, caveat: target window got a LMB click at the point where you started the window move so it could've clicked an UI button!")
 	}
 }
-
-const (
-	MOUSEEVENTF_ABSOLUTE    = 0x8000
-	MOUSEEVENTF_VIRTUALDESK = 0x4000
-	MOUSEEVENTF_MOVE        = 0x0001
-)
-
-const (
-	SM_XVIRTUALSCREEN  = 76
-	SM_YVIRTUALSCREEN  = 77
-	SM_CXVIRTUALSCREEN = 78
-	SM_CYVIRTUALSCREEN = 79
-)
 
 func injectLMBClickAtCoords(x, y int32) {
 	// SendInput absolute mouse coordinates use the entire virtual desktop,
@@ -1355,10 +1223,10 @@ func injectLMBClickAtCoords(x, y int32) {
 	// res1 = procGetSystemMetrics.Call(SM_CYVIRTUALSCREEN)
 	// var virtualHeight int32 = int32(res1.R1)
 
-	var virtualLeft int32 = wincoe.GetSystemMetrics(SM_XVIRTUALSCREEN)
-	var virtualTop int32 = wincoe.GetSystemMetrics(SM_YVIRTUALSCREEN)
-	var virtualWidth int32 = wincoe.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-	var virtualHeight int32 = wincoe.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+	var virtualLeft int32 = wincoe.GetSystemMetrics(wincoe.SM_XVIRTUALSCREEN)
+	var virtualTop int32 = wincoe.GetSystemMetrics(wincoe.SM_YVIRTUALSCREEN)
+	var virtualWidth int32 = wincoe.GetSystemMetrics(wincoe.SM_CXVIRTUALSCREEN)
+	var virtualHeight int32 = wincoe.GetSystemMetrics(wincoe.SM_CYVIRTUALSCREEN)
 
 	// GetSystemMetrics has no distinguishable failure signal for these indices
 	// (0 is returned both on legitimate "value is 0" and on any hypothetical
@@ -1450,10 +1318,10 @@ func injectLMBClickAtCoords(x, y int32) {
 
 	inputs := []wincoe.KEYANDMOUSE_INPUT{
 		{
-			Type: INPUT_MOUSE,
+			Type: wincoe.INPUT_MOUSE,
 		},
 		{
-			Type: INPUT_MOUSE,
+			Type: wincoe.INPUT_MOUSE,
 		},
 	}
 
@@ -1462,10 +1330,10 @@ func injectLMBClickAtCoords(x, y int32) {
 	m0 := mouseInputView(&inputs[0])
 	m0.Dx = normalizedX
 	m0.Dy = normalizedY
-	m0.DwFlags = MOUSEEVENTF_ABSOLUTE |
-		MOUSEEVENTF_VIRTUALDESK |
-		MOUSEEVENTF_MOVE |
-		MOUSEEVENTF_LEFTDOWN
+	m0.DwFlags = wincoe.MOUSEEVENTF_ABSOLUTE |
+		wincoe.MOUSEEVENTF_VIRTUALDESK |
+		wincoe.MOUSEEVENTF_MOVE |
+		wincoe.MOUSEEVENTF_LEFTDOWN
 
 	// Release LMB at the same location.
 	// m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
@@ -1473,10 +1341,10 @@ func injectLMBClickAtCoords(x, y int32) {
 	m1.Dx = normalizedX
 	m1.Dy = normalizedY
 	m1.DwFlags =
-		MOUSEEVENTF_ABSOLUTE |
-			MOUSEEVENTF_VIRTUALDESK |
-			MOUSEEVENTF_MOVE |
-			MOUSEEVENTF_LEFTUP
+		wincoe.MOUSEEVENTF_ABSOLUTE |
+			wincoe.MOUSEEVENTF_VIRTUALDESK |
+			wincoe.MOUSEEVENTF_MOVE |
+			wincoe.MOUSEEVENTF_LEFTUP
 
 	//you can "save and restore" the cursor position. Since GetCursorPos and SetCursorPos are extremely fast
 	// and don't involve the message queue, this will happen so quickly (sub-millisecond) that the user won't perceive the jump.
@@ -1781,18 +1649,6 @@ func initTray() error {
 	return nil
 }
 
-/*
-WM_DESTROY Breakdown
-
-	Constant Value: 0x0002
-
-	What triggers it: It is sent by the system to a window after the window has been removed from the screen, but before the child windows are destroyed.
-	Specifically, calling procDestroyWindow.Call(hwnd) is what triggers the WM_DESTROY message to be sent to that hwnd's wndProc.
-
-	The Flow: User clicks Exit (or Hook panics) → WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage().
-*/
-const WM_DESTROY = 0x0002
-
 func cleanupTray() {
 	if trayIcon.HWnd == 0 {
 		// Never initialized or window creation failed — nothing to clean
@@ -1857,17 +1713,17 @@ func formatHeldInputState() string {
 		name string
 	}
 	keys := [...]trackedKey{
-		{VK_LWIN, "LWin"},
-		{VK_RWIN, "RWin"},
-		{VK_LSHIFT, "LShift"},
-		{VK_RSHIFT, "RShift"},
-		{VK_LCONTROL, "LCtrl"},
-		{VK_RCONTROL, "RCtrl"},
-		{VK_LMENU, "LAlt"},
-		{VK_RMENU, "RAlt"},
-		{VK_LBUTTON, "LMB"},
-		{VK_RBUTTON, "RMB"},
-		{VK_MBUTTON, "MMB"},
+		{wincoe.VK_LWIN, "LWin"},
+		{wincoe.VK_RWIN, "RWin"},
+		{wincoe.VK_LSHIFT, "LShift"},
+		{wincoe.VK_RSHIFT, "RShift"},
+		{wincoe.VK_LCONTROL, "LCtrl"},
+		{wincoe.VK_RCONTROL, "RCtrl"},
+		{wincoe.VK_LMENU, "LAlt"},
+		{wincoe.VK_RMENU, "RAlt"},
+		{wincoe.VK_LBUTTON, "LMB"},
+		{wincoe.VK_RBUTTON, "RMB"},
+		{wincoe.VK_MBUTTON, "MMB"},
 	}
 
 	var held []string
@@ -2607,7 +2463,7 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 } //softReset
 
 func hardReset(releaseCapture bool) {
-	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+	var winDown bool = keyDown(wincoe.VK_LWIN) || keyDown(wincoe.VK_RWIN)
 	if winGestureUsed.Load() && winDown {
 		injectShiftTapOnly() // this way when winUP happens it won't pop up start menu
 		//alreadydoingitTODO: inject shift tap at the time gesture is detected!
@@ -2955,12 +2811,10 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 	}
 }
 
-const SW_HIDE = 0
-
 func hideOverlay() {
 	if overlayHwnd != 0 {
 		//_ = procShowWindow.Call(uintptr(overlayHwnd), SW_HIDE)
-		wasShown := wincoe.ShowWindow(overlayHwnd, SW_HIDE)
+		wasShown := wincoe.ShowWindow(overlayHwnd, wincoe.SW_HIDE)
 		if !wasShown {
 			logf("hideOverlay() executed while overlay was already hidden!")
 		}
@@ -3092,7 +2946,7 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 	}
 
 	// 4. STYLE TIE-BREAKER: It fills the screen, but is it just a maximized window?
-	if style, err := getWindowLongPtr(hwnd, GWL_STYLE); err != nil {
+	if style, err := getWindowLongPtr(hwnd, wincoe.GWL_STYLE); err != nil {
 		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
 		// Fallback: if style check fails but it fills the screen, err on the side of caution
 		return true
@@ -3210,11 +3064,6 @@ func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 	return setForegroundWindow(target, "failed SetForegroundWindow")
 }
 
-const (
-	GWL_STYLE   = -16 // We could use ^uintptr(15) to represent -16 (GWL_STYLE) to prevent Go constant overflow errors.
-	GWL_EXSTYLE = -20
-)
-
 func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
 	if hwnd == 0 {
 		return 0, fmt.Errorf("getWindowLongPtr: hwnd is 0")
@@ -3283,14 +3132,14 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 	// 2. Read styles
 	// style, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_STYLE))
 	// exStyle, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_EXSTYLE))
-	style, err := getWindowLongPtr(hwnd, GWL_STYLE)
+	style, err := getWindowLongPtr(hwnd, wincoe.GWL_STYLE)
 	if err != nil {
 		logf("GetWindowLongPtr GWL_STYLE failed: %v", err)
 		reason = "GetWindowLongPtr GWL_STYLE failed"
 		return
 	}
 
-	exStyle, err := getWindowLongPtr(hwnd, GWL_EXSTYLE)
+	exStyle, err := getWindowLongPtr(hwnd, wincoe.GWL_EXSTYLE)
 	if err != nil {
 		logf("GetWindowLongPtr GWL_EXSTYLE failed: %v", err)
 		reason = "GetWindowLongPtr GWL_EXSTYLE failed"
@@ -3492,10 +3341,10 @@ func forceForeground(target windows.Handle) bool {
 
 			//if err2 != nil || ret == 0 {
 			if res3 := wincoe.SendMessageTimeout(target,
-				WM_NULL, // WM_NULL (harmless ping)
+				wincoe.WM_NULL, // WM_NULL (harmless ping)
 				0, 0,
-				SMTO_ABORTIFHUNG,  //0x0002, // SMTO_ABORTIFHUNG
-				HungWindowTimeout, // 150ms timeout
+				wincoe.SMTO_ABORTIFHUNG, //0x0002, // SMTO_ABORTIFHUNG
+				HungWindowTimeout,       // 150ms timeout
 				&result,
 			); res3.Failed() {
 				logf("forceForeground: Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
@@ -3533,7 +3382,7 @@ func logLMBState(prefix string) {
 	// res1 := procGetAsyncKeyState.Call(VK_LBUTTON)
 	// state := res1.R1
 	// if state&0x8000 != 0 {
-	if wincoe.IsKeyDown(VK_LBUTTON) {
+	if wincoe.IsKeyDown(wincoe.VK_LBUTTON) {
 		logf("%s: LMB is DOWN", prefix) //, state)
 	} else {
 		logf("%s: LMB is UP", prefix) //, state)
@@ -3577,7 +3426,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	// //nolint:govet,unsafeptr // because
 	// info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(p.(uintptr)))
 
-	if info.Flags&LLMHF_INJECTED != 0 {
+	if info.Flags&wincoe.LLMHF_INJECTED != 0 {
 		// This mouse event was generated by SendInput
 		// Do NOT treat it as user input
 		//res2 := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
@@ -3589,7 +3438,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	}
 
 	switch wParam {
-	case WM_LBUTTONDOWN: //LMB pressed aka LMBDown or LMB DOWN
+	case wincoe.WM_LBUTTONDOWN: //LMB pressed aka LMBDown or LMB DOWN
 		// we don't want to trigger our drag gesture if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -3617,7 +3466,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			tryBringForegroundToFrontAt(info.Pt)
 		} // the 'if' in LMB
 
-	case WM_MOUSEMOVE:
+	case wincoe.WM_MOUSEMOVE:
 		session := activeSession.Load()
 		if session == nil {
 			// See if we might have missed the LMB/RMB-down that would normally have
@@ -3634,7 +3483,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 					if winDown && !ctrlDown && !altDown {
 						switch {
-						case !shiftDown && keyDown(VK_LBUTTON):
+						case !shiftDown && keyDown(wincoe.VK_LBUTTON):
 							started, bypassed := tryBeginMoveGestureAt(info.Pt, true)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
@@ -3673,7 +3522,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							} else {
 								logf("failed to begin Move gesture(the why should be above ^) while trying to start it as recovery")
 							}
-						case !shiftDown && keyDown(VK_RBUTTON):
+						case !shiftDown && keyDown(wincoe.VK_RBUTTON):
 							started, bypassed := tryBeginResizeGestureAt(info.Pt, true)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
@@ -3696,7 +3545,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							} else {
 								logf("Failed to begin Resize gesture (reason why should be above ^) while trying to start it as recovery.")
 							}
-						case keyDown(VK_MBUTTON): //this doesn't get hit, doh! unless you hold it during mouse move, which is unlikely for you to do!
+						case keyDown(wincoe.VK_MBUTTON): //this doesn't get hit, doh! unless you hold it during mouse move, which is unlikely for you to do!
 							started, bypassed := tryPerformMMBGestureAt(info.Pt, shiftDown)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
@@ -3722,7 +3571,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		switch session.mode {
 		case ModeMove:
 			if requireWinDownHeldDuringGesture.Load() {
-				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+				var winDown bool = keyDown(wincoe.VK_LWIN) || keyDown(wincoe.VK_RWIN)
 				if !winDown {
 					//cantFIXME: shouldn't I also stop drag if LMB (for ModeMove) or RMB(for ModeResize) aren't also down?! especially when unlocking a Winkey+L locked Desktop which was locked while doing any of the two gestures(ie. winkey+LMB drag to move, then pressed L without first releasing any of winkey or LMB, but then unlocked with both being released which means we didn't sense them being released). It doesn't work, checking async state reports it's actually UP not down because we swallowed it!
 					logf("winkey is no longer down, stopping drag")
@@ -3900,7 +3749,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			//} //main 'if', for capturing aka moving/dragging window
 		case ModeResize:
 			if requireWinDownHeldDuringGesture.Load() {
-				var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
+				var winDown bool = keyDown(wincoe.VK_LWIN) || keyDown(wincoe.VK_RWIN)
 				if !winDown {
 					logf("winkey is no longer down, stopping resize")
 					//don't think of doing this if RMB is no longer down also, it won't work because we 'return 1' on RMB so async state will see it UP, logically.
@@ -3994,7 +3843,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// 	// that seems like a good trade for killing the selection-growth bug.
 		// }
 
-	case WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
+	case wincoe.WM_LBUTTONUP: //LMB released aka LMBUP aka LMB UP
 		if session := activeSession.Load(); session != nil && session.mode == ModeMove {
 			// End the drag regardless of whether we owe a swallow below (see
 			// lmbDownSwallowed's doc comment): a real LMB-up always ends an
@@ -4017,7 +3866,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// would otherwise act like a real click on LBUTTONUP).
 		return 1
 
-	case WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
+	case wincoe.WM_RBUTTONUP: //RMB released aka RMBUP aka RMB UP
 		if session := activeSession.Load(); session != nil && session.mode == ModeResize {
 			// See the identical comment in WM_LBUTTONUP: end the resize
 			// regardless of whether we owe a swallow below.
@@ -4037,7 +3886,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		*/
 		return 1 // Swallow
 
-	case WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
+	case wincoe.WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 		// var shiftDown bool = keyDown(VK_SHIFT)
@@ -4302,7 +4151,7 @@ func hookWorker() {
 			if msgHwnd := loadMainMsgHwnd(); msgHwnd != 0 {
 				// Post to the Window Handle, NOT the Thread ID.
 				// This cuts through modal menus like the systray popup menu!
-				if res := wincoe.PostMessage(msgHwnd, WM_CLOSE, 0, 0); res.Failed() {
+				if res := wincoe.PostMessage(msgHwnd, wincoe.WM_CLOSE, 0, 0); res.Failed() {
 					logf("hookWorker panic-bridge: PostMessage(WM_CLOSE) to mainMsgHwnd=0x%X failed, err: %v", msgHwnd, res.Err)
 				}
 			} else {
@@ -4473,8 +4322,6 @@ func MarkAsResizedNow() {
 }
 
 const forceMoveOrResizeActionsToBeThisManyMSApart = 16 // 16ms is 60fps, 10ms is 100fps
-
-const WS_THICKFRAME = 0x00040000 // or WS_SIZEBOX which has same value (as per chatgpt 5.5)
 
 func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	//Top of handleActualMoveOrResize, before the rate-limit check (capture should be set even if we throttle the actual SetWindowPos):
@@ -4813,9 +4660,9 @@ func UnpackLParam(lParam uintptr) (x, y int32) {
 
 func wtsSessionChangeName(code uintptr) string {
 	switch code {
-	case WTS_SESSION_LOCK:
+	case wincoe.WTS_SESSION_LOCK:
 		return "lock"
-	case WTS_SESSION_UNLOCK:
+	case wincoe.WTS_SESSION_UNLOCK:
 		return "unlock"
 	default:
 		return fmt.Sprintf("0x%x", code)
@@ -4929,9 +4776,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		handleShiftMirrorToggle(session, cursorPt, shiftDown)
 		return 0
 
-	case WM_WTSSESSION_CHANGE:
+	case wincoe.WM_WTSSESSION_CHANGE:
 		switch wParam {
-		case WTS_SESSION_LOCK, WTS_SESSION_UNLOCK:
+		case wincoe.WTS_SESSION_LOCK, wincoe.WTS_SESSION_UNLOCK:
 			// Real key/button releases that happen on the secure desktop
 			// while locked are invisible to our low-level hooks (it's a
 			// separate desktop object entirely), so two independent pieces
@@ -4982,12 +4829,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		}
 		return 0
 
-	case WM_QUERYENDSESSION:
+	case wincoe.WM_QUERYENDSESSION:
 		// system is asking permission to end session
 		logf("system is asking permission to end session")
 		return 1 // allow
 
-	case WM_ENDSESSION:
+	case wincoe.WM_ENDSESSION:
 		if wParam != 0 {
 			logf("WM_ENDSESSION with wParam!=0 aka system shutdown or restart detected")
 			// ensure flush here if buffered
@@ -5062,7 +4909,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		// 	logf("WM_TRAY received with lParam %x, %x", lParam, low)
 		// }
 
-		if low == WM_MOUSEMOVE {
+		if low == wincoe.WM_MOUSEMOVE {
 			// Opportunistic hover-tooltip refresh -- see
 			// updateTrayTooltipInputStateIfChanged's doc comment for why
 			// this WM_MOUSEMOVE-over-the-tray-icon notification is the only
@@ -5072,7 +4919,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		}
 
 		//if ((lParam & 0x0FFFF) == WM_RBUTTONUP) || ((lParam & 0x0FFFF) == WM_CONTEXTMENU) {
-		if low == WM_RBUTTONUP { // RMB on systray aka RMBUp or RMBUP on systray aka RMB button released
+		if low == wincoe.WM_RBUTTONUP { // RMB on systray aka RMBUp or RMBUP on systray aka RMB button released
 			/*
 				Yes — handling WM_RBUTTONUP (after masking with 0xFFFF) alone would work on every Windows version, because:
 				  XP → only 0x0205
@@ -5103,18 +4950,18 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}()
 
 			{
-				var actFlags uint32 = MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
+				var actFlags uint32 = wincoe.MF_STRING // untyped constants can auto-convert, but not untyped vars(in the below call)
 				if focusOnDrag.Load() {
-					actFlags |= MF_CHECKED
+					actFlags |= wincoe.MF_CHECKED
 				}
 				focusText := "Activate(aka focus) window when moved if not in focus."
 				appendMenuChecked(hMenu, actFlags, MENU_ACTIVATE_MOVE, focusText)
 			}
 
 			{
-				var bringToFrontOnDragFlags uint32 = MF_STRING
+				var bringToFrontOnDragFlags uint32 = wincoe.MF_STRING
 				if bringToFrontOnDrag.Load() {
-					bringToFrontOnDragFlags |= MF_CHECKED
+					bringToFrontOnDragFlags |= wincoe.MF_CHECKED
 				}
 				// if !focusOnDrag.Load() { //XXX:actually don't, because if it's focused, we can bring it to front
 				// 	bringToFrontOnDragFlags |= MF_DISABLED | MF_GRAYED
@@ -5125,9 +4972,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var actResizeFlags uint32 = MF_STRING
+				var actResizeFlags uint32 = wincoe.MF_STRING
 				if focusOnResize.Load() {
-					actResizeFlags |= MF_CHECKED
+					actResizeFlags |= wincoe.MF_CHECKED
 				}
 				focusResizeText := "Activate(aka focus) window when a resize gesture starts if not already in focus."
 				appendMenuChecked(hMenu, actResizeFlags,
@@ -5135,9 +4982,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var bringToFrontOnResizeFlags uint32 = MF_STRING
+				var bringToFrontOnResizeFlags uint32 = wincoe.MF_STRING
 				if bringToFrontOnResize.Load() {
-					bringToFrontOnResizeFlags |= MF_CHECKED
+					bringToFrontOnResizeFlags |= wincoe.MF_CHECKED
 				}
 				bringToFrontOnResizeText := "Bring already-focused(!) window to front of Z-order when starting a resize gesture (independent of the same option for drag/move above)"
 				appendMenuChecked(hMenu, bringToFrontOnResizeFlags,
@@ -5145,9 +4992,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var btfbcFlags uint32 = MF_STRING
+				var btfbcFlags uint32 = wincoe.MF_STRING
 				if bringToFrontOnBackgroundClick.Load() {
-					btfbcFlags |= MF_CHECKED
+					btfbcFlags |= wincoe.MF_CHECKED
 				}
 				btfbcText := "Bring backgrounded-but-focused window(ie. winkey+MMB -ed one) to front on LMB/MMB/RMB click"
 				appendMenuChecked(hMenu, btfbcFlags,
@@ -5155,9 +5002,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var unfocusSentToBackFlags uint32 = MF_STRING
+				var unfocusSentToBackFlags uint32 = wincoe.MF_STRING
 				if unfocusSentToBackWindow.Load() {
-					unfocusSentToBackFlags |= MF_CHECKED
+					unfocusSentToBackFlags |= wincoe.MF_CHECKED
 				}
 				//ie. the meaning of winkey+shift+MMB changes when this is true!
 				unfocusSentToBackText := "Switch the focus from the sent-to-back window(but can bring it back with winkey+shift+MMB) to whichever window is now on top"
@@ -5166,9 +5013,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var useThreadAttachInputForFocusFlags uint32 = MF_STRING
+				var useThreadAttachInputForFocusFlags uint32 = wincoe.MF_STRING
 				if useThreadAttachInputForFocus.Load() {
-					useThreadAttachInputForFocusFlags |= MF_CHECKED
+					useThreadAttachInputForFocusFlags |= wincoe.MF_CHECKED
 				}
 				useThreadAttachInputForFocusText := "(dontuse)Use AttachThreadInput before attempting any window focus (else focus stealing prevention might happen)"
 				appendMenuChecked(hMenu, useThreadAttachInputForFocusFlags,
@@ -5176,12 +5023,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var lmbFlags uint32 = MF_STRING
+				var lmbFlags uint32 = wincoe.MF_STRING
 				if doLMBClick2FocusAsFallback.Load() {
-					lmbFlags |= MF_CHECKED
+					lmbFlags |= wincoe.MF_CHECKED
 				}
 				if !focusOnDrag.Load() && !focusOnResize.Load() {
-					lmbFlags |= MF_DISABLED | MF_GRAYED
+					lmbFlags |= wincoe.MF_DISABLED | wincoe.MF_GRAYED
 				}
 				doLMBClick2FocusAsFallbackText := "Fallback: Use Left Mouse Click to focus (Warning: will click underlying UI elements)."
 				appendMenuChecked(hMenu, lmbFlags,
@@ -5189,9 +5036,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var rlFlags uint32 = MF_STRING
+				var rlFlags uint32 = wincoe.MF_STRING
 				if ratelimitOnMove.Load() {
-					rlFlags |= MF_CHECKED
+					rlFlags |= wincoe.MF_CHECKED
 				}
 				ratelimitText := "Rate-limit window moves(by 5x, uses less CPU but looks choppier so ur subconscious will hate it)"
 				appendMenuChecked(hMenu, rlFlags,
@@ -5199,13 +5046,13 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var sldrFlags uint32 = MF_STRING
+				var sldrFlags uint32 = wincoe.MF_STRING
 				if shouldLogDragRate.Load() {
-					sldrFlags |= MF_CHECKED
+					sldrFlags |= wincoe.MF_CHECKED
 				}
 				// Disable (grey) the "Log rate of moves" item when rate-limit is off
 				if !ratelimitOnMove.Load() {
-					sldrFlags |= MF_DISABLED | MF_GRAYED
+					sldrFlags |= wincoe.MF_DISABLED | wincoe.MF_GRAYED
 				}
 				sldrText := "Log rate of moves(only if rate-limit above is enabled)"
 				appendMenuChecked(hMenu, sldrFlags,
@@ -5213,9 +5060,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var asyncFlags uint32 = MF_STRING
+				var asyncFlags uint32 = wincoe.MF_STRING
 				if asyncResize.Load() {
-					asyncFlags |= MF_CHECKED
+					asyncFlags |= wincoe.MF_CHECKED
 				}
 				asyncText := "Use Async Window Positioning for Resizing(bugged for unresizable windows - it moves them)(don't use this)"
 				appendMenuChecked(hMenu, asyncFlags,
@@ -5223,9 +5070,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var reqWinDownFlags uint32 = MF_STRING
+				var reqWinDownFlags uint32 = wincoe.MF_STRING
 				if requireWinDownHeldDuringGesture.Load() {
-					reqWinDownFlags |= MF_CHECKED
+					reqWinDownFlags |= wincoe.MF_CHECKED
 				}
 				reqWinDownText := "Require holding down WinKey while performing the gesture(move/resize) - if not you'll hit edge cases" //such as(not anymore this): if you do Winkey+L to lock, then release winkey and LMB(or RMB if resize) then you unlock, the gesture is still in effect(if this is false); actually not anymore now that I got lock/unlock hooks and I reset when winkey+L locks !
 				appendMenuChecked(hMenu, reqWinDownFlags,
@@ -5233,9 +5080,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var coalesceEventsFlags uint32 = MF_STRING
+				var coalesceEventsFlags uint32 = wincoe.MF_STRING
 				if coalesceMoveResizeEvents.Load() {
-					coalesceEventsFlags |= MF_CHECKED
+					coalesceEventsFlags |= wincoe.MF_CHECKED
 				}
 				coalesceEventsText := "Coalesce Move/Resize (ignores queue history to keep drag responsive), if off it's rate-limited to 60fps"
 				appendMenuChecked(hMenu, coalesceEventsFlags,
@@ -5243,9 +5090,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var immediateOverlayRepaintFlags uint32 = MF_STRING
+				var immediateOverlayRepaintFlags uint32 = wincoe.MF_STRING
 				if immediateOverlayRepaint.Load() {
-					immediateOverlayRepaintFlags |= MF_CHECKED
+					immediateOverlayRepaintFlags |= wincoe.MF_CHECKED
 				}
 				immediateOverlayRepaintText := "Force immediate repaint of the resize overlay (avoids freezing if dragging at a certain constant rate), if off, it repaints when target window repaints"
 				appendMenuChecked(hMenu, immediateOverlayRepaintFlags,
@@ -5253,9 +5100,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var missedGestureRecoveryFlags uint32 = MF_STRING
+				var missedGestureRecoveryFlags uint32 = wincoe.MF_STRING
 				if missedGestureRecoveryEnabled.Load() {
-					missedGestureRecoveryFlags |= MF_CHECKED
+					missedGestureRecoveryFlags |= wincoe.MF_CHECKED
 				}
 				var missedGestureRecoveryText string
 				if isAdmin {
@@ -5272,12 +5119,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var injectButtonUpFlags uint32 = MF_STRING
+				var injectButtonUpFlags uint32 = wincoe.MF_STRING
 				if injectButtonUpOnMissedGestureRecovery.Load() {
-					injectButtonUpFlags |= MF_CHECKED
+					injectButtonUpFlags |= wincoe.MF_CHECKED
 				}
 				if !missedGestureRecoveryEnabled.Load() {
-					injectButtonUpFlags |= MF_DISABLED | MF_GRAYED
+					injectButtonUpFlags |= wincoe.MF_DISABLED | wincoe.MF_GRAYED
 				}
 				injectButtonUpOnMissedGestureRecoveryText := "(dontuse)On missed-gesture recovery, inject a button-release early (Warning: will click LMB or RMB eg. console-paste unexpectedly)"
 				appendMenuChecked(hMenu, injectButtonUpFlags,
@@ -5285,9 +5132,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
-				var bypassWhenFullscreenFlags uint32 = MF_STRING
+				var bypassWhenFullscreenFlags uint32 = wincoe.MF_STRING
 				if bypassGesturesWhenFullscreen.Load() {
-					bypassWhenFullscreenFlags |= MF_CHECKED
+					bypassWhenFullscreenFlags |= wincoe.MF_CHECKED
 				}
 				bypassWhenFullscreenText := "Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)"
 
@@ -5302,14 +5149,14 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				// rebuilt from scratch on each WM_MYSYSTRAY RMB, so there's
 				// no separate refresh mechanism needed here the way the
 				// hover tooltip needs one).
-				var keysHeldFlags uint32 = MF_STRING | MF_GRAYED | MF_DISABLED
+				var keysHeldFlags uint32 = wincoe.MF_STRING | wincoe.MF_GRAYED | wincoe.MF_DISABLED
 				keysHeldText := "Currently held (GetAsyncKeyState): " + formatHeldInputState()
 				appendMenuChecked(hMenu, keysHeldFlags, MENU_SHOW_INPUT_STATE, keysHeldText)
 			}
 
 			{
 				exitText := "Exit"
-				appendMenuChecked(hMenu, MF_STRING, MENU_EXIT, exitText)
+				appendMenuChecked(hMenu, wincoe.MF_STRING, MENU_EXIT, exitText)
 			}
 
 			// var pt POINT
@@ -5402,7 +5249,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			//SendMessage is 100% synchronous. It does not put a message into the event queue to wait for the message loop; instead, it immediately calls your window's wndProc directly on the current thread and blocks until it returns.
 			//PostMessage is asynchronous. It places WM_NULL at the very end of your thread's message queue and returns immediately.
 			//so, SendMessage below: // Synchronously flushes message processing on hwnd
-			_ = wincoe.SendMessage(hwnd /*yes hwnd, not hMenu!*/, WM_NULL, 0, 0) // Send WM_NULL, cannot fail, it's also CheckNone
+			_ = wincoe.SendMessage(hwnd /*yes hwnd, not hMenu!*/, wincoe.WM_NULL, 0, 0) // Send WM_NULL, cannot fail, it's also CheckNone
 			restoreForegroundAfterTrayMenu()
 
 			switch cmd {
@@ -5484,7 +5331,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		} // fi RMB context menu
 		return 0
 
-	case WM_CLOSE:
+	case wincoe.WM_CLOSE:
 		//exit(0)
 		//WM_CLOSE → DestroyWindow() → WM_DESTROY → PostQuitMessage() -> getmessage() -> break loop -> outside of loop continuation...
 		if res := wincoe.DestroyWindow(hwnd); res.Failed() {
@@ -5492,7 +5339,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		}
 		return 0
 
-	case WM_DESTROY:
+	case wincoe.WM_DESTROY:
 		// _ = procPostQuitMessage.Call(0)
 		wincoe.PostQuitMessage(0 /*exit code*/)
 		return 0
@@ -5501,16 +5348,17 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		var ctrlType uint32 = uint32(wParam)
 		switch ctrlType {
 		//case 0, 2: // CTRL_C_EVENT, CTRL_CLOSE_EVENT
-		case CTRL_C_EVENT:
-			// procUnhookWindowsHookEx.Call(uintptr(hHook))
-			// os.Exit(0)
-			//todo()
+		case wincoe.CTRL_C_EVENT:
 			exitf(128, "exit via Ctrl+C")
 
-		case CTRL_BREAK_EVENT:
+		case wincoe.CTRL_BREAK_EVENT:
 			exitf(128, "exit via Ctrl+Break")
-		case CTRL_CLOSE_EVENT:
-			exitf(127, "exit via Ctrl+Close event (wtf is this?!)") //TODO: find out what this is.
+		case wincoe.CTRL_CLOSE_EVENT:
+			exitf(127, "exit via (Console Window Closed)")
+		case wincoe.CTRL_LOGOFF_EVENT:
+			exitf(126, "exit via (User Logoff)")
+		case wincoe.CTRL_SHUTDOWN_EVENT:
+			exitf(125, "exit via (System Shutdown)")
 		default:
 			exitf(129, "exit via unknown event %d", ctrlType)
 		}
@@ -5649,10 +5497,6 @@ func exit(code int32) {
 	// })
 	exitf(code, "express exit")
 }
-
-const CTRL_C_EVENT = 0
-const CTRL_BREAK_EVENT = 1
-const CTRL_CLOSE_EVENT = 2
 
 // ctrlCHandlerFired guards ctrlCHandler so that only the FIRST invocation
 // posts WM_EXIT_VIA_CTRL_C to the main thread. Per SetConsoleCtrlHandler's
@@ -5958,16 +5802,16 @@ func injectLetterE() {
 func injectKeyTap(vk uint16) {
 	inputs := []wincoe.KEYANDMOUSE_INPUT{
 		{
-			Type: INPUT_KEYBOARD,
+			Type: wincoe.INPUT_KEYBOARD,
 			Ki: wincoe.KEYBDINPUT{
 				WVk: vk,
 			},
 		},
 		{
-			Type: INPUT_KEYBOARD,
+			Type: wincoe.INPUT_KEYBOARD,
 			Ki: wincoe.KEYBDINPUT{
 				WVk:     vk,
-				DwFlags: KEYEVENTF_KEYUP,
+				DwFlags: wincoe.KEYEVENTF_KEYUP,
 			},
 		},
 	}
@@ -6107,7 +5951,7 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		now is this mandatory
 		Without this, your injected Win-UP would recursively trigger injectShiftTapThenWinUp again and you’d summon an infinite keyboard demon 👹
 	*/
-	if k.Flags&LLKHF_INJECTED != 0 {
+	if k.Flags&wincoe.LLKHF_INJECTED != 0 {
 		// This key event was generated by SendInput
 		// Do NOT treat it as user input
 		//res2 := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
@@ -6139,8 +5983,8 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	*/
 
 	// Key DOWN
-	if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
-		if vk == VK_ESCAPE && tryCancelActiveGestureViaEsc() {
+	if wParam == wincoe.WM_KEYDOWN || wParam == wincoe.WM_SYSKEYDOWN {
+		if vk == wincoe.VK_ESCAPE && tryCancelActiveGestureViaEsc() {
 			// Swallow ESC entirely: the target window under an in-progress
 			// winkey+LMB/RMB gesture never saw the original button-down (it
 			// was swallowed at gesture start -- see mouseProc's
@@ -6150,7 +5994,7 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// about this gesture ever having reached it.
 			return 1
 		}
-		if vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT {
+		if vk == wincoe.VK_SHIFT || vk == wincoe.VK_LSHIFT || vk == wincoe.VK_RSHIFT {
 			// Checking all three: the low-level keyboard hook has, across
 			// different Windows versions/input paths, been observed to
 			// report either the left/right-specific VK code or the
@@ -6161,12 +6005,12 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	}
 
 	// Key UP
-	if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
-		if vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT {
+	if wParam == wincoe.WM_KEYUP || wParam == wincoe.WM_SYSKEYUP {
+		if vk == wincoe.VK_SHIFT || vk == wincoe.VK_LSHIFT || vk == wincoe.VK_RSHIFT {
 			postShiftMirrorToggleIfNeeded(false)
 		}
 		switch vk {
-		case VK_LWIN, VK_RWIN:
+		case wincoe.VK_LWIN, wincoe.VK_RWIN:
 			//logf("winUP")
 			//hardResetIfDesynced(false)
 			/*
@@ -8059,11 +7903,11 @@ func injectMouseButtonUp(flag uint32) {
 }
 
 func injectLMBUp() {
-	injectMouseButtonUp(MOUSEEVENTF_LEFTUP)
+	injectMouseButtonUp(wincoe.MOUSEEVENTF_LEFTUP)
 }
 
 func injectRMBUp() {
-	injectMouseButtonUp(MOUSEEVENTF_RIGHTUP)
+	injectMouseButtonUp(wincoe.MOUSEEVENTF_RIGHTUP)
 }
 
 // initDarkMode tells Windows this app supports dark mode,
@@ -8133,10 +7977,10 @@ func closeHandleLogged(h windows.Handle, context2 string) {
 }
 
 func modifierKeyState() (winDown, shiftDown, ctrlDown, altDown bool) {
-	winDown = keyDown(VK_LWIN) || keyDown(VK_RWIN)
-	shiftDown = keyDown(VK_SHIFT)
-	ctrlDown = keyDown(VK_CONTROL)
-	altDown = keyDown(VK_MENU)
+	winDown = keyDown(wincoe.VK_LWIN) || keyDown(wincoe.VK_RWIN)
+	shiftDown = keyDown(wincoe.VK_SHIFT)
+	ctrlDown = keyDown(wincoe.VK_CONTROL)
+	altDown = keyDown(wincoe.VK_MENU)
 	return
 }
 
