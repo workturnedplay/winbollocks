@@ -1,10 +1,12 @@
 todo:
 
+* try to use an own-designed icon for the .exe which presumably can be shown as such in explorer but mainly in systray! currently has same icon as the console cmd.exe has.
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
  //done//[Wed Jul 29 22:23:16.291664700 CEST 2026] hideOverlay() executed while overlay was already hidden!
  
-* move consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
+* move the relevant consts from main.go into main_api.go and ref them via wincoe.CONST (example) in main.go
 
 * should I make it so that the sent-to-back window when unfocusSentToBackWindow is true to be remembered until the gesture is reset which for winkey+MMB should probably be when winkey is released; currently it overwrites it with the last focused window sent to back (ignores unfocused ones sent to back, of course)
 
