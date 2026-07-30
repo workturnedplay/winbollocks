@@ -221,10 +221,36 @@ const (
 	WM_EXIT_VIA_CTRL_C             = wincoe.WM_USER + 150
 	WM_DO_SETWINDOWPOS             = wincoe.WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = wincoe.WM_USER + 205
-	WM_BRING_TO_FRONT              = wincoe.WM_USER + 206
-	WM_DO_RELEASE_CAPTURE          = wincoe.WM_USER + 215
-	WM_CANCEL_GESTURE              = wincoe.WM_USER + 220
-	WM_APPLY_SHIFT_MIRROR          = wincoe.WM_USER + 225
+	// WM_BRING_TO_FRONT promotes the window in wParam to the top of the
+	// Z-order via SetWindowPos(HWND_TOP, ..., SWP_NOACTIVATE). Regardless of
+	// lParam, the handler first checks isAlreadyTopmostInZOrder(wParam) and
+	// skips entirely if there's nothing to promote -- this is the actual fix
+	// for a race where a click that opens a NEW top-level window (e.g.
+	// double-clicking a list item -- see tryBringForegroundToFrontAt's own
+	// doc comment for the concrete repro: Network Connections adapter
+	// Properties -> "Internet Protocol Version 4 (TCP/IPv4)") can result in
+	// this message being processed after the new window already exists and
+	// is already sitting above wParam in the Z-order, but BEFORE that new
+	// window has stolen foreground/keyboard focus -- checking Z-order
+	// position directly catches that even though a foreground-identity
+	// check alone would not (foreground hasn't changed yet).
+	//
+	// lParam additionally selects between two semantics needed by this
+	// codebase's two posters of this message:
+	//   - lParam == 0: promote wParam once confirmed not already topmost.
+	//     Used by applyFocusAndBringToFrontOnGestureStart, which explicitly
+	//     targets whatever window a winkey+LMB/RMB gesture just started on,
+	//     regardless of whether that window happens to be foreground.
+	//   - lParam != 0: additionally only promote wParam if it is STILL the
+	//     current foreground window by the time this message is actually
+	//     processed. Used by tryBringForegroundToFrontAt, whose wParam is
+	//     only ever a foreground-window snapshot taken synchronously on the
+	//     hook thread at mouse-down time, and can therefore be stale by the
+	//     time this is processed.
+	WM_BRING_TO_FRONT     = wincoe.WM_USER + 206
+	WM_DO_RELEASE_CAPTURE = wincoe.WM_USER + 215
+	WM_CANCEL_GESTURE     = wincoe.WM_USER + 220
+	WM_APPLY_SHIFT_MIRROR = wincoe.WM_USER + 225
 )
 const (
 	MENU_EXIT                                      = 1
@@ -4677,11 +4703,39 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			logf("WM_BRING_TO_FRONT: received with zero HWND; ignoring")
 			return 0
 		}
-		// if res := procSetWindowPos.Call(
-		// 	uintptr(target),
-		// 	uintptr(HWND_TOP),
-		// 	0, 0, 0, 0,
-		// 	SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE,
+		// The real race-closer: check actual Z-order position, not just
+		// foreground identity. See WM_BRING_TO_FRONT's doc comment for why
+		// this catches the case a foreground-only check misses (a new
+		// window already created and already above target, but not yet
+		// foreground).
+		if isAlreadyTopmostInZOrder(target) {
+			logf("WM_BRING_TO_FRONT: HWND=0x%X is already topmost; nothing to promote (skipping SetWindowPos)", target)
+			return 0
+		}
+		// target may legitimately NOT be topmost while still being exactly
+		// where it should be: if it currently owns the foreground window
+		// (see windowOwnsCurrentForeground's doc comment), that owned
+		// window is correctly sitting above it per Win32's owner/owned
+		// Z-order invariant. Promoting target itself above HWND_TOP here
+		// (with SWP_NOACTIVATE, bypassing the activation path that would
+		// normally keep that invariant intact) would incorrectly shove the
+		// still-focused owned window behind its own owner.
+		if windowOwnsCurrentForeground(target) {
+			logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; it currently owns the foreground window, so promoting it would push its own active owned dialog behind it", target)
+			return 0
+		}
+		// See WM_BRING_TO_FRONT's doc comment for the lParam contract. A
+		// non-zero lParam means the poster only captured 'target' as a
+		// point-in-time foreground snapshot and wants us to double-check
+		// it's still accurate before acting -- acting on a stale snapshot
+		// here would silently bury whatever window is ACTUALLY foreground
+		// now underneath 'target'.
+		if lParam != 0 {
+			if current := getForegroundWindow(); current != target {
+				logf("WM_BRING_TO_FRONT: skipping stale request for HWND=0x%X; foreground changed to HWND=0x%X by the time this was processed", target, current)
+				return 0
+			}
+		}
 		if res := wincoe.SetWindowPos(target, wincoe.HWND_TOP, 0, 0, 0, 0,
 			wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
 		); res.Failed() {
@@ -8092,11 +8146,44 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) {
 
 	clickedHwnd, res0 := wincoe.RootWindowFromPoint(pt)
 	if clickedHwnd != 0 && clickedHwnd == fg {
-		// It's the foreground window. Fire an async message to bring it to top.
-		// We DO NOT swallow the click (we let it fall through to CallNextHookEx)
-		// so the target window still receives the actual mouse click!
+		// Nothing to do if fg is already the frontmost top-level window: it
+		// can't be a "sent to back but still nominally focused" window this
+		// feature exists to rescue, since such a window is (by definition)
+		// NOT at the top of the Z-order. Skipping here -- rather than only
+		// relying on the recheck inside WM_BRING_TO_FRONT's handler -- avoids
+		// posting a message at all for the overwhelmingly common case of
+		// "user is just clicking around in the window they're already
+		// using", which is exactly what was racing against newly-created
+		// windows: double-clicking a list item that spawns a new dialog
+		// (e.g. Network Connections adapter Properties ->
+		// "Internet Protocol Version 4 (TCP/IPv4)") fires this on BOTH
+		// physical clicks, both seeing fg == the not-yet-superseded parent
+		// dialog, both posting a redundant HWND_TOP promotion for it -- and
+		// one of those could land after the new dialog already exists (and
+		// is already sitting above the parent) but before it has stolen
+		// foreground/keyboard focus, silently burying the new dialog behind
+		// the reasserted parent.
+		if isAlreadyTopmostInZOrder(fg) {
+			return
+		}
+
+		// It's the foreground window (and not already topmost). Fire an
+		// async message to bring it to top. We DO NOT swallow the click (we
+		// let it fall through to CallNextHookEx) so the target window still
+		// receives the actual mouse click!
+		//
+		// 'fg' is only a snapshot taken synchronously here on the hook
+		// thread, at the exact moment of this physical mouse-down -- before
+		// the click has even been dispatched to (let alone processed by) the
+		// target application. If processing that very click causes some
+		// OTHER window to become foreground, 'fg' is stale by the time our
+		// posted message is actually processed. Pass lParam=1 so
+		// WM_BRING_TO_FRONT's handler re-verifies foreground identity before
+		// acting -- though the handler's own independent Z-order topmost
+		// recheck (see its doc comment) is what actually closes this race
+		// even in the narrow window where foreground hasn't switched yet.
 		if main := loadMainMsgHwnd(); main != 0 {
-			if res := wincoe.PostMessage(main, WM_BRING_TO_FRONT, uintptr(fg), 0); res.Failed() {
+			if res := wincoe.PostMessage(main, WM_BRING_TO_FRONT, uintptr(fg), 1); res.Failed() {
 				logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
 			}
 		} else {
@@ -8105,4 +8192,80 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) {
 	} else if res0.Failed() {
 		logf("tryBringForegroundToFrontAt:RootWindowFromPoint failed, res:%v", res0)
 	}
+}
+
+// isAlreadyTopmostInZOrder reports whether hwnd currently has nothing above
+// it in the system Z-order (GetWindow(hwnd, GW_HWNDPREV) finds no
+// predecessor). Used both by tryBringForegroundToFrontAt (to avoid posting
+// a needless WM_BRING_TO_FRONT for a window that's already frontmost) and
+// by WM_BRING_TO_FRONT's own handler (as the actual race-closer -- see
+// their respective doc comments for why checking raw Z-order position,
+// rather than only foreground/focus identity, is what's needed here).
+//
+// Returns false (conservative: "assume NOT topmost, so callers still
+// attempt the promotion") if the GetWindow call itself fails for a reason
+// other than "no predecessor" -- an unrelated API hiccup here should never
+// cause us to silently skip a promotion that's actually needed.
+func isAlreadyTopmostInZOrder(hwnd windows.Handle) bool {
+	if hwnd == 0 {
+		return false
+	}
+	res := wincoe.GetWindow(hwnd, wincoe.GW_HWNDPREV)
+	if res.Failed() {
+		logf("isAlreadyTopmostInZOrder:GetWindow(GW_HWNDPREV) failed for HWND=0x%X, res:%v; assuming not topmost so callers still attempt promotion", hwnd, res)
+		return false
+	}
+	return res.R1 == 0 // no predecessor in Z-order => hwnd is already topmost
+}
+
+// windowOwnsCurrentForeground reports whether target is the direct or
+// indirect owner of the current foreground window (walking the foreground
+// window's owner chain via GW_OWNER), or is the foreground window itself.
+//
+// This guards WM_BRING_TO_FRONT's HWND_TOP promotion against a specific
+// Win32 Z-order invariant: an owned window (WS_POPUP with its owner set via
+// GWL_HWNDPARENT, e.g. a modal-ish dialog spawned by another dialog -- NOT
+// a WS_CHILD) is always kept above its owner in normal Z-order maintenance,
+// and Windows re-asserts that automatically whenever the OWNED window
+// itself is activated. But SetWindowPos(owner, HWND_TOP, SWP_NOACTIVATE)
+// does not go through that activation path at all -- it can genuinely
+// place the owner ABOVE its own currently-foreground owned window, an
+// inconsistent state (the owned window keeps keyboard focus/an active
+// title bar, yet sits BEHIND its owner in Z-order) that Windows does not
+// auto-correct until something else forces re-activation.
+//
+// Concretely: Control Panel's Network Connections -> adapter Properties ->
+// double-clicking "Internet Protocol Version 4 (TCP/IPv4)" in the list
+// spawns the IPv4 Properties dialog OWNED by the adapter Properties dialog.
+// tryBringForegroundToFrontAt's queued promotion of the adapter Properties
+// dialog (captured as the foreground snapshot at the moment of the
+// double-click) can be processed after the IPv4 dialog already exists and
+// has already become foreground; promoting the adapter dialog to HWND_TOP
+// at that point shoves the still-focused IPv4 dialog behind it. Checking
+// isAlreadyTopmostInZOrder(adapter dialog) does NOT catch this -- the
+// adapter dialog correctly is not topmost (its own owned IPv4 dialog is
+// correctly above it) -- so this separate, owner-chain-aware check exists
+// specifically for that gap.
+//
+// Bounded to maxOwnerChainSteps as a defensive measure; a real owner chain
+// is never remotely that deep. Returns false (never block a legitimate
+// promotion) if the GetWindow(GW_OWNER) walk itself fails partway through.
+func windowOwnsCurrentForeground(target windows.Handle) bool {
+	if target == 0 {
+		return false
+	}
+	cur := getForegroundWindow()
+	const maxOwnerChainSteps = 32
+	for i := 0; cur != 0 && i < maxOwnerChainSteps; i++ {
+		if cur == target {
+			return true
+		}
+		res := wincoe.GetWindow(cur, wincoe.GW_OWNER)
+		if res.Failed() {
+			logf("windowOwnsCurrentForeground: GetWindow(GW_OWNER) failed for HWND=0x%X while walking owner chain from foreground, res:%v; treating as not-owned so the promotion isn't incorrectly blocked", cur, res)
+			return false
+		}
+		cur = windows.Handle(res.R1)
+	}
+	return false
 }
