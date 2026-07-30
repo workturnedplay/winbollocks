@@ -42,7 +42,7 @@ func BenchmarkBoundProcKeyDown(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		_ = procGetAsyncKeyStateN.Call(vk)
+		_ = procGetAsyncKeyStateN.Call(vk) //nolint:errcheck // don't care about return just timing
 	}
 }
 
@@ -54,7 +54,7 @@ func BenchmarkBoundProcGetAsyncStateArity1(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		_ = procGetAsyncKeyState1.Call(vk)
+		_ = procGetAsyncKeyState1.Call(vk) //nolint:errcheck // don't care about return just timing
 	}
 }
 
@@ -76,7 +76,7 @@ func BenchmarkDirectSyscallNKeyDown(b *testing.B) {
 
 //go:uintptrescapes
 func winCall1(proc *windows.LazyProc, a1 uintptr) uintptr {
-	r1, _, _ := syscall.SyscallN(proc.Addr(), a1)
+	r1, _, _ := syscall.SyscallN(proc.Addr(), a1) //nolint:errcheck // don't care about return just timing
 	return r1
 }
 
