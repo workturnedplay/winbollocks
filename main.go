@@ -317,22 +317,6 @@ type WindowMoveData struct {
 	FocusAfterBringToFront bool
 }
 
-type KBDLLHOOKSTRUCT struct {
-	VkCode      uint32
-	ScanCode    uint32
-	Flags       uint32
-	Time        uint32
-	DwExtraInfo uintptr
-}
-
-type MSLLHOOKSTRUCT struct {
-	Pt          wincoe.POINT
-	MouseData   uint32
-	Flags       uint32
-	Time        uint32
-	DwExtraInfo uintptr
-}
-
 type dragState struct {
 	startPt   wincoe.POINT
 	startRect wincoe.RECT
@@ -3419,7 +3403,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	//info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam)) // XXX: warns without the .\.vscode\settings.json the unsafeptr false part.
 
 	// ✅ Direct conversion from unsafe.Pointer to struct pointer (100% valid Go):
-	info := (*MSLLHOOKSTRUCT)(lParam)
+	info := (*wincoe.MSLLHOOKSTRUCT)(lParam)
 	// // Trick the linter: convert to pointer via an interface or a helper
 	// // that doesn't trigger the "unsafeptr" heuristic.
 	// var p interface{} = lParam
@@ -5938,7 +5922,7 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	//no effect: //nolint:govet,unsafeptr // Win32 hook lParam is OS-owned pointer valid for callback duration
 	//k := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
 
-	k := (*KBDLLHOOKSTRUCT)(lParam)
+	k := (*wincoe.KBDLLHOOKSTRUCT)(lParam)
 	vk := k.VkCode
 	// You see here even modifiers repeat just like letters, when held down!
 	//logf("vk=%#x wParam=%#x flags=%#x", vk, wParam, k.Flags)
@@ -6472,6 +6456,10 @@ func logWorker() {
 	var counter uint32 = 0
 	const MaxBeforeReset uint32 = 4_294_967_295 - 10_000_000
 	const modVal = 50 //must be more than 1, else infinite loop below
+	// Compile-time assertion: fails to compile if modVal <= 1
+	// Uses a division by zero error if modVal <= 1, which halts compilation cleanly.
+	const _ = 0 / (modVal - 1) // if compile-error set modVal to be > 1 !
+
 loggingLoop:
 	for {
 		select {
@@ -6946,13 +6934,13 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	// 	uintptr(WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS), //0x0000|0x0002, // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS
 	// ); res1.Failed() { //err != nil || h == 0 {
 	if theEvHook, res1 := wincoe.SetWinEventHook(
-		EVENT_SYSTEM_FOREGROUND, //min
-		EVENT_OBJECT_FOCUS,      //max
-		0,                       // hmod = 0 (out-of-context callback)
+		wincoe.EVENT_SYSTEM_FOREGROUND, //min
+		wincoe.EVENT_OBJECT_FOCUS,      //max
+		0,                              // hmod = 0 (out-of-context callback)
 		winEventProc,
 		0, // idProcess = 0 (all)
 		0, // idThread = 0 (all)
-		WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS,
+		wincoe.WINEVENT_OUTOFCONTEXT|wincoe.WINEVENT_SKIPOWNPROCESS,
 	); res1.Failed() {
 		logf("SetWinEventHook failed, hooking of winEventHook, from main thread: %v", res1.Err)
 	} else {
@@ -7509,7 +7497,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	_ = dwmsEventTime //don't warn me it's unused!
 
 	// ONLY process if it's the actual window, not a sub-control/caret/item
-	if idObject != OBJID_WINDOW { // 0 is OBJID_WINDOW
+	if idObject != wincoe.OBJID_WINDOW { // 0 is OBJID_WINDOW
 		return 0 // WinEvent callbacks return 0 (no chaining)
 	}
 
@@ -7524,9 +7512,9 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	var untrackedEvent bool = false
 
 	switch event {
-	case EVENT_SYSTEM_FOREGROUND: //0x0003:
+	case wincoe.EVENT_SYSTEM_FOREGROUND: //0x0003:
 		eventName = "EVENT_SYSTEM_FOREGROUND"
-	case EVENT_SYSTEM_CAPTURESTART: //0x0008:
+	case wincoe.EVENT_SYSTEM_CAPTURESTART: //0x0008:
 		eventName = "EVENT_SYSTEM_CAPTURESTART"
 		// fg := getForegroundWindow()
 		// logf("CaptureStart: FG=0x%x eventHWND=0x%x", fg, hwnd)
@@ -7538,30 +7526,30 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		// time.AfterFunc(100*time.Millisecond, func() {
 		// 	logf("100ms later FG=0x%x", getForegroundWindow())
 		// })
-	case EVENT_SYSTEM_CAPTUREEND: //0x0009:
+	case wincoe.EVENT_SYSTEM_CAPTUREEND: //0x0009:
 		eventName = "EVENT_SYSTEM_CAPTUREEND"
-	case EVENT_CONSOLE_UPDATE_REGION: //0x4002:
+	case wincoe.EVENT_CONSOLE_UPDATE_REGION: //0x4002:
 		//This fires when an object (window, button, menu item) is made visible. During a Regedit search,
 		// it might fire if the UI is dynamically popping elements in and out of the view.
 		eventName = "EVENT_CONSOLE_UPDATE_REGION"
 		untrackedEvent = true
-	case EVENT_CONSOLE_LAYOUT: // 0x4005:
+	case wincoe.EVENT_CONSOLE_LAYOUT: // 0x4005:
 		//It fires every time a window or an element moves or changes size.
 		eventName = "EVENT_CONSOLE_LAYOUT"
 		untrackedEvent = true
-	case EVENT_OBJECT_CREATE: //0x8000:
+	case wincoe.EVENT_OBJECT_CREATE: //0x8000:
 		eventName = "EVENT_OBJECT_CREATE"
 		untrackedEvent = true
-	case EVENT_OBJECT_DESTROY: //0x8001:
+	case wincoe.EVENT_OBJECT_DESTROY: //0x8001:
 		eventName = "EVENT_OBJECT_DESTROY"
 		untrackedEvent = true
-	case EVENT_OBJECT_SHOW: //0x8002:
+	case wincoe.EVENT_OBJECT_SHOW: //0x8002:
 		eventName = "EVENT_OBJECT_SHOW"
-	case EVENT_OBJECT_HIDE: // 0x8003:
+	case wincoe.EVENT_OBJECT_HIDE: // 0x8003:
 		eventName = "EVENT_OBJECT_HIDE"
-	case EVENT_OBJECT_REORDER: //0x8004:
+	case wincoe.EVENT_OBJECT_REORDER: //0x8004:
 		eventName = "EVENT_OBJECT_REORDER"
-	case EVENT_OBJECT_FOCUS: // 0x8005:
+	case wincoe.EVENT_OBJECT_FOCUS: // 0x8005:
 		eventName = "EVENT_OBJECT_FOCUS"
 	default:
 		// Return early if it's an event we aren't tracking to keep logs clean
@@ -7605,15 +7593,15 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	// transition, use the first reliable mouse-capture event to reconcile the
 	// actual foreground window via GetForegroundWindow().
 	forceReconcile := foregroundWasHigherIntegrity.Load() &&
-		event == EVENT_SYSTEM_CAPTURESTART // || event == EVENT_SYSTEM_CAPTUREEND || event == EVENT_OBJECT_FOCUS) // these two aren't needed, and last one isn't hit anyway!
+		event == wincoe.EVENT_SYSTEM_CAPTURESTART // || event == EVENT_SYSTEM_CAPTUREEND || event == EVENT_OBJECT_FOCUS) // these two aren't needed, and last one isn't hit anyway!
 
 	var pid uint32
 	targetHwnd := hwnd
 
-	if shouldLogFocusChanges || event == EVENT_SYSTEM_FOREGROUND || forceReconcile {
+	if shouldLogFocusChanges || event == wincoe.EVENT_SYSTEM_FOREGROUND || forceReconcile {
 		// If reconciling, the event's 'hwnd' might just be a child element.
 		// We want the absolute master foreground window to bypass the glitch.
-		if forceReconcile && event != EVENT_SYSTEM_FOREGROUND {
+		if forceReconcile && event != wincoe.EVENT_SYSTEM_FOREGROUND {
 			//res1 := procGetForegroundWindow.Call()
 			//targetHwnd = windows.Handle(res1.R1)
 			targetHwnd = getForegroundWindow()
@@ -7668,7 +7656,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			eventName, targetHwnd, rootHwnd, idObject, idChild, title, class, pid, procName, res2)
 	}
 
-	if event == EVENT_SYSTEM_FOREGROUND && targetHwnd != 0 && !isOwnWindow(targetHwnd) {
+	if event == wincoe.EVENT_SYSTEM_FOREGROUND && targetHwnd != 0 && !isOwnWindow(targetHwnd) {
 		class, res3 := wincoe.GetClassName(targetHwnd)
 		if res3.Failed() {
 			logf("winEventProc:GetClassName failed for HWND=0x%X, res: %v", targetHwnd, res3)
@@ -7680,7 +7668,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		}
 	}
 
-	if event == EVENT_SYSTEM_FOREGROUND || forceReconcile {
+	if event == wincoe.EVENT_SYSTEM_FOREGROUND || forceReconcile {
 		if pid == 0 {
 			badprogramming("pid is 0 here, code logic was changed!")
 		}
@@ -7696,7 +7684,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 			// 0x4000: System
 
 			// Only lock the state down if this was a genuine foreground transition
-			if event == EVENT_SYSTEM_FOREGROUND {
+			if event == wincoe.EVENT_SYSTEM_FOREGROUND {
 				logf("Target window HWND=0x%x is higher integrity (0x%x > 0x%x). UIPI will block movement(no key/mouse events will be received while it is focused!thus can't trigger the gesture).", targetHwnd, targetIL, selfIntegrityLevel)
 				softReset(true)
 				foregroundWasHigherIntegrity.Store(true)
@@ -7802,38 +7790,6 @@ func getWindowTextFast(hwnd windows.Handle) string {
 
 // Package-level. Non-nil = capture is currently held for that session pointer.
 var captureHeldForSession atomic.Pointer[dragSession]
-
-// WinEvent hook flags (SetWinEventHook dwFlags argument).
-const (
-	WINEVENT_OUTOFCONTEXT   uint32 = 0x0000 // callback delivered out-of-context (different process)
-	WINEVENT_SKIPOWNPROCESS uint32 = 0x0002 // suppress events originating in our own process
-)
-
-// WinEvent event codes.
-// The hook registered in runApplication covers EVENT_SYSTEM_FOREGROUND..EVENT_OBJECT_FOCUS,
-// which incidentally includes the 0x4xxx console-event band.
-const (
-	// System events
-	EVENT_SYSTEM_FOREGROUND   uint32 = 0x0003
-	EVENT_SYSTEM_CAPTURESTART uint32 = 0x0008 // a window acquired mouse capture
-	EVENT_SYSTEM_CAPTUREEND   uint32 = 0x0009 // mouse capture was released
-
-	// Console events (received because hook range 0x0003–0x8005 spans 0x4xxx)
-	EVENT_CONSOLE_UPDATE_REGION uint32 = 0x4002
-	EVENT_CONSOLE_LAYOUT        uint32 = 0x4005
-
-	// Object events
-	EVENT_OBJECT_CREATE  uint32 = 0x8000
-	EVENT_OBJECT_DESTROY uint32 = 0x8001
-	EVENT_OBJECT_SHOW    uint32 = 0x8002
-	EVENT_OBJECT_HIDE    uint32 = 0x8003
-	EVENT_OBJECT_REORDER uint32 = 0x8004
-	EVENT_OBJECT_FOCUS   uint32 = 0x8005
-)
-
-// OBJID_WINDOW is the idObject value meaning the event concerns the window itself,
-// not a child control, caret, or accessibility item.
-const OBJID_WINDOW int32 = 0
 
 // initForegroundIntegrityState seeds foregroundWasHigherIntegrity with the
 // integrity level of whatever window currently has the foreground, at the

@@ -1088,6 +1088,7 @@ var (
 	Advapi32 = windows.NewLazySystemDLL("advapi32.dll")
 	Ntdll    = windows.NewLazySystemDLL("ntdll.dll")
 	Wtsapi32 = windows.NewLazySystemDLL("wtsapi32.dll")
+	Setupapi = windows.NewLazySystemDLL("setupapi.dll")
 
 	procGetExtendedUdpTable = NewBoundProc6(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
 	procGetExtendedTcpTable = NewBoundProc6(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
@@ -1360,6 +1361,22 @@ var (
 	// (visible or not), not a failure indicator -- also CheckNone.
 	procIsWindowVisible = NewBoundProc1(User32, "IsWindowVisible", CheckNone)
 	procIsWindow        = NewBoundProc1(User32, "IsWindow", CheckNone)
+
+	// Iphlpapi routing procs
+	procGetBestInterface     = NewBoundProc2(Iphlpapi, "GetBestInterface", CheckErrno)
+	procGetIPForwardTable    = NewBoundProc3(Iphlpapi, "GetIpForwardTable", CheckErrno)
+	procCreateIPForwardEntry = NewBoundProc1(Iphlpapi, "CreateIpForwardEntry", CheckErrno)
+	procDeleteIPForwardEntry = NewBoundProc1(Iphlpapi, "DeleteIpForwardEntry", CheckErrno)
+	procGetIfTable           = NewBoundProc3(Iphlpapi, "GetIfTable", CheckErrno)
+	procGetIPAddrTable       = NewBoundProc3(Iphlpapi, "GetIpAddrTable", CheckErrno)
+
+	procSetupDiGetClassDevs              = NewBoundProc4(Setupapi, "SetupDiGetClassDevsW", CheckHandle)
+	procSetupDiEnumDeviceInfo            = NewBoundProc3(Setupapi, "SetupDiEnumDeviceInfo", CheckBool)
+	procSetupDiDestroyDeviceInfoList     = NewBoundProc1(Setupapi, "SetupDiDestroyDeviceInfoList", CheckBool)
+	procSetupDiGetDeviceInstanceId       = NewBoundProc5(Setupapi, "SetupDiGetDeviceInstanceIdW", CheckBool)
+	procSetupDiGetDeviceRegistryProperty = NewBoundProc7(Setupapi, "SetupDiGetDeviceRegistryPropertyW", CheckBool)
+	procSetupDiSetClassInstallParams     = NewBoundProc4(Setupapi, "SetupDiSetClassInstallParamsW", CheckBool)
+	procSetupDiCallClassInstaller        = NewBoundProc3(Setupapi, "SetupDiCallClassInstaller", CheckBool)
 )
 
 // auto runs before main(), loads the DLLs non-lazily.
@@ -3271,9 +3288,11 @@ func SetLastError() {
 }
 
 const (
-	CTRL_C_EVENT        = windows.CTRL_C_EVENT        //0
-	CTRL_BREAK_EVENT    = windows.CTRL_BREAK_EVENT    //1
-	CTRL_CLOSE_EVENT    = windows.CTRL_CLOSE_EVENT    //2
+	CTRL_C_EVENT     = windows.CTRL_C_EVENT     //0
+	CTRL_BREAK_EVENT = windows.CTRL_BREAK_EVENT //1
+	//clicked the close button on top right:
+	CTRL_CLOSE_EVENT = windows.CTRL_CLOSE_EVENT //2
+	//if win11 wants to restart/shutdown:
 	CTRL_LOGOFF_EVENT   = windows.CTRL_LOGOFF_EVENT   //5
 	CTRL_SHUTDOWN_EVENT = windows.CTRL_SHUTDOWN_EVENT //6
 )
@@ -3353,6 +3372,7 @@ func PostThreadMessage(threadID, msg uint32, wParam, lParam uintptr) WinResult {
 	)
 }
 
+// KEYBDINPUT is used for synthesizing inputs via SendInput
 type KEYBDINPUT struct {
 	WVk         uint16
 	WScan       uint16
@@ -3361,6 +3381,7 @@ type KEYBDINPUT struct {
 	DwExtraInfo uintptr
 }
 
+// MOUSEINPUT is used for synthesizing inputs via SendInput
 type MOUSEINPUT struct {
 	Dx          int32
 	Dy          int32
@@ -3370,6 +3391,10 @@ type MOUSEINPUT struct {
 	DwExtraInfo uintptr
 }
 
+// KEYANDMOUSE_INPUT represent any of the above 2
+// "The Union Problem: In C, an INPUT structure is a union where the largest member dictates the overall size of the structure.
+// MOUSEINPUT is larger than KEYBDINPUT. To prevent buffer overflows or misalignment when passing an array of INPUT structures to native APIs like SendInput,
+// Go structs representing C unions must explicitly pad out any remaining bytes so that Go's unsafe.Sizeof() matches the C header size precisely."
 type KEYANDMOUSE_INPUT struct {
 	Type uint32
 	_    uint32 // explicit padding for 64-bit alignment
@@ -3648,6 +3673,26 @@ func DestroyWindow(hwnd windows.Handle) WinResult {
 // GetWindowPlacement retrieves the show state and the restored, minimized, and maximized positions.
 func GetWindowPlacement(hwnd windows.Handle, wp *WINDOWPLACEMENT) WinResult {
 	return procGetWindowPlacement.Call(uintptr(hwnd), uintptr(unsafe.Pointer(wp)))
+}
+
+// --- Hook Structs ---
+
+// KBDLLHOOKSTRUCT is used by low-level keyboard hooks (SetWindowsHookEx with WH_KEYBOARD_LL)
+type KBDLLHOOKSTRUCT struct {
+	VkCode      uint32
+	ScanCode    uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+// MSLLHOOKSTRUCT is used by low-level mouse hooks (SetWindowsHookEx with WH_MOUSE_LL)
+type MSLLHOOKSTRUCT struct {
+	Pt          POINT
+	MouseData   uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
 }
 
 const (
@@ -5152,6 +5197,38 @@ type WinEventProc func(
 	dwEventThread, dwmsEventTime uint32,
 ) uintptr
 
+// WinEvent hook flags (SetWinEventHook dwFlags argument).
+const (
+	WINEVENT_OUTOFCONTEXT   uint32 = 0x0000 // callback delivered out-of-context (different process)
+	WINEVENT_SKIPOWNPROCESS uint32 = 0x0002 // suppress events originating in our own process
+)
+
+// WinEvent event codes.
+// The hook registered in runApplication covers EVENT_SYSTEM_FOREGROUND..EVENT_OBJECT_FOCUS,
+// which incidentally includes the 0x4xxx console-event band.
+const (
+	// System events
+	EVENT_SYSTEM_FOREGROUND   uint32 = 0x0003
+	EVENT_SYSTEM_CAPTURESTART uint32 = 0x0008 // a window acquired mouse capture
+	EVENT_SYSTEM_CAPTUREEND   uint32 = 0x0009 // mouse capture was released
+
+	// Console events (received because hook range 0x0003–0x8005 spans 0x4xxx)
+	EVENT_CONSOLE_UPDATE_REGION uint32 = 0x4002
+	EVENT_CONSOLE_LAYOUT        uint32 = 0x4005
+
+	// Object events
+	EVENT_OBJECT_CREATE  uint32 = 0x8000
+	EVENT_OBJECT_DESTROY uint32 = 0x8001
+	EVENT_OBJECT_SHOW    uint32 = 0x8002
+	EVENT_OBJECT_HIDE    uint32 = 0x8003
+	EVENT_OBJECT_REORDER uint32 = 0x8004
+	EVENT_OBJECT_FOCUS   uint32 = 0x8005
+)
+
+// OBJID_WINDOW is the idObject value meaning the event concerns the window itself,
+// not a child control, caret, or accessibility item.
+const OBJID_WINDOW int32 = 0
+
 // SetWinEventHook sets an event hook function for a range of events.
 //
 // It wraps the Win32 SetWinEventHook API, returning a WinResult containing
@@ -5369,3 +5446,201 @@ const (
 	SM_CXVIRTUALSCREEN = 78
 	SM_CYVIRTUALSCREEN = 79
 )
+
+// --- Routing & Interface Structs ---
+
+type MIB_IPFORWARDROW struct {
+	ForwardDest      uint32
+	ForwardMask      uint32
+	ForwardPolicy    uint32
+	ForwardNextHop   uint32
+	ForwardIfIndex   uint32
+	ForwardType      uint32
+	ForwardProto     uint32
+	ForwardAge       uint32
+	ForwardNextHopAS uint32
+	ForwardMetric1   uint32
+	ForwardMetric2   uint32
+	ForwardMetric3   uint32
+	ForwardMetric4   uint32
+	ForwardMetric5   uint32
+}
+
+type MIB_IFROW struct {
+	WszName         [256]uint16
+	Index           uint32
+	Type            uint32
+	Mtu             uint32
+	Speed           uint32
+	PhysAddrLen     uint32
+	PhysAddr        [8]byte
+	AdminStatus     uint32
+	OperStatus      uint32
+	LastChange      uint32
+	InOctets        uint32
+	InUcastPkts     uint32
+	InNUcastPkts    uint32
+	InDiscards      uint32
+	InErrors        uint32
+	InUnknownProtos uint32
+	OutOctets       uint32
+	OutUcastPkts    uint32
+	OutNUcastPkts   uint32
+	OutDiscards     uint32
+	OutErrors       uint32
+	OutQLen         uint32
+	DescrLen        uint32
+	Descr           [256]byte
+}
+
+type MIB_IPFORWARDTABLE struct {
+	NumEntries uint32
+	Table      [1]MIB_IPFORWARDROW // placeholder for dynamic allocation
+}
+
+type MIB_IPADDRROW struct {
+	Addr      uint32
+	Index     uint32
+	Mask      uint32
+	BCastAddr uint32
+	ReasmSize uint32
+	Unused1   uint16
+	Unused2   uint16
+}
+
+type MIB_IPADDRTABLE struct {
+	NumEntries uint32
+	Table      [1]MIB_IPADDRROW // Anchor for the array
+}
+
+// --- Routing API Wrappers ---
+
+// GetBestInterface retrieves the index of the interface that has the best route to the specified IPv4 address.
+func GetBestInterface(dwDestAddr uint32, pdwBestIfIndex *uint32) WinResult {
+	return procGetBestInterface.Call(uintptr(dwDestAddr), uintptr(unsafe.Pointer(pdwBestIfIndex)))
+}
+
+// GetIpForwardTable retrieves the IPv4 routing table.
+func GetIpForwardTable(pIpForwardTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
+	return procGetIPForwardTable.Call(uintptr(pIpForwardTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+}
+
+// CreateIpForwardEntry creates a route in the local computer's IPv4 routing table.
+func CreateIpForwardEntry(pRoute unsafe.Pointer) WinResult {
+	return procCreateIPForwardEntry.Call(uintptr(pRoute))
+}
+
+// DeleteIpForwardEntry deletes an existing route in the local computer's IPv4 routing table.
+func DeleteIpForwardEntry(pRoute unsafe.Pointer) WinResult {
+	return procDeleteIPForwardEntry.Call(uintptr(pRoute))
+}
+
+// GetIfTable retrieves the MIB-II interface table.
+func GetIfTable(pIfTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
+	return procGetIfTable.Call(uintptr(pIfTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+}
+
+// GetIpAddrTable retrieves the interface-to-IPv4 address mapping table.
+func GetIpAddrTable(pIpAddrTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
+	return procGetIPAddrTable.Call(uintptr(pIpAddrTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+}
+
+// --- SetupAPI Structs and Constants ---
+
+type SP_DEVINFO_DATA struct {
+	CbSize    uint32
+	ClassGuid windows.GUID
+	DevInst   uint32
+	Reserved  uintptr
+}
+
+type SP_CLASSINSTALL_HEADER struct {
+	CbSize          uint32
+	InstallFunction uint32
+}
+
+type SP_PROPCHANGE_PARAMS struct {
+	ClassInstallHeader SP_CLASSINSTALL_HEADER
+	StateChange        uint32
+	Scope              uint32
+	HwProfile          uint32
+}
+
+const (
+	DIGCF_DEFAULT         = 0x00000001
+	DIGCF_PRESENT         = 0x00000002
+	DIGCF_ALLCLASSES      = 0x00000004
+	DIGCF_PROFILE         = 0x00000008
+	DIGCF_DEVICEINTERFACE = 0x00000010
+
+	SPDRP_DEVICEDESC = 0x00000000
+
+	DIF_PROPERTYCHANGE = 0x00000012
+	DICS_PROPCHANGE    = 0x00000003
+	DICS_FLAG_GLOBAL   = 0x00000001
+
+	HC_ACTION = 0
+)
+
+// --- SetupAPI Wrappers ---
+
+func SetupDiGetClassDevs(classGuid *windows.GUID, enumerator *uint16, hwndParent windows.Handle, flags uint32) (windows.Handle, WinResult) {
+	res := procSetupDiGetClassDevs.Call(
+		uintptr(unsafe.Pointer(classGuid)),
+		uintptr(unsafe.Pointer(enumerator)),
+		uintptr(hwndParent),
+		uintptr(flags),
+	)
+	return windows.Handle(res.R1), res
+}
+
+func SetupDiEnumDeviceInfo(deviceInfoSet windows.Handle, memberIndex uint32, deviceInfoData *SP_DEVINFO_DATA) WinResult {
+	return procSetupDiEnumDeviceInfo.Call(
+		uintptr(deviceInfoSet),
+		uintptr(memberIndex),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+	)
+}
+
+func SetupDiDestroyDeviceInfoList(deviceInfoSet windows.Handle) WinResult {
+	return procSetupDiDestroyDeviceInfoList.Call(uintptr(deviceInfoSet))
+}
+
+func SetupDiGetDeviceInstanceId(deviceInfoSet windows.Handle, deviceInfoData *SP_DEVINFO_DATA, deviceInstanceId *uint16, deviceInstanceIdSize uint32, requiredSize *uint32) WinResult {
+	return procSetupDiGetDeviceInstanceId.Call(
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+		uintptr(unsafe.Pointer(deviceInstanceId)),
+		uintptr(deviceInstanceIdSize),
+		uintptr(unsafe.Pointer(requiredSize)),
+	)
+}
+
+func SetupDiGetDeviceRegistryProperty(deviceInfoSet windows.Handle, deviceInfoData *SP_DEVINFO_DATA, property uint32, propertyRegDataType *uint32, propertyBuffer *byte, propertyBufferSize uint32, requiredSize *uint32) WinResult {
+	return procSetupDiGetDeviceRegistryProperty.Call(
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+		uintptr(property),
+		uintptr(unsafe.Pointer(propertyRegDataType)),
+		uintptr(unsafe.Pointer(propertyBuffer)),
+		uintptr(propertyBufferSize),
+		uintptr(unsafe.Pointer(requiredSize)),
+	)
+}
+
+func SetupDiSetClassInstallParams(deviceInfoSet windows.Handle, deviceInfoData *SP_DEVINFO_DATA, classInstallParams *SP_PROPCHANGE_PARAMS, classInstallParamsSize uint32) WinResult {
+	return procSetupDiSetClassInstallParams.Call(
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+		uintptr(unsafe.Pointer(classInstallParams)),
+		uintptr(classInstallParamsSize),
+	)
+}
+
+func SetupDiCallClassInstaller(installFunction uint32, deviceInfoSet windows.Handle, deviceInfoData *SP_DEVINFO_DATA) WinResult {
+	return procSetupDiCallClassInstaller.Call(
+		uintptr(installFunction),
+		uintptr(deviceInfoSet),
+		uintptr(unsafe.Pointer(deviceInfoData)),
+	)
+}
