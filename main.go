@@ -204,6 +204,8 @@ var (
 	overlayHwnd windows.Handle
 	overlayText string
 
+	overlayIsShowing atomic.Bool // Tracks overlay visibility to prevent hide spam
+
 	// Reusable GDI brushes
 	magentaBrush windows.Handle
 	blackBrush   windows.Handle
@@ -2560,17 +2562,21 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		}
 	}
 
-	//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
 	// Instead of calling hideOverlay() synchronously on the hook thread,
 	// post it asynchronously to your main thread's message window loop.
-	if msgHwnd != 0 {
-		if res := wincoe.PostMessage(msgHwnd, WM_HIDE_OVERLAY, 0, 0); res.Failed() {
-			logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
+	if overlayIsShowing.CompareAndSwap(true, false) {
+		//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
+		// Instead of calling hideOverlay() synchronously on the hook thread,
+		// post it asynchronously to your main thread's message window loop.
+		if msgHwnd != 0 {
+			if res := wincoe.PostMessage(msgHwnd, WM_HIDE_OVERLAY, 0, 0); res.Failed() {
+				logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
+			}
+		} else {
+			logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0")
 		}
-	} else {
-		logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0")
 	}
-}
+} //softReset
 
 func hardReset(releaseCapture bool) {
 	var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -2864,6 +2870,8 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 	// 	300, 50,
 	// 	SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
 	// )
+
+	overlayIsShowing.Store(true) // Mark as showing before we ask Windows to show it
 
 	//Combining SWP_SHOWWINDOW and SWP_NOACTIVATE will successfully unhide (display) a window that was hidden using SW_HIDE,
 	//  and it will do so without stealing input focus or bringing the window to the foreground.
@@ -4390,8 +4398,8 @@ func hookWorker() {
 		if res3 := wincoe.GetMessage(&msg, 0, 0, 0); res3.Failed() {
 			logf("Hook worker thread got GetMessage error res=%v, exiting and unhooking...", res3)
 			break
-		} else if res3.R1 == wincoe.WM_QUIT /*aka WM_QUIT*/ {
-			logf("Hook worker thread received WM_QUIT(==0), exiting and unhooking...")
+		} else if res3.R1 == 0 /*returns 0 due to receiving WM_QUIT==0x12*/ {
+			logf("Hook worker thread received WM_QUIT(so R1==0), exiting and unhooking...")
 			break
 		}
 
