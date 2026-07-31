@@ -4649,8 +4649,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			}
 
 		default:
-			panic(fmt.Sprintf(
-				"BUG: unknown WindowMoveData.ZOrderAction %d",
+			badprogramming(fmt.Sprintf(
+				"unknown WindowMoveData.ZOrderAction %d",
 				data.ZOrderAction,
 			))
 		} //switch
@@ -8147,9 +8147,25 @@ func GetVersion() string {
 // using SWP_NOACTIVATE while unfocusSentToBackWindow was disabled.
 //
 // The repair must happen synchronously while the low-level mouse hook still
-// owns the physical button-down. Posting it asynchronously permits the
-// clicked application to process the click, create a new dialog, and then
-// have that dialog buried by a late promotion of its parent.
+// owns the physical button-down, BEFORE CallNextHookEx lets the click reach
+// the target application. Posting it asynchronously cannot guarantee that
+// ordering: our posted message and the target application processing its
+// own queued click are two independently scheduled threads, and there is a
+// real window where a newly-created owned dialog already sits above the
+// parent in Z-order while GetForegroundWindow() still reports the parent
+// (foreground hasn't switched yet) -- neither a foreground-identity check
+// nor a Z-order-topmost check catches that gap at processing time, only
+// acting before the click is even dispatched does.
+//
+// SAFETY: calling SetWindowPos directly on the hook thread is otherwise
+// forbidden in this codebase for exactly the reason documented on
+// moveDataChan/handleActualMoveOrResize -- a slow or hung target could
+// stall the global mouse hook for everyone. This is a deliberate, narrow
+// exception, scoped to the single window recorded in focusedSentToBackHwnd,
+// and guarded by the same SendMessageTimeout/SMTO_ABORTIFHUNG probe
+// forceForeground already relies on before doing anything riskier than a
+// plain getter -- if the target doesn't respond promptly, we skip the
+// promotion this time rather than risk hanging the hook thread.
 //
 // Returns true only when a remembered window was successfully restored.
 func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
@@ -8178,39 +8194,35 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 	clicked, res := wincoe.RootWindowFromPoint(pt)
 	if clicked == 0 {
 		if res.Failed() {
-			logf(
-				"tryBringForegroundToFrontAt: RootWindowFromPoint failed at (%d,%d): %v",
-				pt.X,
-				pt.Y,
-				res,
-			)
+			logf("tryBringForegroundToFrontAt: RootWindowFromPoint failed at (%d,%d): %v", pt.X, pt.Y, res)
 		}
 		return false
 	}
-
 	if clicked != target {
+		return false
+	}
+
+	// Hang guard before the synchronous, blocking-risk call below -- see
+	// this function's own doc comment. A failure here (hung target) is not
+	// itself logged as an error condition worth alarming over; skip this
+	// time and let a later click or Win+Shift+MMB retry.
+	var pingResult uintptr
+	if res := wincoe.SendMessageTimeout(
+		target, wincoe.WM_NULL, 0, 0,
+		wincoe.SMTO_ABORTIFHUNG, HungWindowTimeout, &pingResult,
+	); res.Failed() {
+		logf("tryBringForegroundToFrontAt: target HWND=0x%X appears hung (SendMessageTimeout probe failed: %v); skipping synchronous promotion to avoid stalling the mouse hook", target, res.Err)
 		return false
 	}
 
 	// This executes before CallNextHookEx lets the target process the
 	// initiating mouse-down, so no dialog caused by that click can exist yet.
 	res = wincoe.SetWindowPos(
-		target,
-		wincoe.HWND_TOP,
-		0,
-		0,
-		0,
-		0,
-		wincoe.SWP_NOMOVE|
-			wincoe.SWP_NOSIZE|
-			wincoe.SWP_NOACTIVATE,
+		target, wincoe.HWND_TOP, 0, 0, 0, 0,
+		wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
 	)
 	if res.Failed() {
-		logf(
-			"tryBringForegroundToFrontAt: SetWindowPos(HWND_TOP) failed for HWND=0x%X: %v",
-			target,
-			res.Err,
-		)
+		logf("tryBringForegroundToFrontAt: SetWindowPos(HWND_TOP) failed for HWND=0x%X: %v", target, res.Err)
 		// Retain the marker so another click or Win+Shift+MMB can retry.
 		return false
 	}
