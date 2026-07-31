@@ -4740,6 +4740,48 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			logf("WM_BRING_TO_FRONT: skipping stale request for HWND=0x%X; foreground changed to HWND=0x%X by the time this was processed", target, fg)
 			return 0
 		}
+		// // [THE FIX] failed, via Gemini 3.1 Pro
+		// // If the target is STILL the focused window (target == fg), we must distinguish between:
+		// // 1. The window was genuinely sent to the back (Win+MMB) and needs to be promoted.
+		// // 2. The user double-clicked an item (like IPv4 properties) which spawned a new dialog
+		// //    above the parent, but the parent hasn't officially lost 'fg' status yet.
+		// if target == fg {
+		// 	// Check A: Is the parent window disabled?
+		// 	// Standard Win32 behavior for spawning a modal dialog (like IPv4 properties)
+		// 	// is to disable the parent window immediately.
+		// 	style, err := getWindowLongPtr(target, wincoe.GWL_STYLE)
+		// 	if err == nil && (style&wincoe.WS_DISABLED) != 0 {
+		// 		logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; it is focused but DISABLED. Likely has an active modal popup above it.", target)
+		// 		return 0
+		// 	}
+
+		// 	// Check B: Walk up the Z-order to find the FIRST VISIBLE window above target.
+		// 	// The previous attempt failed because GW_HWNDPREV only looks exactly ONE step up.
+		// 	// If there is an invisible helper window wedged between the parent and the IPv4 dialog,
+		// 	// the check failed to abort the promotion.
+		// 	currRes := wincoe.GetWindow(target, wincoe.GW_HWNDPREV)
+		// 	for steps := 0; steps < 32 && currRes.Succeeded() && currRes.R1 != 0; steps++ {
+		// 		prevHwnd := windows.Handle(currRes.R1)
+
+		// 		prevStyle, errStyle := getWindowLongPtr(prevHwnd, wincoe.GWL_STYLE)
+		// 		if errStyle == nil && (prevStyle&wincoe.WS_VISIBLE) != 0 {
+		// 			// Found the first VISIBLE window above target! Does it share the same thread?
+		// 			var dummyPid uint32
+		// 			targetTid, errTarget := wincoe.GetWindowThreadProcessId(target, &dummyPid)
+		// 			prevTid, errPrev := wincoe.GetWindowThreadProcessId(prevHwnd, &dummyPid)
+
+		// 			if errTarget.Succeeded() && errPrev.Succeeded() && targetTid != 0 && targetTid == prevTid {
+		// 				logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; first VISIBLE window above it (0x%X) belongs to the same thread (TID %d). Assumed to be a newly spawned dialog.", target, prevHwnd, targetTid)
+		// 				return 0
+		// 			}
+		// 			// If the first visible window is from a DIFFERENT thread, the target is genuinely
+		// 			// sitting behind another application. We can safely stop looking and allow promotion.
+		// 			break
+		// 		}
+		// 		// It was invisible, move up to the next window in the Z-order
+		// 		currRes = wincoe.GetWindow(prevHwnd, wincoe.GW_HWNDPREV)
+		// 	}
+		// }
 		if res := wincoe.SetWindowPos(target, wincoe.HWND_TOP, 0, 0, 0, 0,
 			wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
 		); res.Failed() {
