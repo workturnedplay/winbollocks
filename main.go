@@ -2258,23 +2258,23 @@ func tryPerformMMBGestureAt(
 
 		- Gemini 3.5 Thinking
 	*/
-	// winkey + shift + MMB -> bring back the originally sent-to-back window
-	// Win+Shift+MMB: restore according to the setting snapshot taken now.
-	//
-	// With unfocusing enabled, select the newest successfully sent-to-back
-	// stack entry. Otherwise the sent-to-back window retained foreground,
-	// so use the explicitly tracked focused marker.
-	if unfocusSentToBackWindow.Load() {
-		var restoreID uint64
-		var ok bool
-
-		restoreID, hwnd, ok = reserveSentToBackWindow()
-		if !ok {
-			logf(
-				"Win+Shift+MMB: no unreserved valid sent-to-back window to restore",
-			)
-			return false, false
-		}
+	// Win+Shift+MMB: restore whichever remembered sent-to-back window is
+	// available. Checked in a FIXED order -- sentToBackStack first, then
+	// the focusedSentToBackHwnd marker -- regardless of the LIVE
+	// unfocusSentToBackWindow setting. Unlike send-time (which snapshots
+	// the setting into the data it commits, since THAT decides whether
+	// focus should be touched at all for a given send -- see
+	// data.UnfocusAfterSuccessfulSendToBack above), a restore must still
+	// find the right window even if the setting was toggled in between a
+	// send and its corresponding restore attempt: a sentToBackStack entry
+	// only ever exists because a send happened while the setting was on,
+	// and the focusedSentToBackHwnd marker only ever exists because a send
+	// happened while the setting was off -- so trying the stack first,
+	// falling back to the marker only if the stack is empty, always finds
+	// whichever one is actually populated, independent of whatever the
+	// setting currently reads.
+	if restoreID, stackCandidate, ok := reserveSentToBackWindow(); ok {
+		hwnd = stackCandidate
 
 		if shouldBypassGestureNow(hwnd) {
 			releaseSentToBackReservation(restoreID)
@@ -2284,19 +2284,13 @@ func tryPerformMMBGestureAt(
 		if ShouldThrottle() {
 			releaseSentToBackReservation(restoreID)
 			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
-			return true, false               //"One deliberate difference from Claude’s version: a throttled operation still returns started=true, preserving the current caller contract, but it does not lose or consume an undo entry." GPT-5.4 Thinking Mini
+			return true, false               // preserves the "started" contract without losing the undo entry
 		}
 
 		data.ZOrderAction = zOrderActionRestoreStackEntry
 		data.SentToBackRestoreID = restoreID
-	} else {
-		hwnd = windows.Handle(focusedSentToBackHwnd.Load())
-		if hwnd == 0 {
-			logf(
-				"Win+Shift+MMB: no focused sent-to-back window to restore",
-			)
-			return false, false
-		}
+	} else if markerCandidate := windows.Handle(focusedSentToBackHwnd.Load()); markerCandidate != 0 {
+		hwnd = markerCandidate
 
 		if !wincoe.IsWindow(hwnd) {
 			focusedSentToBackHwnd.CompareAndSwap(uintptr(hwnd), 0)
@@ -2330,6 +2324,9 @@ func tryPerformMMBGestureAt(
 		}
 
 		data.ZOrderAction = zOrderActionRestoreFocused
+	} else {
+		logf("Win+Shift+MMB: nothing to restore (sentToBackStack empty, no focused marker set)")
+		return false, false
 	}
 
 	data.Hwnd = hwnd
