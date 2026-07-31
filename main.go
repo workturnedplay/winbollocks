@@ -2941,7 +2941,7 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
 		// Fallback: if style check fails but it fills the screen, err on the side of caution
 		return true
-	} else {
+	} else { //nolint:gocritic // elseif: can replace 'else {if cond {}}' with 'else if cond {}' (gocritic) // no it can't: i need the comment!
 		// If it fills the screen AND has a caption, it's just a normal maximized window
 		// (likely bleeding over the edges due to an auto-hidden taskbar).
 		if (style & wincoe.WS_CAPTION) == wincoe.WS_CAPTION {
@@ -8188,14 +8188,12 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 		return false
 	}
 
-	clicked, res := wincoe.RootWindowFromPoint(pt)
-	if clicked == 0 {
-		if res.Failed() {
-			logf("tryBringForegroundToFrontAt: RootWindowFromPoint failed at (%d,%d): %v", pt.X, pt.Y, res)
+	if clicked, res1 := wincoe.RootWindowFromPoint(pt); clicked == 0 {
+		if res1.Failed() {
+			logf("tryBringForegroundToFrontAt: RootWindowFromPoint failed at (%d,%d): %v", pt.X, pt.Y, res1)
 		}
 		return false
-	}
-	if clicked != target {
+	} else if clicked != target {
 		return false
 	}
 
@@ -8204,22 +8202,22 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 	// itself logged as an error condition worth alarming over; skip this
 	// time and let a later click or Win+Shift+MMB retry.
 	var pingResult uintptr
-	if res := wincoe.SendMessageTimeout(
+	if res2 := wincoe.SendMessageTimeout(
 		target, wincoe.WM_NULL, 0, 0,
 		wincoe.SMTO_ABORTIFHUNG, HungWindowTimeout, &pingResult,
-	); res.Failed() {
-		logf("tryBringForegroundToFrontAt: target HWND=0x%X appears hung (SendMessageTimeout probe failed: %v); skipping synchronous promotion to avoid stalling the mouse hook", target, res.Err)
+	); res2.Failed() {
+		logf("tryBringForegroundToFrontAt: target HWND=0x%X appears hung (SendMessageTimeout probe failed: %v); skipping synchronous promotion to avoid stalling the mouse hook", target, res2.Err)
 		return false
 	}
 
 	// This executes before CallNextHookEx lets the target process the
 	// initiating mouse-down, so no dialog caused by that click can exist yet.
-	res = wincoe.SetWindowPos(
+
+	if res3 := wincoe.SetWindowPos(
 		target, wincoe.HWND_TOP, 0, 0, 0, 0,
 		wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
-	)
-	if res.Failed() {
-		logf("tryBringForegroundToFrontAt: SetWindowPos(HWND_TOP) failed for HWND=0x%X: %v", target, res.Err)
+	); res3.Failed() {
+		logf("tryBringForegroundToFrontAt: SetWindowPos(HWND_TOP) failed for HWND=0x%X: %v", target, res3.Err)
 		// Retain the marker so another click or Win+Shift+MMB can retry.
 		return false
 	}
