@@ -221,32 +221,14 @@ const (
 	WM_EXIT_VIA_CTRL_C             = wincoe.WM_USER + 150
 	WM_DO_SETWINDOWPOS             = wincoe.WM_USER + 200 // arbitrary, just unique
 	WM_HIDE_OVERLAY                = wincoe.WM_USER + 205
-	// WM_BRING_TO_FRONT promotes the window in wParam to the top of the
-	// Z-order via SetWindowPos(HWND_TOP, ..., SWP_NOACTIVATE). Regardless of
-	// lParam, the handler first checks isAlreadyTopmostInZOrder(wParam) and
-	// skips entirely if there's nothing to promote -- this is the actual fix
-	// for a race where a click that opens a NEW top-level window (e.g.
-	// double-clicking a list item -- see tryBringForegroundToFrontAt's own
-	// doc comment for the concrete repro: Network Connections adapter
-	// Properties -> "Internet Protocol Version 4 (TCP/IPv4)") can result in
-	// this message being processed after the new window already exists and
-	// is already sitting above wParam in the Z-order, but BEFORE that new
-	// window has stolen foreground/keyboard focus -- checking Z-order
-	// position directly catches that even though a foreground-identity
-	// check alone would not (foreground hasn't changed yet).
+	// WM_BRING_TO_FRONT promotes wParam to HWND_TOP without activating it.
+	// It is used only by gesture-start bring-to-front handling.
 	//
-	// lParam additionally selects between two semantics needed by this
-	// codebase's two posters of this message:
-	//   - lParam == 0: promote wParam once confirmed not already topmost.
-	//     Used by applyFocusAndBringToFrontOnGestureStart, which explicitly
-	//     targets whatever window a winkey+LMB/RMB gesture just started on,
-	//     regardless of whether that window happens to be foreground.
-	//   - lParam != 0: additionally only promote wParam if it is STILL the
-	//     current foreground window by the time this message is actually
-	//     processed. Used by tryBringForegroundToFrontAt, whose wParam is
-	//     only ever a foreground-window snapshot taken synchronously on the
-	//     hook thread at mouse-down time, and can therefore be stale by the
-	//     time this is processed.
+	// Ordinary background-click repair does not use this asynchronous
+	// message: tryBringForegroundToFrontAt performs that repair synchronously
+	// before the initiating click reaches the target application, preventing
+	// a late parent-window promotion from burying a dialog created by that
+	// click.
 	WM_BRING_TO_FRONT     = wincoe.WM_USER + 206
 	WM_DO_RELEASE_CAPTURE = wincoe.WM_USER + 215
 	WM_CANCEL_GESTURE     = wincoe.WM_USER + 220
@@ -293,6 +275,24 @@ var (
 
 //TODO: reorder these (I've 'var' and 'type' in this block)
 
+type zOrderAction uint8
+
+const (
+	zOrderActionNone zOrderAction = iota
+
+	// zOrderActionSendToBack identifies a Win+MMB HWND_BOTTOM operation.
+	zOrderActionSendToBack
+
+	// zOrderActionRestoreStackEntry identifies a Win+Shift+MMB restoration
+	// of an entry reserved from sentToBackStack.
+	zOrderActionRestoreStackEntry
+
+	// zOrderActionRestoreFocused identifies a Win+Shift+MMB restoration of
+	// the foreground-retaining window used while
+	// unfocusSentToBackWindow was disabled.
+	zOrderActionRestoreFocused
+)
+
 type WindowMoveData struct {
 	Hwnd        windows.Handle // Target window
 	X           int32          // New X (full 32-bit)
@@ -302,45 +302,25 @@ type WindowMoveData struct {
 	Flags       uint32         // Optional: extra SWP_ flags
 	ResizeZone  int
 
-	// UnfocusAfterSendToBack marks this entry as originating from a
-	// winkey+MMB (no shift) send-to-back gesture whose target actually held
-	// keyboard focus at the moment of the gesture (see
-	// tryPerformMMBGestureAt's !shiftDown branch and its
-	// targetWasFocusedBeforeSendToBack local), so handleActualMoveOrResize
-	// knows it's safe -- and intended -- to check whether
-	// unfocusSentToBackWindow requires shifting focus to whatever is now
-	// the top-of-Z-order window afterward. Left false (the zero value) for
-	// every other case: ordinary drag-move, resize, the winkey+shift+MMB
-	// bring-to-front gesture (which uses its own FocusAfterBringToFront
-	// flag below instead, since it always wants target itself refocused,
-	// never some OTHER now-topmost window), AND a winkey+MMB send-to-back
-	// gesture whose target was NOT already focused -- sending an
-	// already-unfocused "side window" to the back must never disturb
-	// whatever unrelated window actually holds focus, since SWP_NOACTIVATE
-	// already guarantees the OS itself won't touch it either.
-	UnfocusAfterSendToBack bool
+	// ZOrderAction records the application-level meaning of this operation.
+	// Do not infer that meaning later from InsertAfter: WindowMoveData is
+	// also used by unrelated move and resize operations.
+	ZOrderAction zOrderAction
 
-	// FocusAfterBringToFront marks this entry as originating from a
-	// winkey+shift+MMB (bring-to-front) gesture (see
-	// tryPerformMMBGestureAt's shiftDown branch), so
-	// handleActualMoveOrResize explicitly refocuses Hwnd via
-	// forceForeground() once its Z-order change (always issued with
-	// SWP_NOACTIVATE for this gesture -- see Flags) succeeds. This gesture
-	// always sets this flag rather than relying on SetWindowPos's own
-	// implicit activation (omitting SWP_NOACTIVATE and hoping HWND_TOP
-	// alone both reorders AND focuses): that implicit path is gated by the
-	// same foreground-lock/focus-stealing-prevention rules as a bare
-	// SetForegroundWindow call, and empirically both silently fails to
-	// steal focus AND declines to fully promote the window to the top of
-	// the Z order when the target isn't already foreground -- exactly the
-	// situation unfocusSentToBackWindow creates (some other window now
-	// holds focus after an earlier send-to-back). forceForeground()
-	// already no-ops safely when Hwnd happens to already be foreground
-	// (the unfocusSentToBackWindow==false fallback path in
-	// tryPerformMMBGestureAt, where the target comes straight from
-	// GetForegroundWindow()), so setting this unconditionally for the
-	// gesture is correct regardless of that setting.
-	FocusAfterBringToFront bool
+	// TargetWasForegroundBeforeSendToBack is meaningful only for
+	// zOrderActionSendToBack. It snapshots whether Hwnd was foreground when
+	// the Win+MMB gesture was accepted.
+	TargetWasForegroundBeforeSendToBack bool
+
+	// UnfocusAfterSuccessfulSendToBack is meaningful only for
+	// zOrderActionSendToBack. It snapshots the user's setting at gesture
+	// acceptance time, rather than reloading the setting after this queued
+	// operation eventually runs.
+	UnfocusAfterSuccessfulSendToBack bool
+
+	// SentToBackRestoreID identifies the reserved sentToBackStack entry
+	// associated with zOrderActionRestoreStackEntry.
+	SentToBackRestoreID uint64
 }
 
 type dragState struct {
@@ -594,36 +574,54 @@ var bringToFrontOnDrag atomic.Bool
 var focusOnResize atomic.Bool
 var bringToFrontOnResize atomic.Bool
 
-// bringToFrontOnBackgroundClick, when true, restores a focused-but-
-// backgrounded window (e.g. one previously sent to the back of the
-// Z-order via winkey+MMB) to the top of the Z-order the moment the user
-// clicks on it with LMB/MMB/RMB while winkey isn't held -- see
-// tryBringForegroundToFrontAt, called from mouseProc's
-// WM_LBUTTONDOWN/WM_RBUTTONDOWN/WM_MBUTTONDOWN handling. Toggleable via
-// systray.
+// bringToFrontOnBackgroundClick enables synchronous ordinary-click repair
+// for the focused-but-backgrounded state explicitly recorded in
+// focusedSentToBackHwnd.
+//
+// The promotion is performed inside the low-level mouse-down hook before the
+// target application receives the click, preventing a late queued promotion
+// from burying a dialog spawned by that click.
 var bringToFrontOnBackgroundClick atomic.Bool
 
-// unfocusSentToBackWindow, when true, shifts keyboard focus away from a
-// window immediately after it's sent to the back of the Z-order via
-// winkey+MMB (see tryPerformMMBGestureAt's !shiftDown branch and
-// WindowMoveData.UnfocusAfterSendToBack). That SetWindowPos call always
-// passes SWP_NOACTIVATE so the reordering itself doesn't disturb focus,
-// which means the now-backgrounded window silently keeps keyboard focus
-// even though something else is now visually on top -- typing afterward
-// goes to the window you just tried to banish, not to whatever you can
-// actually see. When enabled, handleActualMoveOrResize walks the Z-order
-// (see findNewForegroundCandidateAfterSendToBack) to find whichever window
-// is now topmost and gives it focus instead.
-// Off by default(Edit:  Switched to on by default!): most people
-// don't mind the quirk, and focusing an arbitrary other-process window
-// carries the same small residual risk any of this codebase's other focus
-// attempts do (e.g. Windows' own focus-stealing prevention could still
-// reject it in some state). Toggleable via systray.
+// unfocusSentToBackWindow, when true, snapshots a request to shift keyboard
+// focus away after a focused window is successfully sent to HWND_BOTTOM via
+// Win+MMB. Successful such operations are recorded in sentToBackStack for
+// LIFO Win+Shift+MMB restoration.
+//
+// When false, the successfully backgrounded window deliberately retains
+// foreground status and is recorded in focusedSentToBackHwnd so an ordinary
+// click can synchronously restore it.
 var unfocusSentToBackWindow atomic.Bool
 
-// lastSentToBackHwnd remembers the last window pushed to the back of the Z-order
-// via winkey+MMB, so winkey+shift+MMB can reliably summon it back even if it lost focus.
-var lastSentToBackHwnd atomic.Uintptr
+// sentToBackEntry represents a successfully completed Win+MMB
+// send-to-back operation performed while unfocusSentToBackWindow was
+// enabled.
+//
+// restoring reserves an entry for one accepted Win+Shift+MMB request. The
+// entry remains in the stack until SetWindowPos(HWND_TOP) actually succeeds.
+type sentToBackEntry struct {
+	id        uint64
+	hwnd      windows.Handle
+	restoring bool
+}
+
+var (
+	sentToBackStackMu sync.Mutex
+	sentToBackStack   []sentToBackEntry
+
+	nextSentToBackEntryID atomic.Uint64
+
+	// focusedSentToBackHwnd is non-zero only after winbollocks successfully
+	// sends a foreground window to HWND_BOTTOM while deliberately retaining
+	// its foreground status.
+	//
+	// An ordinary click on this exact window needs explicit synchronous
+	// restoration because Windows sees it as already foreground and
+	// therefore may not promote it normally.
+	focusedSentToBackHwnd atomic.Uintptr
+)
+
+const maxSentToBackStackDepth = 64
 
 // bypassGesturesWhenFullscreen, when true, suppresses winkey+mouse gestures
 // whose resolved target window is fullscreen (exclusive or
@@ -2162,204 +2160,190 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (st
 	return true, false
 }
 
-// tryPerformMMBGestureAt is MMB's counterpart to tryBeginMoveGestureAt /
-// tryBeginResizeGestureAt: resolves the window a winkey+MMB (shiftDown=false,
-// send-to-back) or winkey+shift+MMB (shiftDown=true, bring-to-front) gesture
-// would act on, applies the same live fullscreen-bypass check (see
-// shouldBypassGestureNow) against that resolved window, and if not bypassed
-// submits the Z-order change (throttled the same way the real-time handler
-// always was). Used by both the real WM_MBUTTONDOWN handler and the
-// missed-gesture recovery path in WM_MOUSEMOVE, so winkey+MMB now recovers
-// from a higher-UIPI foreground window the same way winkey+LMB/RMB already
-// did.
-//
-// Unlike the move/resize gestures, MMB has no persistent dragSession — it's
-// a single, immediate Z-order change — so there's no activeSession
-// interaction here.
-//
-// Returns (started, bypassed) with the same contract as
-// tryBeginMoveGestureAt: bypassed means "let the originating input event
-// pass through unswallowed"; started is false for any other reason nothing
-// was done (no resolvable target window) and callers should still swallow
-// the input, same as before this function existed. A throttled/dropped
-// attempt (see ShouldThrottle) still counts as started=true, matching the
-// original handler's silent-drop behavior (no failure is logged for it).
-func tryPerformMMBGestureAt(pt wincoe.POINT, shiftDown bool) (started, bypassed bool) {
-	var hwnd windows.Handle
-	useTracking := unfocusSentToBackWindow.Load()
-
-	// targetWasFocusedBeforeSendToBack records whether hwnd held keyboard
-	// focus at the moment this gesture fired, computed unconditionally
-	// (independent of useTracking/unfocusSentToBackWindow) so it stays
-	// correct even if that setting gets toggled between now and whenever
-	// handleActualMoveOrResize actually processes the enqueued data below.
-	// Consumed via data.UnfocusAfterSendToBack: sending a window that was
-	// NOT already focused to the back of the Z-order must never disturb
-	// whatever unrelated window actually holds focus (SWP_NOACTIVATE
-	// already guarantees the OS itself won't touch it) -- only a window
-	// that genuinely held focus before being sent back needs its focus
-	// explicitly reconciled afterward.
-	var targetWasFocusedBeforeSendToBack bool
+func tryPerformMMBGestureAt(
+	pt wincoe.POINT,
+	shiftDown bool,
+) (started, bypassed bool) {
+	var (
+		hwnd windows.Handle
+		data WindowMoveData // stack allocated — zero cost
+	)
 
 	if !shiftDown {
 		// winkey + MMB -> send window under cursor to bottom of Z-order
-		var res0 wincoe.WinResult
-		hwnd, res0 = wincoe.RootWindowFromPoint(pt) // window under cursor
-		if hwnd != 0 {
-			targetWasFocusedBeforeSendToBack = isWindowForeground(hwnd)
-			if useTracking && targetWasFocusedBeforeSendToBack {
-				// ONLY remember this window if unfocusSentToBackWindow is true AND it currently has focus
-				lastSentToBackHwnd.Store(uintptr(hwnd))
+		// Win+MMB: send the root window under the cursor to the bottom.
+		var res wincoe.WinResult
+		hwnd, res = wincoe.RootWindowFromPoint(pt) // window under cursor
+		if hwnd == 0 {
+			if res.Failed() {
+				logf(
+					"tryPerformMMBGestureAt: RootWindowFromPoint failed: %v",
+					res,
+				)
+			} else {
+				logf(
+					"tryPerformMMBGestureAt: no target for Win+MMB at (%d,%d)",
+					pt.X,
+					pt.Y,
+				)
 			}
-		} else if res0.Failed() {
-			logf("tryPerformMMBGestureAt:RootWindowFromPoint failed, res:%v", res0)
-		}
-	} else {
-		// winkey + shift + MMB -> bring currently focused window to top
-		/*
-					Based on how the Windows API behaves, procGetForegroundWindow should remain CheckNone rather than CheckNull.
-
-			Here is a breakdown of why treating a NULL (0) return value from GetForegroundWindow as an API failure (which CheckNull typically does) will cause bugs in your application:
-			1. NULL is a valid, normal state
-
-			According to Microsoft's documentation for GetForegroundWindow:
-
-			    "The return value is a handle to the foreground window. The foreground window can be NULL in certain circumstances, such as when a window is losing activation."
-
-			Other common scenarios where it returns NULL (0) include:
-
-			    The workstation is locked (Ctrl+Alt+Del or Win+L).
-
-			    A screen saver is active.
-
-			    The system is in the middle of a window-switching transition.
-
-			    A full-screen exclusive application (like some games) is changing display modes.
-
-			Because NULL is a legitimate state meaning "there is currently no foreground window," your Go code should handle this as a normal logic branch (e.g., skipping an action or retrying later), rather than treating it as an exceptional system failure.
-
-			2. It does not set GetLastError
-
-			Functions that use CheckNull usually assume that if the function returns 0, it failed, and they will automatically call syscall.GetLastError() to append a descriptive error message.
-
-			However, GetForegroundWindow does not set an error code via SetLastError. If it returns NULL, calling GetLastError will return either 0 (The operation completed successfully.) or a stale error left over from a completely unrelated previous system call. This leads to confusing log pollution or false-positive panics.
-
-			- Gemini 3.5 Thinking
-		*/
-		// winkey + shift + MMB -> bring back the originally sent-to-back window
-		if useTracking {
-			// Atomically consume (swap to 0) the saved handle so it is only restored once
-			if saved := lastSentToBackHwnd.Swap(0); saved != 0 {
-				candidate := windows.Handle(saved)
-				// Verify the window was not closed while in the background
-				if wincoe.IsWindow(candidate) {
-					hwnd = candidate
-					logf("got one 0x%X", hwnd)
-				}
-			}
-
-			// When tracking is enabled and no valid saved window exists, stop here.
-			// Do NOT fall back to GetForegroundWindow(), because the active foreground
-			// window is currently sitting on TOP of the Z-order!
-			if hwnd == 0 {
-				logf("winkey+shift+MMB: no valid previously focused sent-to-back window to restore (or it's focused already from last time)")
-				return false, false
-			}
-		} else {
-			// Fallback mode: unfocusSentToBackWindow is FALSE, meaning the window sent to back
-			// retained foreground focus. Thus, GetForegroundWindow() points to that window.
-			fg := getForegroundWindow()
-			if fg == 0 {
-				logf("Couldn't get currently focused window for winkey+shift+MMB gesture ergo aborting attempt")
-				return false, false
-			}
-			hwnd = fg
+			return false, false
 		}
 
-		// // Fallback: if unfocusSentToBackWindow is false, or no window has been saved yet
-		// if hwnd == 0 {
-		// 	// Fallback if we haven't sent anything to the back yet
-		// 	res1 := procGetForegroundWindow.Call() // whichever the currently focused window is, wherever it is
-		// 	// procGetForegroundWindow is bound with wincoe.CheckNone (GetForegroundWindow has no
-		// 	// real failure signal beyond returning NULL), so res1.Failed() can never be true here;
-		// 	// check R1 directly, matching GetForegroundWindow's documented NULL-on-failure contract.
-		// 	if res1.R1 == 0 {
-		// 		logf("Couldn't get currently focused window for the purposes of bringing it to front for winkey+shift+MMB gesture ergo aborting attempt, err=%v callStatus=%v r1=%v", res1.Err, res1.CallStatus, res1.R1)
-		// 		return false, false
-		// 	}
-		// 	hwnd = windows.Handle(res1.R1)
-		// }
-	}
-
-	if hwnd == 0 {
-		if !shiftDown {
-			logf("hwnd == 0 for winkey+MMB (send to back) thus nothing was done!")
-		} else {
-			logf("hwnd == 0 for winkey+shift+MMB (bring focused window to front) thus nothing was done!")
+		if shouldBypassGestureNow(hwnd) {
+			return false, true // foreground is fullscreen; let event through
 		}
-		return false, false
-	}
 
-	if shouldBypassGestureNow(hwnd) {
-		if useTracking {
-			lastSentToBackHwnd.Store(0)
+		if ShouldThrottle() { //every 10ms or more, else drop it
+			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			return true, false
 		}
-		return false, true // foreground is fullscreen; let event through
-	}
 
-	if !ShouldThrottle() {
-		//data := new(WindowMoveData) // Heap-allocated, TODO: fix this the same way as for mouse move event!
-		var data WindowMoveData // stack allocated — zero cost
-		if !shiftDown {
-			// winkey + MMB → send active window to bottom
+		targetWasForeground := isWindowForeground(hwnd)
+		unfocusAfterSuccess :=
+			targetWasForeground && unfocusSentToBackWindow.Load()
 
-			// Send to back, no activation
-			// if you do this for a focused window then no amount of LMB will bring it back to front unless it loses focus first!
-
-			// winkey_DOWN but no other modifiers(including shift) is down
-			// and LMB is down, ofc, then we start move window gesture:
-			data.InsertAfter = wincoe.HWND_BOTTOM
-			data.Flags = wincoe.SWP_NOMOVE | wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE
-			// SWP_NOACTIVATE above means hwnd keeps keyboard focus even
-			// though it's now behind everything else -- but only if hwnd
-			// actually held focus to begin with (see
-			// targetWasFocusedBeforeSendToBack above). Sending an
-			// already-unfocused "side window" to the back changes nothing
-			// about focus at all, so only flag this entry for
-			// handleActualMoveOrResize's post-move refocus reconciliation
-			// when there's genuinely something to reconcile.
-			data.UnfocusAfterSendToBack = targetWasFocusedBeforeSendToBack
-		} else {
-			// winkey + shift + MMB → bring focused window to top
-
-			// shift is down too, so winkey_DOWN and shiftDOWN and LMB are down
-			// but no other modifiers like ctrl or alt are down
-			// then we start the bring focused window to front gesture:
-			data.InsertAfter = wincoe.HWND_TOP
-			// Always request SWP_NOACTIVATE here and handle activation
-			// ourselves afterward via forceForeground() (see
-			// FocusAfterBringToFront) instead of relying on SetWindowPos's
-			// own implicit activation: when hwnd isn't already the
-			// foreground window (exactly the case unfocusSentToBackWindow
-			// creates -- some OTHER window now holds focus after an
-			// earlier send-to-back), that implicit path is gated by the
-			// same foreground-lock/focus-stealing-prevention rules as a
-			// bare SetForegroundWindow call, and empirically fails to
-			// steal focus AND to fully promote hwnd to the very top of the
-			// Z order -- silently doing neither. See FocusAfterBringToFront's
-			// doc comment on WindowMoveData.
-			data.Flags = wincoe.SWP_NOMOVE | wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE
-			data.FocusAfterBringToFront = true
-		}
 		data.Hwnd = hwnd // window under cursor
-		data.X = 0       // int32, full range
-		data.Y = 0
-		enqueueMoveOrResize(data, "MMB gesture (winkey+MMB or winkey+shift+MMB, direct or recovered)")
-	} else { // endif every 10ms or more, else drop it
-		if useTracking {
-			lastSentToBackHwnd.Store(0)
+		data.InsertAfter = wincoe.HWND_BOTTOM
+		data.Flags =
+			wincoe.SWP_NOMOVE |
+				wincoe.SWP_NOSIZE |
+				wincoe.SWP_NOACTIVATE
+		data.ZOrderAction = zOrderActionSendToBack
+		data.TargetWasForegroundBeforeSendToBack = targetWasForeground
+		data.UnfocusAfterSuccessfulSendToBack = unfocusAfterSuccess
+
+		// Ignore enqueueMoveOrResize's return value here.
+		//
+		// started reports that we recognized and consumed a Win+MMB gesture, not
+		// that the queued SetWindowPos is guaranteed to execute. A full queue is an
+		// internal implementation detail; the initiating middle-click must still be
+		// swallowed so it never leaks through to the target application.
+		_ = enqueueMoveOrResize(
+			data,
+			"Win+MMB send-to-back gesture (direct or recovered)",
+		)
+
+		return true, false
+	}
+
+	// winkey + shift + MMB -> bring currently focused window to top
+	/*
+				Based on how the Windows API behaves, procGetForegroundWindow should remain CheckNone rather than CheckNull.
+
+		Here is a breakdown of why treating a NULL (0) return value from GetForegroundWindow as an API failure (which CheckNull typically does) will cause bugs in your application:
+		1. NULL is a valid, normal state
+
+		According to Microsoft's documentation for GetForegroundWindow:
+
+		    "The return value is a handle to the foreground window. The foreground window can be NULL in certain circumstances, such as when a window is losing activation."
+
+		Other common scenarios where it returns NULL (0) include:
+
+		    The workstation is locked (Ctrl+Alt+Del or Win+L).
+
+		    A screen saver is active.
+
+		    The system is in the middle of a window-switching transition.
+
+		    A full-screen exclusive application (like some games) is changing display modes.
+
+		Because NULL is a legitimate state meaning "there is currently no foreground window," your Go code should handle this as a normal logic branch (e.g., skipping an action or retrying later), rather than treating it as an exceptional system failure.
+
+		2. It does not set GetLastError
+
+		Functions that use CheckNull usually assume that if the function returns 0, it failed, and they will automatically call syscall.GetLastError() to append a descriptive error message.
+
+		However, GetForegroundWindow does not set an error code via SetLastError. If it returns NULL, calling GetLastError will return either 0 (The operation completed successfully.) or a stale error left over from a completely unrelated previous system call. This leads to confusing log pollution or false-positive panics.
+
+		- Gemini 3.5 Thinking
+	*/
+	// winkey + shift + MMB -> bring back the originally sent-to-back window
+	// Win+Shift+MMB: restore according to the setting snapshot taken now.
+	//
+	// With unfocusing enabled, select the newest successfully sent-to-back
+	// stack entry. Otherwise the sent-to-back window retained foreground,
+	// so use the explicitly tracked focused marker.
+	if unfocusSentToBackWindow.Load() {
+		var restoreID uint64
+		var ok bool
+
+		restoreID, hwnd, ok = reserveSentToBackWindow()
+		if !ok {
+			logf(
+				"Win+Shift+MMB: no unreserved valid sent-to-back window to restore",
+			)
+			return false, false
 		}
-		droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+
+		if shouldBypassGestureNow(hwnd) {
+			releaseSentToBackReservation(restoreID)
+			return false, true // foreground is fullscreen; let event through
+		}
+
+		if ShouldThrottle() {
+			releaseSentToBackReservation(restoreID)
+			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			return true, false               //"One deliberate difference from Claude’s version: a throttled operation still returns started=true, preserving the current caller contract, but it does not lose or consume an undo entry." GPT-5.4 Thinking Mini
+		}
+
+		data.ZOrderAction = zOrderActionRestoreStackEntry
+		data.SentToBackRestoreID = restoreID
+	} else {
+		hwnd = windows.Handle(focusedSentToBackHwnd.Load())
+		if hwnd == 0 {
+			logf(
+				"Win+Shift+MMB: no focused sent-to-back window to restore",
+			)
+			return false, false
+		}
+
+		if !wincoe.IsWindow(hwnd) {
+			focusedSentToBackHwnd.CompareAndSwap(uintptr(hwnd), 0)
+			logf(
+				"Win+Shift+MMB: remembered focused sent-to-back HWND=0x%X is no longer valid",
+				hwnd,
+			)
+			return false, false
+		}
+
+		// The marker should normally equal foreground. Requiring that here
+		// prevents a stale marker from moving an unrelated formerly
+		// foreground window after focus has changed naturally.
+		if fg := getForegroundWindow(); fg != hwnd {
+			focusedSentToBackHwnd.CompareAndSwap(uintptr(hwnd), 0)
+			logf(
+				"Win+Shift+MMB: discarding stale focused sent-to-back HWND=0x%X; current foreground is HWND=0x%X",
+				hwnd,
+				fg,
+			)
+			return false, false
+		}
+
+		if shouldBypassGestureNow(hwnd) {
+			return false, true
+		}
+
+		if ShouldThrottle() {
+			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
+			return true, false
+		}
+
+		data.ZOrderAction = zOrderActionRestoreFocused
+	}
+
+	data.Hwnd = hwnd
+	data.InsertAfter = wincoe.HWND_TOP
+	data.Flags =
+		wincoe.SWP_NOMOVE |
+			wincoe.SWP_NOSIZE |
+			wincoe.SWP_NOACTIVATE
+
+	if !enqueueMoveOrResize(
+		data,
+		"Win+Shift+MMB restore gesture (direct or recovered)",
+	) {
+		abandonPendingZOrderAction(data)
 	}
 
 	return true, false
@@ -4344,7 +4328,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		} else {
 			logf("handleActualMoveOrResize:SetCapture couldn't setcapture because mainMsgHwnd was 0")
 			droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action, maybe we need a diff. counter for each kind of dropped type/reason?
-			return
+			abandonPendingZOrderAction(data)
+			return //These are the early exits before the relevant SetWindowPos.
 		}
 		/*
 			One caveat worth stating: since you're using WH_MOUSE_LL, you receive all mouse events globally regardless of capture.
@@ -4361,7 +4346,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	if !bypassThrottle && ShouldThrottle() {
 		// dropped because of execution speed limit
 		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action, maybe we need a diff. counter for each kind of dropped type/reason?
-		return
+		abandonPendingZOrderAction(data)
+		return //These are the early exits before the relevant SetWindowPos.
 	}
 	// Mark EARLY — we've decided to process this one
 	MarkAsResizedNow()
@@ -4581,42 +4567,95 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		// 	uintptr(data.Flags),
 		// )
 		//if ret == 0 { //failed
-		if res4 := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H, data.Flags); res4.Failed() {
+		res4 := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H, data.Flags)
+		if res4.Failed() {
 			//errCode, _, _ := procGetLastError.Call()
 			logf("SetWindowPos/Move-or-AsyncResize failed(from within main message loop): hwnd=0x%x err=%v", target, res4.Err)
 			// if errCode == 5 { // Access denied (UIPI likely)
 			if res4.ErrIs(windows.ERROR_ACCESS_DENIED) { // ==5 aka Access denied (UIPI likely)
 				showTrayInfo(selfName, "Cannot Move-or-AsyncResize elevated window (access denied), you'd have to run as admin.")
 			}
-		} else if data.UnfocusAfterSendToBack && unfocusSentToBackWindow.Load() {
-			// The send-to-back Z-order change above succeeded and this
-			// entry came from winkey+MMB's send-to-back gesture; since that
-			// call used SWP_NOACTIVATE, target still nominally holds
-			// keyboard focus even though it's now behind everything else.
-			// Shift focus to whichever window is now genuinely on top.
-			if newTop := findNewForegroundCandidateAfterSendToBack(target); newTop != 0 {
-				if !forceForeground(newTop) {
-					logf("handleActualMoveOrResize: failed to shift focus to new top-of-Z-order HWND=0x%X after sending HWND=0x%X to back", newTop, target)
+			abandonPendingZOrderAction(data)
+			return
+		}
+		switch data.ZOrderAction {
+		case zOrderActionNone:
+			// Ordinary move or asynchronous resize.
+
+		case zOrderActionSendToBack:
+			if !data.TargetWasForegroundBeforeSendToBack {
+				// Sending an already-unfocused side window to the bottom
+				// must neither change focus nor create a restoration entry.
+				break
+			}
+
+			if data.UnfocusAfterSuccessfulSendToBack {
+				// The send-to-back Z-order change above succeeded and this
+				// entry came from winkey+MMB's send-to-back gesture; since that
+				// call used SWP_NOACTIVATE, target still nominally holds
+				// keyboard focus even though it's now behind everything else.
+				// Shift focus to whichever window is now genuinely on top.
+
+				// Record only now that HWND_BOTTOM actually succeeded.
+				pushSentToBackWindow(target)
+
+				// This HWND is using stack-based restoration, not the
+				// foreground-retaining ordinary-click repair.
+				focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+
+				if newTop :=
+					findNewForegroundCandidateAfterSendToBack(target); newTop != 0 {
+					if !forceForeground(newTop) {
+						logf(
+							"handleActualMoveOrResize: failed to shift focus to new top-of-Z-order HWND=0x%X after sending HWND=0x%X to back",
+							newTop,
+							target,
+						)
+					}
+				} else {
+					logf(
+						"handleActualMoveOrResize: no suitable window found to refocus after sending HWND=0x%X to back",
+						target,
+					)
 				}
 			} else {
-				logf("handleActualMoveOrResize: no suitable window found to refocus after sending HWND=0x%X to back", target)
+				// HWND_BOTTOM succeeded and foreground was deliberately
+				// retained. This exact provenance authorizes synchronous
+				// ordinary-click restoration later.
+				focusedSentToBackHwnd.Store(uintptr(target))
 			}
-		} else if data.FocusAfterBringToFront {
-			// The bring-to-front Z-order change above succeeded (issued
-			// with SWP_NOACTIVATE, so it happened unconditionally
-			// regardless of whatever focus-stealing restrictions might
-			// otherwise silently veto SetWindowPos's own implicit
-			// activation -- see FocusAfterBringToFront's doc comment on
-			// WindowMoveData). Now explicitly focus target via the same
-			// reliable mechanism the rest of this codebase already relies
-			// on to steal focus. Safe no-op if target already happens to
-			// be foreground.
+
+		case zOrderActionRestoreStackEntry:
+			// Remove the undo entry only after HWND_TOP succeeds.
+			completeSentToBackRestoration(data.SentToBackRestoreID)
+			focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+
 			if !forceForeground(target) {
-				logf("handleActualMoveOrResize: failed to focus HWND=0x%X after bringing it to front via winkey+shift+MMB", target)
+				logf(
+					"handleActualMoveOrResize: failed to focus HWND=0x%X after restoring sent-to-back stack entry ID=%d",
+					target,
+					data.SentToBackRestoreID,
+				)
 			}
-		}
-	}
-}
+
+		case zOrderActionRestoreFocused:
+			focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+
+			if !forceForeground(target) {
+				logf(
+					"handleActualMoveOrResize: failed to focus HWND=0x%X after restoring focused sent-to-back window",
+					target,
+				)
+			}
+
+		default:
+			panic(fmt.Sprintf(
+				"BUG: unknown WindowMoveData.ZOrderAction %d",
+				data.ZOrderAction,
+			))
+		} //switch
+	} //else
+} //func
 
 // makeLParam packs signed 16-bit x,y coordinates into a Win32 LPARAM (uintptr).
 // This ensures proper sign-extension to 64 bits on x64, matching MAKELPARAM / LPARAM semantics.
@@ -4698,90 +4737,13 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		return 0
 
 	case WM_BRING_TO_FRONT:
+		//"lParam is now unused in this case"
 		target := windows.Handle(wParam)
 		if target == 0 {
 			logf("WM_BRING_TO_FRONT: received with zero HWND; ignoring")
 			return 0
 		}
-		if isAlreadyTopmostInZOrder(target) {
-			logf("WM_BRING_TO_FRONT: HWND=0x%X is already topmost; nothing to promote (skipping SetWindowPos)", target)
-			return 0
-		}
-		// Fetch the current foreground window once and reuse it below for
-		// both the owner-chain check and the optional lParam staleness
-		// recheck, rather than querying GetForegroundWindow() twice for
-		// what is, within this single message handler, the same
-		// point-in-time snapshot.
-		fg := getForegroundWindow()
-		// target may legitimately NOT be topmost while still being exactly
-		// where it should be: if it currently owns fg (see
-		// windowOwnsForeground's doc comment), fg is correctly sitting
-		// above it per Win32's owner/owned Z-order invariant. Promoting
-		// target itself above HWND_TOP here (with SWP_NOACTIVATE, bypassing
-		// the activation path that would normally keep that invariant
-		// intact) would incorrectly shove the still-focused owned window
-		// behind its own owner.
-		if windowOwnsForeground(target, fg) {
-			logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; it currently owns the foreground window, so promoting it would push its own active owned dialog behind it", target)
-			return 0
-		}
-		// See WM_BRING_TO_FRONT's doc comment for the lParam contract. A
-		// non-zero lParam means the poster only captured 'target' as a
-		// point-in-time foreground snapshot and wants us to double-check
-		// it's still accurate before acting -- acting on a stale snapshot
-		// here would silently bury whatever window is ACTUALLY foreground
-		// now underneath 'target'. This is a plain equality check (NOT
-		// "does target own fg", already handled above): target simply being
-		// focused (fg == target) is exactly the state
-		// tryBringForegroundToFrontAt's whole feature exists to promote out
-		// of the background, so equality here must be treated as "still
-		// valid, proceed" rather than "nothing to do".
-		if lParam != 0 && fg != target {
-			logf("WM_BRING_TO_FRONT: skipping stale request for HWND=0x%X; foreground changed to HWND=0x%X by the time this was processed", target, fg)
-			return 0
-		}
-		// // [THE FIX] failed, via Gemini 3.1 Pro
-		// // If the target is STILL the focused window (target == fg), we must distinguish between:
-		// // 1. The window was genuinely sent to the back (Win+MMB) and needs to be promoted.
-		// // 2. The user double-clicked an item (like IPv4 properties) which spawned a new dialog
-		// //    above the parent, but the parent hasn't officially lost 'fg' status yet.
-		// if target == fg {
-		// 	// Check A: Is the parent window disabled?
-		// 	// Standard Win32 behavior for spawning a modal dialog (like IPv4 properties)
-		// 	// is to disable the parent window immediately.
-		// 	style, err := getWindowLongPtr(target, wincoe.GWL_STYLE)
-		// 	if err == nil && (style&wincoe.WS_DISABLED) != 0 {
-		// 		logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; it is focused but DISABLED. Likely has an active modal popup above it.", target)
-		// 		return 0
-		// 	}
 
-		// 	// Check B: Walk up the Z-order to find the FIRST VISIBLE window above target.
-		// 	// The previous attempt failed because GW_HWNDPREV only looks exactly ONE step up.
-		// 	// If there is an invisible helper window wedged between the parent and the IPv4 dialog,
-		// 	// the check failed to abort the promotion.
-		// 	currRes := wincoe.GetWindow(target, wincoe.GW_HWNDPREV)
-		// 	for steps := 0; steps < 32 && currRes.Succeeded() && currRes.R1 != 0; steps++ {
-		// 		prevHwnd := windows.Handle(currRes.R1)
-
-		// 		prevStyle, errStyle := getWindowLongPtr(prevHwnd, wincoe.GWL_STYLE)
-		// 		if errStyle == nil && (prevStyle&wincoe.WS_VISIBLE) != 0 {
-		// 			// Found the first VISIBLE window above target! Does it share the same thread?
-		// 			var dummyPid uint32
-		// 			targetTid, errTarget := wincoe.GetWindowThreadProcessId(target, &dummyPid)
-		// 			prevTid, errPrev := wincoe.GetWindowThreadProcessId(prevHwnd, &dummyPid)
-
-		// 			if errTarget.Succeeded() && errPrev.Succeeded() && targetTid != 0 && targetTid == prevTid {
-		// 				logf("WM_BRING_TO_FRONT: skipping promotion of HWND=0x%X; first VISIBLE window above it (0x%X) belongs to the same thread (TID %d). Assumed to be a newly spawned dialog.", target, prevHwnd, targetTid)
-		// 				return 0
-		// 			}
-		// 			// If the first visible window is from a DIFFERENT thread, the target is genuinely
-		// 			// sitting behind another application. We can safely stop looking and allow promotion.
-		// 			break
-		// 		}
-		// 		// It was invisible, move up to the next window in the Z-order
-		// 		currRes = wincoe.GetWindow(prevHwnd, wincoe.GW_HWNDPREV)
-		// 	}
-		// }
 		if res := wincoe.SetWindowPos(target, wincoe.HWND_TOP, 0, 0, 0, 0,
 			wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
 		); res.Failed() {
@@ -4906,6 +4868,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			// resetStaleGestureFlags's doc comment (shared with the
 			// higher-integrity-foreground case in winEventProc).
 			resetStaleGestureFlags()
+			clearSentToBackStack()
 			if session := activeSession.Load(); session != nil {
 				logf("WTS session %s detected mid-%v; discarding stale drag/resize session for HWND=0x%X", wtsSessionChangeName(wParam), session.mode, session.targetWnd)
 				softReset(true)
@@ -6095,6 +6058,9 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		}
 		switch vk {
 		case wincoe.VK_LWIN, wincoe.VK_RWIN:
+			clearSentToBackStack()
+			//Do not clear focusedSentToBackHwnd here. That marker must survive Win-key release because ordinary-click restoration occurs later, after the user releases Win and clicks the backgrounded window.
+
 			//logf("winUP")
 			//hardResetIfDesynced(false)
 			/*
@@ -7794,6 +7760,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 				// very foreground shift was itself caused by an in-flight
 				// gesture. See resetStaleGestureFlags's doc comment.
 				resetStaleGestureFlags()
+				clearSentToBackStack()
 			}
 		} else {
 			if shouldLogFocusChanges {
@@ -8049,7 +8016,7 @@ func markGestureUsedOnce() {
 
 // enqueueMoveOrResize submits data to moveDataChan and wakes the main thread's
 // message loop to drain it. context is only used in the failure log.
-func enqueueMoveOrResize(data WindowMoveData, context3 string) {
+func enqueueMoveOrResize(data WindowMoveData, context3 string) bool { //Existing callers are allowed to ignore a returned value in Go, so this does not require changing every call site.
 	// Send to your mover channel
 	select {
 	case moveDataChan <- data:
@@ -8068,12 +8035,14 @@ func enqueueMoveOrResize(data WindowMoveData, context3 string) {
 				logf("enqueueMoveOrResize:PostMessage of WM_DO_SETWINDOWPOS for %s failed because mainMsgHwnd was 0", context3)
 			}
 		}
+		return true
 	default:
 		// FAIL: The channel (2048 slots) is completely full.
 		// This happens if the Main Thread is frozen (e.g., Admin console lag).
 		// We MUST NOT block here, or we will freeze the user's entire mouse cursor.
 		// We just increment our "shame counter" and move on.
 		droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to channel full
+		return false
 	}
 }
 
@@ -8173,155 +8142,211 @@ func GetVersion() string {
 	return memoizedVersion
 }
 
-// tryBringForegroundToFrontAt checks if the mouse click was over the window that
-// already has foreground focus. If so, it posts an async WM_BRING_TO_FRONT message
-// to restore its Z-order position (e.g. if it was previously sent to bottom via Win+MMB).
-func tryBringForegroundToFrontAt(pt wincoe.POINT) {
+// tryBringForegroundToFrontAt repairs the exact exceptional state created
+// when winbollocks successfully sent a foreground window to HWND_BOTTOM
+// using SWP_NOACTIVATE while unfocusSentToBackWindow was disabled.
+//
+// The repair must happen synchronously while the low-level mouse hook still
+// owns the physical button-down. Posting it asynchronously permits the
+// clicked application to process the click, create a new dialog, and then
+// have that dialog buried by a late promotion of its parent.
+//
+// Returns true only when a remembered window was successfully restored.
+func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 	if !bringToFrontOnBackgroundClick.Load() {
-		return
+		return false
 	}
 
-	// --- NEW FIX: Bring focused-but-backgrounded window to front ---
-	// If the user clicks the window that already has focus, Windows normally
-	// skips Z-order promotion. If we sent it to the back previously via
-	// winkey+MMB, it stays stuck there. We detect this and explicitly bring it up.
+	target := windows.Handle(focusedSentToBackHwnd.Load())
+	if target == 0 {
+		return false
+	}
+
+	if !wincoe.IsWindow(target) {
+		focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+		return false
+	}
+
 	fg := getForegroundWindow()
-	if fg == 0 {
+	if fg != target {
+		// The exceptional focused-but-backgrounded state ended naturally.
+		// Do not later promote this stale HWND merely because it is clicked.
+		focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+		return false
+	}
+
+	clicked, res := wincoe.RootWindowFromPoint(pt)
+	if clicked == 0 {
+		if res.Failed() {
+			logf(
+				"tryBringForegroundToFrontAt: RootWindowFromPoint failed at (%d,%d): %v",
+				pt.X,
+				pt.Y,
+				res,
+			)
+		}
+		return false
+	}
+
+	if clicked != target {
+		return false
+	}
+
+	// This executes before CallNextHookEx lets the target process the
+	// initiating mouse-down, so no dialog caused by that click can exist yet.
+	res = wincoe.SetWindowPos(
+		target,
+		wincoe.HWND_TOP,
+		0,
+		0,
+		0,
+		0,
+		wincoe.SWP_NOMOVE|
+			wincoe.SWP_NOSIZE|
+			wincoe.SWP_NOACTIVATE,
+	)
+	if res.Failed() {
+		logf(
+			"tryBringForegroundToFrontAt: SetWindowPos(HWND_TOP) failed for HWND=0x%X: %v",
+			target,
+			res.Err,
+		)
+		// Retain the marker so another click or Win+Shift+MMB can retry.
+		return false
+	}
+
+	focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+	return true
+}
+
+// pushSentToBackWindow records a successfully completed send-to-back
+// operation. It must only be called after SetWindowPos(HWND_BOTTOM)
+// succeeds.
+func pushSentToBackWindow(hwnd windows.Handle) {
+	if hwnd == 0 {
 		return
 	}
 
-	clickedHwnd, res0 := wincoe.RootWindowFromPoint(pt)
-	if clickedHwnd != 0 && clickedHwnd == fg {
-		// Nothing to do if fg is already the frontmost top-level window: it
-		// can't be a "sent to back but still nominally focused" window this
-		// feature exists to rescue, since such a window is (by definition)
-		// NOT at the top of the Z-order. Skipping here -- rather than only
-		// relying on the recheck inside WM_BRING_TO_FRONT's handler -- avoids
-		// posting a message at all for the overwhelmingly common case of
-		// "user is just clicking around in the window they're already
-		// using", which is exactly what was racing against newly-created
-		// windows: double-clicking a list item that spawns a new dialog
-		// (e.g. Network Connections adapter Properties ->
-		// "Internet Protocol Version 4 (TCP/IPv4)") fires this on BOTH
-		// physical clicks, both seeing fg == the not-yet-superseded parent
-		// dialog, both posting a redundant HWND_TOP promotion for it -- and
-		// one of those could land after the new dialog already exists (and
-		// is already sitting above the parent) but before it has stolen
-		// foreground/keyboard focus, silently burying the new dialog behind
-		// the reasserted parent.
-		if isAlreadyTopmostInZOrder(fg) {
+	id := nextSentToBackEntryID.Add(1)
+	if id == 0 {
+		// uint64 wrapped. Zero is reserved as "no entry".
+		id = nextSentToBackEntryID.Add(1)
+		if id == 0 {
+			panic("nextSentToBackEntryID wrapped twice")
+		}
+	}
+
+	sentToBackStackMu.Lock()
+	defer sentToBackStackMu.Unlock()
+
+	if len(sentToBackStack) >= maxSentToBackStackDepth {
+		copy(sentToBackStack, sentToBackStack[1:])
+		sentToBackStack = sentToBackStack[:len(sentToBackStack)-1]
+
+		logf(
+			"pushSentToBackWindow: stack reached cap %d; dropped oldest entry",
+			maxSentToBackStackDepth,
+		)
+	}
+
+	sentToBackStack = append(sentToBackStack, sentToBackEntry{
+		id:   id,
+		hwnd: hwnd,
+	})
+}
+
+// reserveSentToBackWindow reserves the newest valid, non-reserved entry.
+//
+// Reserving rather than immediately popping prevents repeated queued
+// Win+Shift+MMB gestures from selecting the same window. The entry is only
+// removed after its SetWindowPos(HWND_TOP) succeeds.
+func reserveSentToBackWindow() (id uint64, hwnd windows.Handle, ok bool) {
+	sentToBackStackMu.Lock()
+	defer sentToBackStackMu.Unlock()
+
+	for i := len(sentToBackStack) - 1; i >= 0; i-- {
+		//backwards loop is safe because i is inferred as int, not unsigned. For an empty slice it starts at -1 and never executes.
+
+		entry := &sentToBackStack[i]
+
+		if entry.restoring {
+			continue
+		}
+
+		if !wincoe.IsWindow(entry.hwnd) {
+			sentToBackStack = append(
+				sentToBackStack[:i],
+				sentToBackStack[i+1:]...,
+			)
+			continue
+		}
+
+		entry.restoring = true
+		return entry.id, entry.hwnd, true
+	}
+
+	return 0, 0, false
+}
+
+// releaseSentToBackReservation makes an unsuccessful reserved restore
+// available for a later Win+Shift+MMB attempt.
+func releaseSentToBackReservation(id uint64) {
+	if id == 0 {
+		return
+	}
+
+	sentToBackStackMu.Lock()
+	defer sentToBackStackMu.Unlock()
+
+	for i := range sentToBackStack {
+		if sentToBackStack[i].id == id {
+			sentToBackStack[i].restoring = false
 			return
 		}
-
-		// It's the foreground window (and not already topmost). Fire an
-		// async message to bring it to top. We DO NOT swallow the click (we
-		// let it fall through to CallNextHookEx) so the target window still
-		// receives the actual mouse click!
-		//
-		// 'fg' is only a snapshot taken synchronously here on the hook
-		// thread, at the exact moment of this physical mouse-down -- before
-		// the click has even been dispatched to (let alone processed by) the
-		// target application. If processing that very click causes some
-		// OTHER window to become foreground, 'fg' is stale by the time our
-		// posted message is actually processed. Pass lParam=1 so
-		// WM_BRING_TO_FRONT's handler re-verifies foreground identity before
-		// acting -- though the handler's own independent Z-order topmost
-		// recheck (see its doc comment) is what actually closes this race
-		// even in the narrow window where foreground hasn't switched yet.
-		if main := loadMainMsgHwnd(); main != 0 {
-			if res := wincoe.PostMessage(main, WM_BRING_TO_FRONT, uintptr(fg), 1); res.Failed() {
-				logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed: %v", res.Err)
-			}
-		} else {
-			logf("mouseProc: PostMessage WM_BRING_TO_FRONT failed because mainMsgHwnd is 0")
-		}
-	} else if res0.Failed() {
-		logf("tryBringForegroundToFrontAt:RootWindowFromPoint failed, res:%v", res0)
 	}
 }
 
-// isAlreadyTopmostInZOrder reports whether hwnd currently has nothing above
-// it in the system Z-order (GetWindow(hwnd, GW_HWNDPREV) finds no
-// predecessor). Used both by tryBringForegroundToFrontAt (to avoid posting
-// a needless WM_BRING_TO_FRONT for a window that's already frontmost) and
-// by WM_BRING_TO_FRONT's own handler (as the actual race-closer -- see
-// their respective doc comments for why checking raw Z-order position,
-// rather than only foreground/focus identity, is what's needed here).
-//
-// Returns false (conservative: "assume NOT topmost, so callers still
-// attempt the promotion") if the GetWindow call itself fails for a reason
-// other than "no predecessor" -- an unrelated API hiccup here should never
-// cause us to silently skip a promotion that's actually needed.
-func isAlreadyTopmostInZOrder(hwnd windows.Handle) bool {
-	if hwnd == 0 {
-		return false
+// completeSentToBackRestoration removes an entry only after its restoration
+// SetWindowPos(HWND_TOP) succeeds.
+func completeSentToBackRestoration(id uint64) {
+	if id == 0 {
+		return
 	}
-	res := wincoe.GetWindow(hwnd, wincoe.GW_HWNDPREV)
-	if res.Failed() {
-		logf("isAlreadyTopmostInZOrder:GetWindow(GW_HWNDPREV) failed for HWND=0x%X, res:%v; assuming not topmost so callers still attempt promotion", hwnd, res)
-		return false
+
+	sentToBackStackMu.Lock()
+	defer sentToBackStackMu.Unlock()
+
+	for i := range sentToBackStack {
+		if sentToBackStack[i].id == id {
+			sentToBackStack = append(
+				sentToBackStack[:i],
+				sentToBackStack[i+1:]...,
+			)
+			return
+		}
 	}
-	return res.R1 == 0 // no predecessor in Z-order => hwnd is already topmost
 }
 
-// windowOwnsForeground reports whether target is the direct or indirect
-// owner of fg (the current foreground window), by walking fg's owner chain
-// via GW_OWNER. Deliberately does NOT treat target == fg itself as
-// "owning" -- fg is passed in by the caller (see WM_BRING_TO_FRONT's
-// handler, which fetches it once via GetForegroundWindow() and reuses it
-// here and for its own separate lParam staleness recheck) specifically so
-// callers can distinguish "target simply IS the focused window" (not
-// necessarily anything to do with Z-order position -- a focused window can
-// still be sitting behind others, which is exactly the state
-// bringToFrontOnBackgroundClick's whole feature exists to promote out of)
-// from "target is the OWNER of whatever dialog currently has focus" (a
-// completely different, Z-order-invariant-driven reason to skip -- see
-// below).
-//
-// This guards WM_BRING_TO_FRONT's HWND_TOP promotion against a specific
-// Win32 Z-order invariant: an owned window (WS_POPUP with its owner set via
-// GWL_HWNDPARENT, e.g. a modal-ish dialog spawned by another dialog -- NOT
-// a WS_CHILD) is always kept above its owner in Z-order, and Windows
-// re-asserts that automatically whenever the OWNED window itself is
-// activated. But SetWindowPos(owner, HWND_TOP, SWP_NOACTIVATE) does not go
-// through that activation path at all -- it can genuinely place the owner
-// ABOVE its own currently-foreground owned window, an inconsistent state
-// (the owned window keeps keyboard focus/an active title bar, yet sits
-// BEHIND its owner in Z-order) that Windows does not auto-correct until
-// something else forces re-activation.
-//
-// Concretely: Control Panel's Network Connections -> adapter Properties ->
-// double-clicking "Internet Protocol Version 4 (TCP/IPv4)" in the list
-// spawns the IPv4 Properties dialog OWNED by the adapter Properties dialog.
-// tryBringForegroundToFrontAt's queued promotion of the adapter Properties
-// dialog (captured as the foreground snapshot at the moment of the
-// double-click) can be processed after the IPv4 dialog already exists and
-// has already become foreground; promoting the adapter dialog to HWND_TOP
-// at that point shoves the still-focused IPv4 dialog behind it. Checking
-// isAlreadyTopmostInZOrder(adapter dialog) does NOT catch this -- the
-// adapter dialog correctly is not topmost (its own owned IPv4 dialog is
-// correctly above it) -- so this separate, owner-chain-aware check exists
-// specifically for that gap.
-//
-// Bounded to maxOwnerChainSteps as a defensive measure; a real owner chain
-// is never remotely that deep. Returns false (never block a legitimate
-// promotion) if the GetWindow(GW_OWNER) walk itself fails partway through.
-func windowOwnsForeground(target, fg windows.Handle) bool {
-	if target == 0 || fg == 0 {
-		return false
+func clearSentToBackStack() {
+	sentToBackStackMu.Lock()
+	defer sentToBackStackMu.Unlock()
+
+	if len(sentToBackStack) == 0 {
+		return
 	}
-	cur := fg
-	const maxOwnerChainSteps = 32
-	for i := 0; cur != 0 && i < maxOwnerChainSteps; i++ {
-		res := wincoe.GetWindow(cur, wincoe.GW_OWNER)
-		if res.Failed() {
-			logf("windowOwnsForeground: GetWindow(GW_OWNER) failed for HWND=0x%X while walking owner chain from foreground, res:%v; treating as not-owned so the promotion isn't incorrectly blocked", cur, res)
-			return false
-		}
-		cur = windows.Handle(res.R1)
-		if cur == target {
-			return true
-		}
+
+	logf(
+		"clearSentToBackStack: discarding %d remembered sent-to-back window(s)",
+		len(sentToBackStack),
+	)
+	sentToBackStack = sentToBackStack[:0]
+}
+
+// abandonPendingZOrderAction releases state reserved while accepting an
+// operation that was subsequently dropped before SetWindowPos could
+// successfully complete.
+func abandonPendingZOrderAction(data WindowMoveData) {
+	if data.ZOrderAction == zOrderActionRestoreStackEntry {
+		releaseSentToBackReservation(data.SentToBackRestoreID)
 	}
-	return false
 }
