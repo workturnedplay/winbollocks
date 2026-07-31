@@ -4145,6 +4145,19 @@ func GetTopWindow(hwnd windows.Handle) (windows.Handle, WinResult) {
 // GW_HWNDNEXT is GetWindow's uCmd code for "next window in Z-order".
 const GW_HWNDNEXT = 2
 
+// GW_HWNDPREV is GetWindow's uCmd code for "previous window in Z-order" --
+// i.e. the window immediately ABOVE (in front of) the specified window. A
+// result of R1==0 with WinResult.Succeeded() true means the specified
+// window has no predecessor and is therefore already the topmost top-level
+// window in the system Z-order.
+const GW_HWNDPREV = 3
+
+// GW_OWNER is GetWindow's uCmd code for "the window's owner" (set via
+// GWL_HWNDPARENT / CreateWindowEx's hWndParent on an owned, non-child
+// WS_POPUP-style window). A result of R1==0 with WinResult.Succeeded()
+// true means the specified window has no owner.
+const GW_OWNER = 4
+
 // // GetWindow retrieves a handle to a window that has the specified relationship (Z-Order or owner) to the specified window.
 // func GetWindow(hwnd windows.Handle, uCmd uint32) windows.Handle {
 // 	res := procGetWindow.Call(uintptr(hwnd), uintptr(uCmd))
@@ -4962,6 +4975,11 @@ func SetProcessWorkingSetSize(hProcess windows.Handle, dwMinimumWorkingSetSize, 
 		dwMaximumWorkingSetSize,
 	)
 }
+
+const (
+	WS_DISABLED = 0x08000000
+	WS_VISIBLE  = 0x10000000
+)
 
 // GetWindowLongPtrW retrieves information about the specified window.
 func GetWindowLongPtrW(hwnd windows.Handle, nIndex int32) WinResult { //uintptr {
