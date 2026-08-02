@@ -2521,6 +2521,9 @@ func cancelActiveGesture(session *dragSession) {
 // ESC key event. Returns false -- ESC should pass through normally -- if no
 // ModeMove/ModeResize session is active.
 //
+// Once a gesture is confirmed active, ESC is always swallowed from here on, even on the rare failure paths where the cancel message itself couldn't be posted
+// -- see those branches' own comments.
+//
 // Deliberately does no Win32 UI work itself: this runs on the hook thread
 // (keyboardProc), and SetWindowPos/ShowWindow/SetCursorPos must only ever
 // be called from the main thread, same as every other gesture-driven
@@ -2533,15 +2536,13 @@ func tryCancelActiveGestureViaEsc() bool {
 
 	msgHwnd := loadMainMsgHwnd()
 	if msgHwnd == 0 {
-		logf("tryCancelActiveGestureViaEsc: mainMsgHwnd is 0, can't post WM_CANCEL_GESTURE; letting ESC through instead")
-		//FIXME: re-check this, doesn't seem like a good idea to let it thru!
-		return false
+		logf("tryCancelActiveGestureViaEsc: mainMsgHwnd is 0, can't post WM_CANCEL_GESTURE to actually cancel the gesture, but still swallowing ESC since a gesture is active and its swallowed-down target shouldn't see a stray ESC")
+		return true
 	}
 
 	if res := wincoe.PostMessage(msgHwnd, WM_CANCEL_GESTURE, uintptr(session.targetWnd), 0); res.Failed() {
-		logf("tryCancelActiveGestureViaEsc: PostMessage WM_CANCEL_GESTURE failed: %v; letting ESC through instead", res.Err)
-		//FIXME: re-check this, doesn't seem like a good idea to let it thru!
-		return false
+		logf("tryCancelActiveGestureViaEsc: PostMessage WM_CANCEL_GESTURE failed: %v; couldn't actually cancel the gesture, but still swallowing ESC since a gesture is active and its swallowed-down target shouldn't see a stray ESC", res.Err)
+		return true
 	}
 	return true
 }
@@ -2993,42 +2994,57 @@ func getForegroundWindow() windows.Handle {
 	return hwnd
 }
 
-// aka in window in my own process?
+// // aka in window in my own process?
+// func isOwnWindow(hwnd windows.Handle) bool {
+// 	if hwnd == 0 {
+// 		return false
+// 	}
+
+// 	var pid uint32
+// 	if _, res1 := wincoe.GetWindowThreadProcessId(hwnd, &pid); res1.Failed() {
+// 		return false
+// 	}
+
+// 	return pid == selfPID
+// }
+
+// doneishFIXME: make these two funcs be one(to DRY the GetWindowThreadProcessId call) and return two bools: (samePID, sameTID) and sameTID would be false if samePID is false!
+
+// // is window in the same thread ID as the caller thread ID (could still be two diff. processes tho!)
+// func isInSameThreadID(hwnd windows.Handle) bool {
+// 	var pid uint32
+// 	tid, res1 := wincoe.GetWindowThreadProcessId(hwnd, &pid)
+// 	if res1.Failed() {
+// 		return false
+// 	}
+// 	return tid /*aka tid aka thread id*/ == windows.GetCurrentThreadId()
+// }
+
+// aka is this a window in my own process?
 func isOwnWindow(hwnd windows.Handle) bool {
-	if hwnd == 0 {
-		return false
-	}
-
-	var pid uint32
-	// res1 := procGetWindowThreadProcessID.Call(
-	// 	uintptr(hwnd),
-	// 	uintptr(unsafe.Pointer(&pid)),
-	// )
-	//if r1 == 0 {
-	if _, res1 := wincoe.GetWindowThreadProcessId(hwnd, &pid); res1.Failed() {
-		return false
-	}
-
-	return pid == selfPID //windows.GetCurrentProcessId()
+	samePID, _ := windowOwnershipInfo(hwnd)
+	return samePID
 }
 
-// FIXME: make these two funcs be one and return two bools: (samePID, sameTID) and sameTID would be false if samePID is false!
+// windowOwnershipInfo reports whether hwnd belongs to our own process
+// (samePID) and, if so, whether it also belongs to our own calling thread
+// (sameTID) -- computed from a single GetWindowThreadProcessId call instead
+// of two separate ones. sameTID can only be true when samePID is also true:
+// thread IDs are unique system-wide, so a window owned by a different
+// process could never report our own thread ID. Returns (false, false) if
+// hwnd is 0 or the underlying API call fails.
+func windowOwnershipInfo(hwnd windows.Handle) (samePID, sameTID bool) {
+	if hwnd == 0 {
+		return false, false
+	}
 
-// is window in the same thread ID as the caller thread ID (could still be two diff. processes tho!)
-func isInSameThreadID(hwnd windows.Handle) bool {
 	var pid uint32
-	// res1 := procGetWindowThreadProcessID.Call(
-	// 	uintptr(hwnd),
-	// 	uintptr(unsafe.Pointer(&pid)),
-	// )
-	// if tid == 0 {
 	tid, res1 := wincoe.GetWindowThreadProcessId(hwnd, &pid)
 	if res1.Failed() {
-		return false
+		return false, false
 	}
-	return tid /*aka tid aka thread id*/ == windows.GetCurrentThreadId()
-	// // #nosec G115 -- safe: Win32 Thread IDs are 32-bit DWORDs
-	// return uint32(res1.R1 /*aka tid aka thread id*/) == windows.GetCurrentThreadId()
+
+	return pid == selfPID, tid == windows.GetCurrentThreadId()
 }
 
 // focusThisHwnd requires: procAttachThreadInput to have been done first, to work. XXX: apparently, 17 July 2026, it doesn't require this anymore!!?! maybe I changed something via w11privacy ?! as it used to require it or it would focus-steal prevent it from getting focused! It's for sure the vkE8 tap that happens before this! aka injectShiftTap()
@@ -3248,15 +3264,16 @@ func forceForeground(target windows.Handle) bool {
 		}
 
 		// 1. Our own process → skip
-		if isOwnWindow(target) {
-			//don't try to focus self, it will fail to attach
+		samePID, sameTID := windowOwnershipInfo(target)
+		if samePID {
+			//XXX: don't try to focus self, it will fail to attach
 			//logf("ignoring attempt to focus own window(s), pretending it's already focused(to avoid the LMB click to focus it workaround next)")
 			// Same process → AttachThreadInput is unnecessary and sometimes harmful
 
-			if isInSameThreadID(target) {
+			if sameTID {
 				logf("attempting to focus own window in same thread, sure.")
 				//this will make the systray popup menu disappear and spam these: SetWindowPos failed(from within main message loop): hwnd=0x802d6 error=0
-				// unless we skip tool windows above!
+				// unless we skip tool windows above in shouldSkipFocusingIt like we do!
 				return setForegroundWindow(target, "failed to SetForegroundWindow for own window in same thread(w/o thread attach) (this usually happens because Start menu was open, as: ret==0 and callErr is success)")
 				//XXX: you get ret=0 with "err=The operation completed successfully." when Start menu was already open
 				/*
@@ -3608,9 +3625,8 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					now = time.Now()
 					nowOffset = now.Sub(appStartTime)
 					// Count every potential move (even if we skip due to debounce)
-					//moveCounter++
 					moveCounter.Add(1)
-					//FIXME: should allow logging even if rate limiting isn't enabled.
+					//staleFIXME: should allow logging even if rate limiting isn't enabled.
 					//logf("%d", moveCounter) //FIXME: temp, remove
 				}
 
@@ -3863,7 +3879,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// regardless of whether we owe a swallow below.
 			softReset(true)
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
-				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // FIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
+				logf("stutter7 %d ns", nowDiff.Nanoseconds()) // doneFIXME: hitting only this one! yep it's hideOverlay(), do it in wndProc heh!
 			}
 		}
 		if !rmbDownSwallowed.CompareAndSwap(true, false) {
@@ -5703,23 +5719,43 @@ func init() {
 func initLogFile() {
 	logFileOnce.Do(func() {
 		// 1. Check if the batch script provided a log file path
-		logFilename := os.Getenv(selfName + "_log_file") // aka "winbollocks_log_file" env. var. which depends on readcfg.env 's key value being this! and readcfg.bat reading it and run.bat the top caller thus using it(the env. var.!)
+		logFilename := strings.TrimSpace(os.Getenv(selfName + "_log_file")) // aka "winbollocks_log_file" env. var. which depends on readcfg.env 's key value being this! and readcfg.bat reading it and run.bat the top caller thus using it(the env. var.!)
 		if logFilename == "" {
 			// Fallback just in case it's run directly without the .bat
 			logFilename = selfName + "_debug.log"
 		}
 
+		// Extract only the base filename to strip out any potential traversal paths (like "../")
+		safeFilename := filepath.Base(logFilename)
+		if safeFilename == "" || safeFilename == "." || safeFilename == string(filepath.Separator) || wincoe.IsWindowsReservedFileName(safeFilename) {
+			// Fallback just in case it's run directly without the .bat
+			safeFilename = selfName + "_debug.log"
+			if canUseConsoleStderr {
+				fmt.Fprintf(os.Stderr, "!!! Bad log filename %q, using fallback: %v\n", logFilename, safeFilename) //nolint:errcheck // best-effort diagnostic; nothing else to do if stderr itself fails
+			}
+		}
+
 		// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
 		f, err := os.OpenFile( // FIXME: G703: Path traversal via taint analysis (gosec)
-			logFilename,
+			// logFilename,
+			// Combine it with a guaranteed safe log directory if needed, or use the sanitized name
+			safeFilename,
 			os.O_CREATE|os.O_WRONLY|os.O_APPEND,
 			0644,
 		)
 		if err == nil {
 			logFile.Store(f)
+			return
 		}
 		// on error, logFile stays nil; internalLogger's caller already
-		// handles that by falling back to a no-op.
+		// handles that by falling back to a no-op. Report the failure
+		// directly to stderr (bypassing logf/internalLogger, which would
+		// just re-enter this already-completed sync.Once and find logFile
+		// still nil) so the failure isn't completely silent when a console
+		// is available.
+		if canUseConsoleStderr {
+			fmt.Fprintf(os.Stderr, "!!! Failed to open log file %q: %v\n", logFilename, err) //nolint:errcheck // best-effort diagnostic; nothing else to do if stderr itself fails
+		}
 	})
 }
 
@@ -6310,7 +6346,7 @@ func init() {
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
 	nowOffset := time.Since(appStartTime)
-	//FIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
+	//staleFIXME: these 2 need to be set when startDragging(see 'capturing' bool) happens(ie. state changed from not dragging to dragging, so 1 time not on every drag/move event!), every time! so not here!
 	lastRateLogTime.Store(int64(nowOffset))
 	lastMovePostedTime.Store(int64(nowOffset))
 }

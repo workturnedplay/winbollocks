@@ -226,19 +226,33 @@ func SetConsoleTextAttribute(h windows.Handle, color uint16) error {
 	return res.Err
 }
 
-/*
-ClearStdinIfTermIsNOTRaw bla bla TODO
-Windows:
-
-Console = input events
-
-# Arrow keys are atomic
-
-# FlushConsoleInputBuffer already solves the problem
-
-One read is enough
-*/
+// ClearStdinIfTermIsNOTRaw drains and discards any console input events
+// currently queued for os.Stdin, using FlushConsoleInputBuffer. Intended for
+// callers running in normal (cooked) console mode who want to make sure a
+// later blocking read isn't immediately satisfied by stale buffered input
+// (e.g. leftover keystrokes typed while some earlier operation was busy).
+//
+// NOTE: this also discards queued mouse-movement input records if
+// ENABLE_MOUSE_INPUT is on for the console, not just key events (see the
+// FIXME on the internal GetNumberOfConsoleInputEvents call).
+//
+// Returns true if there was any pending input to clear (n > 0 at the time
+// of the check), false if the console handle couldn't be queried, there was
+// nothing pending, or the flush itself failed (failures are logged via
+// wincoe.Logger but otherwise swallowed — this is a best-effort cleanup
+// helper, not a hard requirement for correctness).
 func ClearStdinIfTermIsNOTRaw() (hadInput bool) {
+	/*
+	   Windows:
+
+	   Console = input events
+
+	   # Arrow keys are atomic
+
+	   # FlushConsoleInputBuffer already solves the problem
+
+	   One read is enough
+	*/
 	h := windows.Handle(os.Stdin.Fd())
 
 	var n uint32
@@ -358,7 +372,21 @@ func ClearStdin() (hadKey bool) {
 	return hadKey // explicit return for clarity (though bare "return" also works)
 }
 
-// WithConsoleEventRaw TODO
+// WithConsoleEventRaw temporarily switches os.Stdin's console into
+// "event-raw" mode — disabling ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT so
+// individual key events are delivered immediately instead of being buffered
+// until a full line + Enter is typed — runs fn, and unconditionally restores
+// the original console mode afterward via defer (even if fn panics).
+//
+// If GetConsoleMode or SetConsoleMode fails at the point of ENTERING raw
+// mode, fn is NOT called at all (the failure is logged via wincoe.Logger and
+// this function returns immediately) rather than running fn in an unknown/
+// uncontrolled mode. If restoring the original mode afterward fails, that
+// failure is only logged — by that point fn has already run and there's
+// nothing more useful to do about it.
+//
+// See ClearStdin/ReadKeySequence for the two OS-specific helpers this is
+// typically paired with inside fn.
 func WithConsoleEventRaw(fn func()) {
 	h := windows.Handle(os.Stdin.Fd())
 
@@ -392,8 +420,22 @@ func WithConsoleEventRaw(fn func()) {
 	fn()
 }
 
+// IsStdinConsoleInteractive reports whether os.Stdin is connected to a real,
+// interactive terminal — as opposed to a pipe, redirect, or non-console file
+// (e.g. `echo foo | program.exe` or CI/CD environments that provide no
+// attached console at all).
+//
+// This distinguishes three cases term.IsTerminal alone would not: cooked
+// line-mode consoles, event-raw consoles, and byte-raw/VT consoles are all
+// still "a terminal" for this check's purposes — the only thing that
+// matters here is whether it's safe to block waiting for a keypress at all.
+//
+// Returns false (without querying anything further) if the underlying file
+// descriptor value doesn't fit in a platform int (an essentially impossible
+// defensive guard, logged via wincoe.GetBugLogger() if ever hit), or if
+// term.IsTerminal reports the descriptor isn't a real character-device
+// console.
 /*
-IsStdinConsoleInteractive TODO
 On Windows there are three distinct modes, not two:
 
 Cooked line mode
@@ -431,8 +473,16 @@ func IsStdinConsoleInteractive() bool {
 	return true
 }
 
-// WaitAnyKeyIfInteractive TODO
-// returns true if waited, false if it's not interactive
+// WaitAnyKeyIfInteractive calls WaitAnyKey only if os.Stdin is connected to
+// a real interactive terminal (see IsStdinConsoleInteractive). This avoids
+// blocking forever on a keypress that can never arrive when the process was
+// launched with stdin piped, redirected, or otherwise non-interactive (e.g.
+// `echo foo | program.exe`, or a CI/CD runner with no attached console).
+//
+// Returns true if it actually waited (i.e. stdin was interactive), false if
+// it skipped waiting entirely because stdin was not interactive.
+//
+// WaitAnyKeyIfInteractive returns true if waited, false if it's not interactive
 // implied before&after clrbuf(s)
 func WaitAnyKeyIfInteractive() bool {
 	//find out which variant is best here:
@@ -444,8 +494,26 @@ func WaitAnyKeyIfInteractive() bool {
 	return true
 }
 
-// WaitAnyKey TODO
-// whether it is or not a terminal, it attempts to wait for any key, with proper clrbuf(s) before and after!
+// WaitAnyKey prints a "Press any key to exit..." prompt and blocks until a
+// single key is pressed, working correctly whether os.Stdin is currently in
+// cooked line-mode, event-raw mode, or byte-raw/VT mode (see the "three
+// distinct modes" doc comment on IsStdinConsoleInteractive above).
+//
+// Before waiting, it clears any input events that were already buffered
+// (logging "(clrbuf)..." if it found any) so a stale keystroke typed earlier
+// doesn't immediately satisfy the wait without the user actually pressing
+// anything now. It then spawns a goroutine that reads exactly one key
+// sequence in event-raw mode (via ReadKeySequence, itself wrapped in
+// WithConsoleEventRaw) and clears any input left buffered afterward too
+// (logging "(clrbuf2)." if so), and blocks the calling goroutine on a
+// channel until that goroutine signals completion.
+//
+// Callers should generally prefer WaitAnyKeyIfInteractive unless they've
+// already independently confirmed stdin is interactive — calling this
+// directly against non-interactive stdin can hang forever with no key ever
+// arriving to satisfy the read.
+//
+// WaitAnyKey, whether it is or not a terminal, it attempts to wait for any key, with proper clrbuf(s) before and after!
 func WaitAnyKey() {
 	fmt.Print("Press any key to exit...")
 
@@ -510,7 +578,7 @@ var (
 	// was used for procTrackPopupMenu = NewBoundProc7(User32, "TrackPopupMenu", CheckNullWithLastError)
 	// but it's only good for the variant that doesn't use TPM_RETURNCMD in uFlags and then CheckBool is better!
 	/*
-		FIXME: problem:
+		done(we are not using CheckNullWithLastError for TrackPopupMenu anymore)doneFIXME: problem:
 		When you pass TPM_RETURNCMD to TrackPopupMenu:
 
 		Return value 0 is overloaded: It means "User pressed Esc / clicked away" (100% normal) OR "The API call failed" (actual error).
@@ -1392,7 +1460,7 @@ func loadDll(dll *windows.LazyDLL) {
 	}
 	err := dll.Load()
 	if err != nil {
-		//TODO: technically not a "BUG: " yet using panic2 means it will use GetBugLogger() to log it!
+		//wekeepitsoTODO: technically not a "BUG: " yet using panic2 means it will use GetBugLogger() to log it!
 		panic2("critical system dll " + dll.Name + " not found, error: " + err.Error())
 	}
 }
@@ -1450,7 +1518,12 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 		//EnumServicesStatusEx (and many Enumeration APIs) returns ERROR_MORE_DATA.
 		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) &&
 			!errors.Is(err, windows.ERROR_MORE_DATA) {
-			return nil, err //TODO: shouldn't we wrap this err here? surely caller is using errors.Is on it no?! and if we don't wrap it, it's not clear it passed thru callWithRetry itself!
+			// Wrap with %w so errors.Is/As against the underlying sentinel
+			// (e.g. windows.ERROR_ACCESS_DENIED) still works for callers,
+			// while making clear in the message that the failure surfaced
+			// through callWithRetry's size-query/allocate/fetch loop rather
+			// than directly from the caller's own call site.
+			return nil, fmt.Errorf("%s:callWithRetry: underlying call failed: %w", who, err)
 		}
 		// 	// Loop continues, using the updated 'size' from the failed call
 		// 	//however:
@@ -1685,7 +1758,16 @@ func impossibiru(msg string) {
 // the process dies almost immediately afterward.
 func logCriticalThenPanic(log *slog.Logger, msg string) {
 	log.Error(msg)
-	//TODO: figure out what happens here with os.Stderr print if we have no UI/console ie. compiled with -ldflags="-H=windowsgui ("your binary is linked as a GUI subsystem executable (/SUBSYSTEM:WINDOWS), not a console subsystem one.")
+	// Best-effort synchronous fallback in case log (which may be async/
+	// buffered by the caller) doesn't flush before the panic unwinds — see
+	// this function's own doc comment above.
+	//
+	// If the process has no console at all (built with -H=windowsgui, no
+	// console subsystem attached at creation), os.Stderr's underlying
+	// handle is invalid; Write simply returns an error in that case rather
+	// than panicking or blocking, and that error is intentionally ignored
+	// below (we're about to panic regardless, and there's no console for
+	// the message to reach even if we retried).
 	fmt.Fprintf(os.Stderr, "%s\n", msg) //nolint:errcheck // best-effort; we're about to panic regardless
 	panic(msg)
 }
@@ -4038,18 +4120,15 @@ func SetForegroundWindow(hwnd windows.Handle) bool {
 	return procSetForegroundWindow.Call(uintptr(hwnd)).R1 != 0
 }
 
-// GetForegroundWindowRaw returns the full WinResult for NULL-checks without losing the wrapper architecture
-//
-// TODO: this *Raw() is kinda useless because LastError is never set, only R1 matters; so remove?!
-func GetForegroundWindowRaw() WinResult {
-	//"GetForegroundWindow does not set GetLastError at all—not even when it returns 0 (NULL)."
-	//"In the eyes of Windows, returning 0 from GetForegroundWindow isn't a "failure." It simply means no window currently holds foreground status."
-	return procGetForegroundWindow.Call() //"It does not set GetLastError"
-}
-
 // GetForegroundWindow retrieves a handle to the foreground window.
+//
+// A return value of 0 means there is currently no foreground window (e.g.
+// the workstation is locked, a screen saver is active, or the system is
+// mid window-switch) — not a failure. GetForegroundWindow never sets
+// GetLastError(aka WinResult.CallStatus), not even on a 0 return, so there is no meaningful WinResult
+// to surface here; only R1 is ever informative for this API which is what's returned only.
 func GetForegroundWindow() windows.Handle {
-	return windows.Handle(GetForegroundWindowRaw().R1)
+	return windows.Handle(procGetForegroundWindow.Call().R1)
 }
 
 // SetCaptureRaw sets the mouse capture to the specified window.
@@ -5661,4 +5740,25 @@ func SetupDiCallClassInstaller(installFunction uint32, deviceInfoSet windows.Han
 		uintptr(deviceInfoSet),
 		uintptr(unsafe.Pointer(deviceInfoData)),
 	)
+}
+
+var ReservedFileNames = map[string]struct{}{
+	"CON": {}, "PRN": {}, "AUX": {}, "NUL": {},
+	"COM1": {}, "COM2": {}, "COM3": {}, "COM4": {}, "COM5": {},
+	"COM6": {}, "COM7": {}, "COM8": {}, "COM9": {},
+	"LPT1": {}, "LPT2": {}, "LPT3": {}, "LPT4": {}, "LPT5": {},
+	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
+}
+
+// IsWindowsReservedFileName checks if a filename uses a Windows reserved device name.
+func IsWindowsReservedFileName(name string) bool {
+	// filepath.Base handles any directory prefix; TrimRight strips trailing
+	// dots and spaces that Windows itself strips before resolving the name.
+	baseName := strings.ToUpper(strings.TrimRight(filepath.Base(name), ". "))
+
+	if _, reserved := ReservedFileNames[baseName]; reserved {
+		return true
+	}
+
+	return false
 }
