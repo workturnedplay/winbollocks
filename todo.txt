@@ -16,6 +16,7 @@ notmybug:
 
 //* trying to resize an F11(fullscreen-ed) vscode will show the overlay but won't change its size at all, unclear why, is the target resisting resizes?!
 
+* if Start menu is open, double clicking on another window's item like a .bat in tcmd, will only single click it instead.
 
 dontdothis:
 
