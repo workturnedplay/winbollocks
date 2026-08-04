@@ -1689,7 +1689,6 @@ var lastTrayInfoUnixNano atomic.Int64
 // system tray icon. msg is always logged via logf regardless of whether
 // the balloon itself ends up rate-limited (see showTrayInfoMinInterval).
 func showTrayInfo(title, msg string) {
-
 	now := time.Now().UnixNano()
 	last := lastTrayInfoUnixNano.Load()
 	if now-last < int64(showTrayInfoMinInterval) {
