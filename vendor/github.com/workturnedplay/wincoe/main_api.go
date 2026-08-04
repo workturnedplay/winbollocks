@@ -166,8 +166,13 @@ func EnableVirtualTerminalProcessing() error {
 	if err != nil {
 		return fmt.Errorf("GetStdHandle failed: %w", err)
 	}
-	if hStdout == windows.InvalidHandle {
-		return errors.New("invalid stdout handle")
+	// hStdout is 0 (NULL) when no console is attached at all (e.g. a
+	// -H=windowsgui build, or after FreeConsole) and no stdio redirection
+	// was configured for this process; windows.InvalidHandle (-1) indicates
+	// an actual GetStdHandle error. Either way there's nothing to enable VT
+	// processing on.
+	if hStdout == windows.InvalidHandle || hStdout == 0 {
+		return errors.New("invalid stdout handle (no console attached)")
 	}
 
 	var mode uint32
@@ -544,9 +549,15 @@ func WaitAnyKey() {
 
 func Flush() {
 	//fmt.Printf("[GoR:%d] !flushing stderr\n", GoRoutineId())
-	os.Stderr.Sync() // Tell Windows to flush the file buffers to disk/console
+	// Errors here are expected and harmless when no console is attached
+	// (-H=windowsgui build, or after FreeConsole), hence Debug not Warn/Error.
+	if err := os.Stderr.Sync(); err != nil {
+		Logger.Load().Debug("Flush: os.Stderr.Sync failed (harmless if no console is attached)", SafeErr(err))
+	}
 	//fmt.Printf("[GoR:%d] !flushing stdout\n", GoRoutineId())
-	os.Stdout.Sync() // Tell Windows to flush the file buffers to disk/console
+	if err := os.Stdout.Sync(); err != nil {
+		Logger.Load().Debug("Flush: os.Stdout.Sync failed (harmless if no console is attached)", SafeErr(err))
+	}
 }
 
 // UnspecifiedWinApi is the string used when empty op name is used
@@ -1406,6 +1417,8 @@ var (
 
 	// procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
 	procGetConsoleWindow = NewBoundProc0(Kernel32, "GetConsoleWindow", CheckNone)
+
+	procFreeConsole = NewBoundProc0(Kernel32, "FreeConsole", CheckBool)
 
 	// procSetWinEventHook = user32.NewProc("SetWinEventHook")
 	// procUnhookWinEvent  = user32.NewProc("UnhookWinEvent")
@@ -5310,6 +5323,36 @@ func InternalGetWindowText(hwnd windows.Handle, pString *uint16, cchMaxCount int
 func GetConsoleWindow() windows.HWND {
 	res := procGetConsoleWindow.Call()
 	return windows.HWND(res.R1)
+}
+
+// HasConsole reports whether this process currently has a console attached.
+// Returns false for GUI-subsystem builds (-H=windowsgui), which never have
+// one, and for any build (console or GUI subsystem) after a successful
+// FreeConsole call. This is the single source of truth callers should use
+// to decide whether console-dependent work (VT processing, interactive
+// prompts, the colored console log handler) is worth attempting at all.
+func HasConsole() bool {
+	return GetConsoleWindow() != 0
+}
+
+// FreeConsole detaches the calling process from its console, if any.
+// After this returns successfully, HasConsole reports false, GetStdHandle
+// for the standard streams returns invalid/NULL handles, and any further
+// reads from os.Stdin or writes to os.Stdout/os.Stderr fail gracefully
+// (returning an error) rather than blocking or panicking -- exactly the
+// same behavior a process built with -H=windowsgui exhibits from the
+// start. If this process was the sole one attached to its console, the
+// console window itself closes as a side effect.
+//
+// Safe to call even when no console is attached (e.g. redundantly on a
+// -H=windowsgui build); FreeConsole simply fails in that case. Callers
+// should treat a failure as a warning, not fatal.
+func FreeConsole() error {
+	res := procFreeConsole.Call()
+	if res.Failed() {
+		return fmt.Errorf("FreeConsole failed: %w", res.Err)
+	}
+	return nil
 }
 
 // WinEventProc represents the callback signature required by Windows for SetWinEventHook.
