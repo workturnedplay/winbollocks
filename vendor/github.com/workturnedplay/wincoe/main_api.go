@@ -1666,7 +1666,7 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		return "", fmt.Errorf("OpenProcess failed for PID %d: %w", pid, err0)
 	}
 	//defer windows.CloseHandle(hProc)
-	defer closeHandleLogged(hProc, "QueryFullProcessName:OpenProcess hProc")
+	defer closeHandleLogged(&hProc, "QueryFullProcessName:OpenProcess hProc")
 
 	// Start with MAX_PATH (260)
 	//Yes, size remains a uint32 on both x86 and x64. This is because the Windows API function QueryFullProcessImageNameW
@@ -1862,7 +1862,7 @@ func GetProcessName(pid uint32) (string, error) {
 		return "", err
 	}
 	//defer windows.CloseHandle(snapshot)
-	defer closeHandleLogged(snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
+	defer closeHandleLogged(&snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
 
 	var entry windows.ProcessEntry32
 	entry.Size = uint32(unsafe.Sizeof(entry))
@@ -3142,9 +3142,36 @@ var (
 	ReplaceFileFunc = ReplaceFile
 )
 
-func closeHandleLogged(h windows.Handle, context string) {
-	if err := windows.CloseHandle(h); err != nil {
-		//Logged shouldn't ever be nil here due to init()
+// func closeHandleLogged(h windows.Handle, context string) {
+// 	if err := windows.CloseHandle(h); err != nil {
+// 		//Logged shouldn't ever be nil here due to init()
+// 		Logger.Load().Debug("CloseHandle failed.")
+// 	}
+// }
+
+// closeHandleLogged closes *h (if non-zero), zeroing *h immediately
+// beforehand so no caller can ever observe or reuse a handle value that's
+// already been handed to CloseHandle -- whether or not the close itself
+// succeeds. Logs (via logf) if CloseHandle fails, but never returns an
+// error: callers already treat handle cleanup as best-effort throughout
+// this codebase.
+//
+// Taking *windows.Handle rather than windows.Handle closes the
+// TOCTOU-style window the previous value-taking signature left open: a
+// caller's own handle variable could still be read (and potentially
+// reused, e.g. in another defer further up the same function, or on some
+// later error path) after this function had already closed it, since the
+// caller's copy was never told the handle was gone.
+//
+// A nil h or a zero *h is treated as "nothing to close" and is a silent
+// no-op.
+func closeHandleLogged(h *windows.Handle, context string) {
+	if h == nil || *h == 0 {
+		return
+	}
+	saved := *h
+	*h = 0 // zero first -- see doc comment above.
+	if err := windows.CloseHandle(saved); err != nil {
 		Logger.Load().Debug("CloseHandle failed.",
 			//"context", context, "err", err, //XXX: yeah this works, doesn't need slog.String("context", context) and the other for err! but I'm not gonna use this pattern!
 			slog.String("context", context),
@@ -3275,7 +3302,7 @@ func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string,
 	if cerr != nil {
 		return false, "", fmt.Errorf("CreateFile failed: %w", cerr)
 	}
-	defer closeHandleLogged(h, "inspectExistingStagingFile:CreateFile h")
+	defer closeHandleLogged(&h, "inspectExistingStagingFile:CreateFile h")
 
 	var info windows.ByHandleFileInformation
 	if gerr := windows.GetFileInformationByHandle(h, &info); gerr != nil {

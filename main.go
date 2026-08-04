@@ -156,6 +156,12 @@ var (
 	// issue, so this is counted (and reported once at shutdown, alongside
 	// the two counters above) instead of panicking.
 	logDepthCASFailures atomic.Uint64
+
+	// moveChannelCASFailures is moveDataChan's identical high-water-mark
+	// CAS-loop-exhaustion counter -- see updateHighWaterMark and
+	// logDepthCASFailures' own doc comment above for why this is counted
+	// rather than treated as fatal.
+	moveChannelCASFailures atomic.Uint64
 )
 
 func init() {
@@ -542,6 +548,17 @@ var immediateOverlayRepaint atomic.Bool
 // non-blocking integrity level; mouseProc's WM_MOUSEMOVE handling consumes it.
 var foregroundWasHigherIntegrity atomic.Bool
 var checkForMissedGestureOnNextMove atomic.Bool
+
+// reconciliationFireCount counts how many times the
+// GetForegroundWindow()-reconciliation workaround has actually fired (see
+// forceReconcile below in winEventProc, and caveats1.txt for the
+// underlying Windows quirk this works around: an occasionally-omitted
+// EVENT_SYSTEM_FOREGROUND delivery). Expected to be at most 1 for the
+// entire lifetime of the process -- anything beyond that is logged as a
+// warning, since it would mean either the omission is more frequent than
+// previously observed, or something else is repeatedly failing to arm the
+// normal EVENT_SYSTEM_FOREGROUND path.
+var reconciliationFireCount atomic.Uint64
 
 // missedGestureRecoveryEnabled gates the missed-gesture recovery feature
 // (see foregroundWasHigherIntegrity / checkForMissedGestureOnNextMove).
@@ -1452,7 +1469,8 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 		return 0, fmt.Errorf("OpenProcess failed: %w", err)
 	}
 	//defer windows.CloseHandle(hProc)
-	defer closeHandleLogged(hProc, "processIntegrityLevel:OpenProcess hProc")
+	// defer closeHandleLogged(hProc, "processIntegrityLevel:OpenProcess hProc")
+	defer closeHandleLogged(&hProc, "processIntegrityLevel:OpenProcess hProc")
 
 	var token windows.Token
 	err = windows.OpenProcessToken(hProc, windows.TOKEN_QUERY, &token)
@@ -1460,7 +1478,9 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 		return 0, fmt.Errorf("OpenProcessToken failed: %w", err)
 	}
 	//defer token.Close()
-	defer closeHandleLogged(windows.Handle(token), "processIntegrityLevel:OpenProcessToken token")
+	// defer closeHandleLogged(windows.Handle(token), "processIntegrityLevel:OpenProcessToken token")
+	tokenHandle := windows.Handle(token)
+	defer closeHandleLogged(&tokenHandle, "processIntegrityLevel:OpenProcessToken token")
 
 	var needed uint32
 	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
@@ -1651,12 +1671,43 @@ func cleanupTray() {
 	}
 }
 
+// showTrayInfoMinInterval is the minimum spacing enforced between actual
+// Shell_NotifyIconW(NIM_MODIFY) balloon-notification calls issued by
+// showTrayInfo, regardless of how often callers invoke it. Some callers
+// (e.g. handleActualMoveOrResize's "Cannot resize elevated window" paths)
+// can be hit on every single SetWindowPos failure during an entire
+// drag/resize gesture against a UIPI-blocked window -- without this,
+// that's a fresh toast notification queued dozens of times a second.
+const showTrayInfoMinInterval = 3 * time.Second
+
+// lastTrayInfoUnixNano records, in UnixNano, the last time showTrayInfo
+// actually issued a balloon call (as opposed to being rate-limited away).
+// See showTrayInfoMinInterval.
+var lastTrayInfoUnixNano atomic.Int64
+
+// showTrayInfo displays a transient balloon/toast notification from the
+// system tray icon. msg is always logged via logf regardless of whether
+// the balloon itself ends up rate-limited (see showTrayInfoMinInterval).
 func showTrayInfo(title, msg string) {
-	//FIXME: this call should be rate-limited, or the callers of it should be.
+
+	now := time.Now().UnixNano()
+	last := lastTrayInfoUnixNano.Load()
+	if now-last < int64(showTrayInfoMinInterval) {
+		logf("systray info(notshown-ratelimited): %s", msg)
+		return // rate-limited; already logged above
+	}
+	if !lastTrayInfoUnixNano.CompareAndSwap(last, now) {
+		// Lost a race with a concurrent caller that just claimed this
+		// window; let that one own the actual balloon call instead of
+		// double-showing.
+		logf("systray info(notshown-lostrace): %s", msg)
+		return
+	}
+	logf("systray info(shown): %s", msg)
+
 	trayIconMu.Lock()
 	defer trayIconMu.Unlock()
 
-	logf("systray info: %s", msg)
 	//the tray notification shows differently than a tooltip on win11 (didn't test it on anything else tho)
 	//and I think you've to turn it on like(this only if you have Do Not Disturn 'on' already) System->Notifications->Set priority notifications, Add Apps(button) and pick winbollocks.exe
 	// then you see it slide from the right, on top of systray, as a notifcation rectangle.
@@ -1664,11 +1715,8 @@ func showTrayInfo(title, msg string) {
 	// because it is already turned on in System->Notifications, Notifications from apps and other senders
 	trayIcon.UFlags |= wincoe.NIF_INFO
 	trayIcon.UTimeoutOrVersion = 5000 //5sec, though Win11 ignores it and uses system accessibility settings)
-	// copy(trayIcon.SzInfoTitle[:], windows.StringToUTF16(title))
-	// copy(trayIcon.SzInfo[:], windows.StringToUTF16(msg))
 	copyUTF16Truncated(trayIcon.SzInfoTitle[:], title)
 	copyUTF16Truncated(trayIcon.SzInfo[:], msg)
-	//if res1 := procShellNotifyIcon.Call(wincoe.NIM_MODIFY, uintptr(unsafe.Pointer(&trayIcon))); res1.Failed() {
 	if res1 := wincoe.ShellNotifyIcon(wincoe.NIM_MODIFY, &trayIcon); res1.Failed() {
 		logf("Failed to update tray icon info: %v", res1.Err)
 	}
@@ -3274,83 +3322,75 @@ func forceForeground(target windows.Handle) bool {
 	if useThreadAttachInputForFocus.Load() {
 		class, res1 := wincoe.GetClassName(target)
 		if res1.Failed() {
-			logf("forceForeground:GetClassName failed, res:%v", res1)
-			return false //TODO: should we continue instead? unclear if it makes sense; #used2continue
-		}
-		isConsole := class == "ConsoleWindowClass" || class == "PseudoConsoleWindow"
-		//logf("isConsole:%v class:%v", isConsole, class) //XXX:ok, admin console(or non-admin but set to conhost aka Console Host Terminal in Settings->Default Terminal Application) is console, the normal non-admin one (with "Let Windows decide" or "Windows Terminal" in same Settings) is not console.
+			// Can't determine whether target is a console window (where
+			// AttachThreadInput is documented to fail outright -- see the
+			// isConsole check below) without a successful GetClassName,
+			// so there's no safe way to decide whether the
+			// AttachThreadInput optimization below is even worth
+			// attempting. Skip it and fall through to the plain
+			// focusThisHwnd() call below rather than treating a
+			// diagnostic GetClassName failure as a hard failure of the
+			// entire focus attempt.
+			logf("forceForeground:GetClassName failed, res:%v; skipping AttachThreadInput optimization for this focus attempt", res1)
+		} else {
+			isConsole := class == "ConsoleWindowClass" || class == "PseudoConsoleWindow"
+			//logf("isConsole:%v class:%v", isConsole, class) //XXX:ok, admin console(or non-admin but set to conhost aka Console Host Terminal in Settings->Default Terminal Application) is console, the normal non-admin one (with "Let Windows decide" or "Windows Terminal" in same Settings) is not console.
 
-		if !isConsole {
-			// Only attempt AttachThreadInput for normal GUI windows, else it will fail anyway.
+			if !isConsole {
+				// Only attempt AttachThreadInput for normal GUI windows, else it will fail anyway.
 
-			/*
-				When you call AttachThreadInput, you aren't just giving yourself permission to move a window; you are literally merging the input message queues of the two threads.
-
-				As shown in the logic of Windows message queues, each thread usually has its own "mailbox." AttachThreadInput solders those two mailboxes together.
-				 If the target thread stops checking its mail, your thread's mail also piles up. By using the SendMessageTimeout "ping" first, you ensure that
-				 the other thread is currently checking its mailbox before you solder yours to it.
-			*/
-
-			var targetProcessID uint32
-			// targetThreadID,res2 := procGetWindowThreadProcessID.Call(uintptr(target), uintptr(unsafe.Pointer(&targetProcessID)))
-			//if r1 == 0 {
-			targetThreadID, res2 := wincoe.GetWindowThreadProcessId(target, &targetProcessID)
-			if res2.Failed() {
-				logf("forceForeground:GetWindowThreadProcessId failed: %v", res2)
-				return false
-			}
-			//var targetThreadID uint32 = uint32(res2.R1)
-
-			// XXX: assuming we're used on mainThreadID only! we should remove these checks and just use mainThreadID
-			curTid := windows.GetCurrentThreadId()
-			if curTid != mainThreadID {
-				logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
-			}
-
-			// Use SendMessageTimeout to see if the window is alive
-			var result uintptr
-			// res3 := procSendMessageTimeout.Call(
-			// 	uintptr(target),
-			// 	WM_NULL, // WM_NULL (harmless ping)
-			// 	0,
-			// 	0,
-			// 	SMTO_ABORTIFHUNG,  //0x0002, // SMTO_ABORTIFHUNG
-			// 	HungWindowTimeout, // 150ms timeout
-			// 	uintptr(unsafe.Pointer(&result)),
-			// )
-
-			//if err2 != nil || ret == 0 {
-			if res3 := wincoe.SendMessageTimeout(target,
-				wincoe.WM_NULL, // WM_NULL (harmless ping)
-				0, 0,
-				wincoe.SMTO_ABORTIFHUNG, //0x0002, // SMTO_ABORTIFHUNG
-				HungWindowTimeout,       // 150ms timeout
-				&result,
-			); res3.Failed() {
-				logf("forceForeground: Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
-				return false
-			}
-
-			// Only if the window responds do we proceed with the attachment
-			// res4 := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(1))
-			// if attachRet == 0 {
-			if res4 := wincoe.AttachThreadInput(curTid, targetThreadID, true /*attach!*/); res4.Failed() {
 				/*
-					The reality: Microsoft explicitly hardcodes AttachThreadInput to fail if the target thread belongs to a classic console window (conhost.exe or cmd.exe). Console windows do not have a standard USER32 message queue in the way GUI apps do; their input is managed by the Client/Server Runtime Subsystem (CSRSS) or the Conhost subsystem.
-					When you ask Windows to attach to a console thread, the OS rejects it and returns ERROR_INVALID_PARAMETER (87) — aka "The parameter is incorrect."
-						- Gemini 3.1 Pro
-				*/
-				logf("forceForeground: AttachThreadInput failed: %v", res4.Err)
-				return false
-			}
+					When you call AttachThreadInput, you aren't just giving yourself permission to move a window; you are literally merging the input message queues of the two threads.
 
-			defer func() {
-				// if res := procAttachThreadInput.Call(uintptr(curTid), uintptr(targetThreadID), uintptr(0)); res.Failed() {
-				if res := wincoe.AttachThreadInput(curTid, targetThreadID, false /*detach!*/); res.Failed() {
-					logf("forceForeground: AttachThreadInput detach failed for threadIDs %d/%d: %v", curTid, targetThreadID, res.Err)
+					As shown in the logic of Windows message queues, each thread usually has its own "mailbox." AttachThreadInput solders those two mailboxes together.
+					 If the target thread stops checking its mail, your thread's mail also piles up. By using the SendMessageTimeout "ping" first, you ensure that
+					 the other thread is currently checking its mailbox before you solder yours to it.
+				*/
+
+				var targetProcessID uint32
+				targetThreadID, res2 := wincoe.GetWindowThreadProcessId(target, &targetProcessID)
+				if res2.Failed() {
+					logf("forceForeground:GetWindowThreadProcessId failed: %v", res2)
+					return false
 				}
-			}() // Detach always
-		} //was not console
+
+				// XXX: assuming we're used on mainThreadID only! we should remove these checks and just use mainThreadID
+				curTid := windows.GetCurrentThreadId()
+				if curTid != mainThreadID {
+					logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
+				}
+
+				// Use SendMessageTimeout to see if the window is alive
+				var result uintptr
+				if res3 := wincoe.SendMessageTimeout(target,
+					wincoe.WM_NULL, // WM_NULL (harmless ping)
+					0, 0,
+					wincoe.SMTO_ABORTIFHUNG, //0x0002, // SMTO_ABORTIFHUNG
+					HungWindowTimeout,       // 150ms timeout
+					&result,
+				); res3.Failed() {
+					logf("forceForeground: Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
+					return false
+				}
+
+				// Only if the window responds do we proceed with the attachment
+				if res4 := wincoe.AttachThreadInput(curTid, targetThreadID, true /*attach!*/); res4.Failed() {
+					/*
+						The reality: Microsoft explicitly hardcodes AttachThreadInput to fail if the target thread belongs to a classic console window (conhost.exe or cmd.exe). Console windows do not have a standard USER32 message queue in the way GUI apps do; their input is managed by the Client/Server Runtime Subsystem (CSRSS) or the Conhost subsystem.
+						When you ask Windows to attach to a console thread, the OS rejects it and returns ERROR_INVALID_PARAMETER (87) — aka "The parameter is incorrect."
+							- Gemini 3.1 Pro
+					*/
+					logf("forceForeground: AttachThreadInput failed: %v", res4.Err)
+					return false
+				}
+
+				defer func() {
+					if res := wincoe.AttachThreadInput(curTid, targetThreadID, false /*detach!*/); res.Failed() {
+						logf("forceForeground: AttachThreadInput detach failed for threadIDs %d/%d: %v", curTid, targetThreadID, res.Err)
+					}
+				}() // Detach always
+			} //was not console
+		} //else GetClassName succeeded
 	} // was useThreadAttachInputForFocus
 
 	succeeded := focusThisHwnd(target) // still attached thread here.
@@ -5752,6 +5792,43 @@ var (
 
 const attemptAtomicSwapThisManyTimes uint = 100
 
+// updateHighWaterMark atomically raises *current to newVal if newVal is
+// larger than the value currently stored there, using a bounded
+// CompareAndSwap retry loop. Shared by logf's maxChannelFillForLogEvents
+// tracking and drainMoveChannel/drainMoveChannelCoalesced's identical
+// maxChannelFillForMoveEvents tracking, so both channels' peak-depth
+// telemetry follow the exact same thread-safe logic instead of two
+// independently hand-rolled (and, in moveDataChan's original case,
+// actually racy Load-then-Store) copies.
+//
+// Telemetry must never crash the app or spin forever under contention: if
+// all attemptAtomicSwapThisManyTimes retries are exhausted without a
+// definitive answer (extremely unlikely -- it only happens if some other
+// goroutine wins the CompareAndSwap on every single attempt),
+// casFailureCounter (if non-nil) is incremented and this sample is simply
+// dropped -- an imprecise peak is preferable to a panic or an unbounded
+// loop.
+//
+// raised is true only when newVal actually became the new stored maximum,
+// letting callers decide whether a "new peak" log line is warranted.
+// ranToCompletion is false only if the retry budget was exhausted.
+func updateHighWaterMark(current *atomic.Uint64, newVal uint64, casFailureCounter *atomic.Uint64) (raised, ranToCompletion bool) {
+	for range attemptAtomicSwapThisManyTimes {
+		oldMax := current.Load()
+		if newVal <= oldMax {
+			return false, true // nothing to do, current is already >= newVal
+		}
+		if current.CompareAndSwap(oldMax, newVal) {
+			return true, true
+		}
+		// Another goroutine changed oldMax concurrently; retry.
+	}
+	if casFailureCounter != nil {
+		casFailureCounter.Add(1)
+	}
+	return false, false
+}
+
 // formatLogMessage renders a log line the way both logf() and
 // directLoggerf() need it: a fixed-format timestamp prefix, the caller's
 // formatted message, and a trailing newline. Extracted so the two — and
@@ -5778,26 +5855,11 @@ func logf(format string, args ...any) {
 	// Check the current pressure on the pipe
 	//len() - It never returns a negative value — for all supported kinds (arrays, slices, maps, strings, channels) the result is >= 0 (and for nil slices/maps/channels it’s 0).
 	currentDepth := uint64(len(logChan))
-	// Update the high water mark if this is a new record
-	// We use a loop or a CompareAndSwap to ensure we never overwrite
-	// a higher value from another thread (though likely overkill here)
-	wentAccordingToPlan := false
-	//TODO: this logic for maxChannelFillForMoveEvents too.
-	for range attemptAtomicSwapThisManyTimes { // try this only 100 times, to prevent infinite loop in impossible cases.
-		oldMax := maxChannelFillForLogEvents.Load()
-		if currentDepth <= oldMax {
-			// Nothing to do, current is smaller
-			wentAccordingToPlan = true
-			break
-		}
-		if maxChannelFillForLogEvents.CompareAndSwap(oldMax, currentDepth) {
-			// Optional: logf it? Careful, don't cause recursion!
-			// Better to just let the exit logic report the final max.
-			wentAccordingToPlan = true
-			break
-		}
-		// If we reach here, another thread changed oldMax, so we loop again
-	}
+	// Update the high water mark if this is a new record. See
+	// updateHighWaterMark's doc comment for the shared CAS-loop mechanics
+	// (also used by drainMoveChannel/drainMoveChannelCoalesced for
+	// maxChannelFillForMoveEvents).
+	updateHighWaterMark(&maxChannelFillForLogEvents, currentDepth, &logDepthCASFailures)
 
 	// select with default makes this NON-BLOCKING
 	sent := false
@@ -5827,20 +5889,6 @@ func logf(format string, args ...any) {
 	// no contention with the hot mouse/keyboard-hook logf() callers.
 	if sent && logQuitClosed.Load() {
 		internalLogger(finalMsg)
-	}
-
-	// // 2. Note the problem if we exhausted the 100 tries
-	// if !wentAccordingToPlan {
-	// 	// We failed to record the peak after 100 tries.
-	// 	// Increment a "Contention Error" counter
-	// 	panic(fmt.Sprintf("Failed(%d times) to set an atomic to int64 value %d. Happened during this log msg: '%s'", attemptAtomicSwapThisManyTimes, currentDepth, finalMsg))
-	// }
-
-	// 2. Note the problem if we exhausted the 100 tries. Telemetry must
-	// never crash the app (see logDepthCASFailures' doc comment) -- count
-	// it and move on instead of panicking.
-	if !wentAccordingToPlan {
-		logDepthCASFailures.Add(1)
 	}
 }
 
@@ -6367,10 +6415,10 @@ func releaseSingleInstance() {
 	if mutexHandle != 0 {
 		//defer is tied to the function, not to inner scopes, so it happens only when this func. exits!
 		//defers do run when a panic happens
-		defer func() { mutexHandle = 0 }() //executes third
+		// defer func() { mutexHandle = 0 }() //executes third
 
 		//"Failing to call CloseHandle results in a kernel handle leak, which slowly exhausts system resources if repeated."
-		defer closeHandleLogged(mutexHandle, "releaseSingleInstance mutexHandle") //executes second
+		defer closeHandleLogged(&mutexHandle, "releaseSingleInstance mutexHandle") //executes second
 		// func() {
 		// 	//If procReleaseMutex.Call somehow panics (unlikely, but possible with corrupted memory), this is in a defer
 
@@ -6574,6 +6622,9 @@ loggingLoop:
 			withCommas(maxMoveEvents), withCommas(droppedMoveOrResizeEvents.Load()), forceMoveOrResizeActionsToBeThisManyMSApart)
 		//logf("for testing when a panic in logWorker happens after main's keypress, right before main's os.Exit!")
 	}
+	if moveCasFailures := moveChannelCASFailures.Load(); moveCasFailures > 0 {
+		directLoggerf("Move/resize channel's high-water-mark CAS loop exhausted its %d retries %s time(s) (never fatal, just an imprecise peak).", attemptAtomicSwapThisManyTimes, withCommas(moveCasFailures))
+	}
 } //logWorker
 
 // drainRemainingLogChanMessages performs a final, non-blocking sweep of
@@ -6611,7 +6662,8 @@ func internalLogger(finalMsg string) {
 		duration := time.Since(startPrint)
 		// --- END TIMING ---
 		// Only alert us if the print took longer than a "frame" (16ms)
-		if duration > 16*time.Millisecond { //TODO: make it a const
+		const consoleLogLagThreshold = 16 * time.Millisecond
+		if duration > consoleLogLagThreshold {
 			// Note: Printing this might trigger another lag, but it's for science!
 			// XXX: used to happen when running as admin and u LMB drag the scroll bar or LMB on the text area which begins selection and auto selects 1 char already! when logging was happening on same thread as hooks and msg.loop.
 			fmt.Fprintf(os.Stderr, "!!! LOG LAG DETECTED: %v !!!\n", duration) //this won't be seen when compiled without console ie. 'go build -ldflags "-H=windowsgui"'
@@ -7388,9 +7440,7 @@ func drainMoveChannel() {
 	for {
 		// Track High-Water Mark
 		currentFill := uint64(len(moveDataChan))
-		if currentFill > maxChannelFillForMoveEvents.Load() {
-			//TODO: recheck the logic in this when using more than 1 thread (currently only 1)
-			maxChannelFillForMoveEvents.Store(currentFill)
+		if raised, _ := updateHighWaterMark(&maxChannelFillForMoveEvents, currentFill, &moveChannelCASFailures); raised {
 			logf("New MoveOrResize Channel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
 				withCommas(currentFill), withCommas(droppedMoveOrResizeEvents.Load()))
 		}
@@ -7467,6 +7517,16 @@ func drainMoveChannelCoalesced() {
 	}
 	coalesceOrder = coalesceOrder[:0]
 
+	// Track High-Water Mark, mirroring drainMoveChannel's identical
+	// tracking (previously only done in the non-coalesced path). Captured
+	// once here, before the drain loop below empties the channel, so it
+	// reflects the deepest backlog this batch actually saw.
+	currentFill := uint64(len(moveDataChan))
+	if raised, _ := updateHighWaterMark(&maxChannelFillForMoveEvents, currentFill, &moveChannelCASFailures); raised {
+		logf("New MoveOrResize Channel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
+			withCommas(currentFill), withCommas(droppedMoveOrResizeEvents.Load()))
+	}
+
 	// 1. Non-blocking full drain of the channel
 	for {
 		select {
@@ -7530,6 +7590,18 @@ var (
 	//well, read the comment for winEventProc below (didn't double check it, Geminit 3.5 Flash made)
 	eventCount atomic.Uint64
 	lastReport time.Time = time.Now()
+)
+
+// winEventLogReportInterval / winEventHighFrequencyThreshold gate
+// winEventProc's periodic "[DEBUG] Events per second" summary line (only
+// active when shouldLogWindowEvents is true): it fires at most once per
+// winEventLogReportInterval, and only if the event count accumulated
+// since the last report exceeded winEventHighFrequencyThreshold.
+// Observed rates are around 122 events/sec during resizes, and under 50
+// during ordinary (not-our-gesture) window switching.
+const (
+	winEventLogReportInterval      = time.Second
+	winEventHighFrequencyThreshold = 160
 )
 
 /*
@@ -7618,8 +7690,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	}
 
 	if shouldLogWindowEvents {
-		// 1. Monitor Event Frequency (Every 1 second)
-		if time.Since(lastReport) > time.Second && nowCount > 160 { //TODO: make it a const; can get 122 events per sec during resizes, or less than 50 during wtw else not-our-gesture events.
+		// 1. Monitor Event Frequency
+		if time.Since(lastReport) > winEventLogReportInterval && nowCount > winEventHighFrequencyThreshold {
 			//count := atomic.SwapUint64(&eventCount, 0)
 			count := eventCount.Swap(0)
 			//fmt.Printf
@@ -7631,7 +7703,13 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		start := time.Now()
 		defer func() {
 			elapsed := time.Since(start)
-			if elapsed > 5*time.Millisecond { // TODO: make it a const
+			// Deliberately reusing mouseProc's Duration5ms threshold here
+			// rather than a second, independently-tunable 5ms constant --
+			// both flag "hook-adjacent work took longer than a rough
+			// budget", and coincidentally already agreed on the same
+			// value. If you ever want these two to diverge, give this one
+			// its own named const instead.
+			if elapsed > Duration5ms {
 				logf("[PERF] Slow Event 0x%x(%s): %v (HWND: 0x%x, ObjId: %d)", event, eventName, elapsed, hwnd, idObject)
 			}
 		}()
@@ -7720,10 +7798,16 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	if event == wincoe.EVENT_SYSTEM_FOREGROUND && targetHwnd != 0 && !isOwnWindow(targetHwnd) {
 		class, res3 := wincoe.GetClassName(targetHwnd)
 		if res3.Failed() {
-			logf("winEventProc:GetClassName failed for HWND=0x%X, res: %v", targetHwnd, res3)
-			return 0 // WinEvent callbacks return 0 (no chaining) //TODO: should we continue instead? #used2continue
-		}
-		if class != "Shell_TrayWnd" && class != "Shell_SecondaryTrayWnd" {
+			// This lookup only feeds lastKnownUserForegroundHwnd (used to
+			// restore focus after the tray menu closes -- see its own doc
+			// comment), a minor feature. Bailing out of the whole
+			// winEventProc call here (as this used to do) would also skip
+			// the integrity-level check and missed-gesture-recovery
+			// arming logic right below, which is this callback's actual
+			// purpose for EVENT_SYSTEM_FOREGROUND -- so just skip the
+			// Store below and continue into that logic instead.
+			logf("winEventProc:GetClassName failed for HWND=0x%X, res: %v; leaving lastKnownUserForegroundHwnd untouched for this transition", targetHwnd, res3)
+		} else if class != "Shell_TrayWnd" && class != "Shell_SecondaryTrayWnd" {
 			//"Caveat: Shell_TrayWnd/Shell_SecondaryTrayWnd cover the normal taskbar; I'm not fully certain of the class name Win11 uses for the "show hidden icons" overflow flyout if your icon ever lives there, so this may need a tweak if you test it and it still shows Explorer in that case. Flagging this as something to actively decide on rather than silently reinstating." - Claude Sonnet 5 Extra Thinking
 			lastKnownUserForegroundHwnd.Store(uintptr(targetHwnd))
 		}
@@ -7768,9 +7852,12 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 
 					reason := eventName //it's EVENT_SYSTEM_FOREGROUND
 					if forceReconcile {
-						reason = "reconciliation via " + reason + "(should only happen once, the first time after just started " + selfName + ")" //TODO: track if this happens more than once and warn in red color or something somehow notify me the dev, maybe write into a new file about it, or I guess the log is enough since it's always append
+						fireCount := reconciliationFireCount.Add(1)
+						reason = fmt.Sprintf("reconciliation via %s (fire #%d; should only happen once, the first time after just started %s)", reason, fireCount, selfName)
+						if fireCount > 1 {
+							logf("WARNING(for dev.): the GetForegroundWindow()-reconciliation workaround (see caveats1.txt) has now fired %d times this run; it was expected to fire at most once.", fireCount)
+						}
 					}
-
 					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) [%s] after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", targetHwnd, pid, targetIL, reason)
 				} else if shouldLogFocusChanges {
 					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x), but missed-gesture recovery is disabled; not arming.", targetHwnd, pid, targetIL)
@@ -7800,7 +7887,8 @@ func getProcessNameFast(pid uint32) string {
 		return "<failed>"
 	}
 	//defer windows.CloseHandle(hProc)
-	defer closeHandleLogged(hProc, "getProcessNameFast:OpenProcess hProc")
+	// defer closeHandleLogged(hProc, "getProcessNameFast:OpenProcess hProc")
+	defer closeHandleLogged(&hProc, "getProcessNameFast:OpenProcess hProc")
 
 	buf := make([]uint16, windows.MAX_PATH)
 	// #nosec G115 -- safe: buffer length is a small constant aka windows.MAX_PATH aka 260 which is well within uint32 bounds
@@ -7986,10 +8074,29 @@ func initDarkMode() {
 
 var startupTerminalHwnd windows.Handle
 
-// TODO: change the sig of this to take pointer to handle and set the pointer to 0 after close
-// or maybe even before then close with the saved one to avoid some TOCTOU window
-func closeHandleLogged(h windows.Handle, context2 string) {
-	if err := windows.CloseHandle(h); err != nil {
+// closeHandleLogged closes *h (if non-zero), zeroing *h immediately
+// beforehand so no caller can ever observe or reuse a handle value that's
+// already been handed to CloseHandle -- whether or not the close itself
+// succeeds. Logs (via logf) if CloseHandle fails, but never returns an
+// error: callers already treat handle cleanup as best-effort throughout
+// this codebase.
+//
+// Taking *windows.Handle rather than windows.Handle closes the
+// TOCTOU-style window the previous value-taking signature left open: a
+// caller's own handle variable could still be read (and potentially
+// reused, e.g. in another defer further up the same function, or on some
+// later error path) after this function had already closed it, since the
+// caller's copy was never told the handle was gone.
+//
+// A nil h or a zero *h is treated as "nothing to close" and is a silent
+// no-op.
+func closeHandleLogged(h *windows.Handle, context2 string) {
+	if h == nil || *h == 0 {
+		return
+	}
+	saved := *h
+	*h = 0 // zero first -- see doc comment above.
+	if err := windows.CloseHandle(saved); err != nil {
 		logf("CloseHandle failed for %s: %v", context2, err)
 	}
 }
