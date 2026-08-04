@@ -3392,7 +3392,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		return res1.R1
 	}
 
-	// nolint:govet //for unsafeptr, has no effect actually, still warns even with settings.json only this works(outside of vscode): go vet -unsafeptr=false
+	// no effect: //nolint:govet //for unsafeptr, has no effect actually, still warns even with settings.json only this works(outside of vscode): go vet -unsafeptr=false
 	//info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(lParam)) // XXX: warns without the .\.vscode\settings.json the unsafeptr false part.
 
 	// ✅ Direct conversion from unsafe.Pointer to struct pointer (100% valid Go):
@@ -3400,7 +3400,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	// // Trick the linter: convert to pointer via an interface or a helper
 	// // that doesn't trigger the "unsafeptr" heuristic.
 	// var p interface{} = lParam
-	// //nolint:govet,unsafeptr // because
+	// no effect://nolint:govet,unsafeptr // because
 	// info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(p.(uintptr)))
 
 	if info.Flags&wincoe.LLMHF_INJECTED != 0 {
