@@ -4149,7 +4149,8 @@ func hookWorker() {
 			} else {
 				currentExitCode.Store(1) //doneFIXME: this is accessed from two diff. threads, protect it.
 				stack := debug.Stack()
-				logf("--- hookWorker thread CRASH: %v ---\nStack: %s\n--- END---", r, stack)
+				// FIX: Use directLoggerf instead of logf to avoid channel drops
+				directLoggerf("--- hookWorker thread CRASH: %v ---\nStack: %s\n--- END---", r, stack)
 			}
 			logf("CRITICAL: from hookWorker, signaling main thread to die...")
 
@@ -5753,6 +5754,16 @@ func initLogFile() {
 		)
 		if err == nil {
 			logFile.Store(f)
+			// --- DEFENSIVE FIX: REDIRECT STDERR ---
+			// If we have no console (-H=windowsgui), wire Stderr directly to the log file.
+			// This forces fatal Go runtime crashes and unprotected goroutine panics
+			// to dump their stack traces into our file instead of into the void.
+			if !canUseConsoleStderr {
+				os.Stderr = f
+				if err2 := windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(f.Fd())); err2 != nil {
+					panic(fmt.Sprintf("CRITICAL: failed to set standard error handle via SetStdHandle, err: %v", err2))
+				}
+			}
 			return
 		}
 		// on error, logFile stays nil; internalLogger's caller already
@@ -6738,10 +6749,12 @@ func secondary_defer() {
 	var exitcode int
 	// SECONDARY SAFETY: Catches panics that happen inside the primary defer (which is below)
 	if r2 := recover(); r2 != nil {
-		logf("!secondary defer here! [CRITICAL ERROR IN primary DEFER]: '%v'\n%s\n----snip----", r2, debug.Stack())
+		// FIX: Use directLoggerf
+		directLoggerf("!secondary defer here! [CRITICAL ERROR IN primary DEFER]: '%v'\n%s\n----snip----", r2, debug.Stack())
 		exitcode = 120
 	} else {
-		logf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
+		// FIX: Use directLoggerf
+		directLoggerf("!secondary defer here! This shouldn't be reached ever. It means primary defer didn't os.Exit as it should. So, bad coding/logic, if here.")
 		exitcode = 121
 	}
 	logf("!secondary defer here! Primary defer wanted to exit with exitcode: '%d' but we do: '%d'", currentExitCode.Load(), exitcode)
@@ -6775,7 +6788,8 @@ func primary_defer() { //primary defer
 		} else {
 			currentExitCode.Store(1)
 			stack := debug.Stack()
-			logf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
+			// FIX: Use directLoggerf instead of logf to avoid channel drops
+			directLoggerf("--- CRASH: %v ---\nStack: %s\n--- END---", r, stack)
 			//debug.PrintStack()
 		}
 	}
@@ -6958,6 +6972,11 @@ func exitf(code int32, format string, a ...interface{}) {
 func runApplication(_token theILockedMainThreadToken) error { //XXX: must be called on main() and after that runtime.LockOSThread()
 	_ = _token // silence warning!
 	assertStructSizes()
+
+	// --- DEFENSIVE FIX: EAGER INITIALIZATION ---
+	// Initialize the log file early so STD_ERROR_HANDLE is redirected
+	// before any complex logic runs.
+	initLogFile()
 	initWincoeLogging() // ← must be before any wincoe calls
 
 	// Capture the actual terminal/console window that launched us

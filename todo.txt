@@ -86,3 +86,4 @@ hallucinated/hand-waved:
 
 
 done:
+//* so if I compile with `-ldflags="-H=windowsgui"` does the panic msg and stack go anywhere like the log file ?! if not, we should make it so, somehow!
