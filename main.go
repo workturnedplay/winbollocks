@@ -1194,14 +1194,14 @@ var lmbClickInputs = func() [2]wincoe.KEYANDMOUSE_INPUT {
 	return inputs
 }()
 
-func injectLMBClick() {
-	if res1 := wincoe.SendInput(lmbClickInputs[:]); res1.Failed() {
-		logf("SendInput mouse click failed: %v", res1.Err)
-	} else {
-		//TODO: remove, temp.
-		logf("Used LMB click to focus, caveat: target window got a LMB click at the point where you started the window move so it could've clicked an UI button!")
-	}
-}
+// func injectLMBClick() {
+// 	if res1 := wincoe.SendInput(lmbClickInputs[:]); res1.Failed() {
+// 		logf("SendInput mouse click failed: %v", res1.Err)
+// 	} else {
+// 		//TODO: remove, temp.
+// 		logf("Used LMB click to focus, caveat: target window got a LMB click at the point where you started the window move so it could've clicked an UI button!")
+// 	}
+// }
 
 func injectLMBClickAtCoords(x, y int32) {
 	// SendInput absolute mouse coordinates use the entire virtual desktop,
@@ -1409,46 +1409,18 @@ func injectLMBClickAtCoords(x, y int32) {
 	}
 }
 
-func injectLMBDown() {
-	// inputs := []wincoe.KEYANDMOUSE_INPUT{
-	// 	{
-	// 		Type: INPUT_MOUSE,
-	// 		Ki:   wincoe.KEYBDINPUT{}, // union placeholder
-	// 	},
-	// }
-
-	// // Fill the union as MOUSEINPUT
-	// // (*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = MOUSEEVENTF_LEFTDOWN
-	// mouseInputView(&inputs[0]).DwFlags = MOUSEEVENTF_LEFTDOWN
-
-	//Your inject (MOUSEEVENTF_LEFTDOWN): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
-
-	//SendInput is synchronous—blocks until inputs queued/processed by system. In WH_MOUSE_LL (global, synchronous chain), this blocks all mouse input until done.
-	//SendInput is synchronous — blocks caller until inputs queued to system queue (not processed).
-
-	// res1 := procSendInput.Call(
-	// 	uintptr(len(inputs)),
-	// 	uintptr(unsafe.Pointer(&inputs[0])),
-	// 	unsafe.Sizeof(inputs[0]),
-	// )
-
-	//if err != nil || ret == 0 {
-
-	// lmbClickInputs[:1] creates a slice of length 1 containing ONLY the LEFTDOWN event
-	if res1 := wincoe.SendInput(lmbClickInputs[:1]); res1.Failed() || res1.R1 != 1 {
-		logf("SendInput mouse LMBdown failed: %v", res1.Err)
-	} else {
-		//TODO: remove, temp.
-		logf("Injected LMB down(without the up!), ret=%d err=%v", res1.R1, res1.Err)
-	}
-}
+// func injectLMBDown() {
+// 	// lmbClickInputs[:1] creates a slice of length 1 containing ONLY the LEFTDOWN event
+// 	if res1 := wincoe.SendInput(lmbClickInputs[:1]); res1.Failed() || res1.R1 != 1 {
+// 		logf("SendInput mouse LMBdown failed: %v", res1.Err)
+// 	} else {
+// 		//TODO: remove, temp.
+// 		logf("Injected LMB down(without the up!), ret=%d err=%v", res1.R1, res1.Err)
+// 	}
+// }
 
 func getWindowPID(hwnd windows.Handle) uint32 {
 	var pid uint32
-	// res1 := procGetWindowThreadProcessID.Call(
-	// 	uintptr(hwnd),
-	// 	uintptr(unsafe.Pointer(&pid)),
-	// )
 	if _, res1 := wincoe.GetWindowThreadProcessId(hwnd, &pid); res1.Failed() {
 		logf("getWindowPID: GetWindowThreadProcessId failed for HWND=0x%X, err: %v", hwnd, res1.Err)
 	}
@@ -3386,16 +3358,13 @@ func forceForeground(target windows.Handle) bool {
 	return succeeded //fgRet != 0
 } //detached thread at end of function due to 'defer'
 
-func logLMBState(prefix string) {
-	// res1 := procGetAsyncKeyState.Call(VK_LBUTTON)
-	// state := res1.R1
-	// if state&0x8000 != 0 {
-	if wincoe.IsKeyDown(wincoe.VK_LBUTTON) {
-		logf("%s: LMB is DOWN", prefix) //, state)
-	} else {
-		logf("%s: LMB is UP", prefix) //, state)
-	}
-}
+// func logLMBState(prefix string) {
+// 	if wincoe.IsKeyDown(wincoe.VK_LBUTTON) {
+// 		logf("%s: LMB is DOWN", prefix)
+// 	} else {
+// 		logf("%s: LMB is UP", prefix)
+// 	}
+// }
 
 /* ---------------- Mouse Hook ---------------- */
 
@@ -3789,7 +3758,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// zone (original or mirrored) is currently active by the time
 			// any WM_MOUSEMOVE is processed.
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone) //TODO: move this into wndProc aka into handleActualMove() ?!
+				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
 				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 				if asyncResize.Load() {
 					flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -4905,9 +4874,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		unreachable()
 		return 0
 
-	//TODO: maybe add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
+	//alreadyhaveTODO: maybe add option in systray if 'true' keep moving the window even after winkey is released, else stop; the latter case would stop it from moving after coming back from unlock screen, if it was moving when lock happened.
 	//doneTODO: Add WH_SHELL Hook for Focus Change Detection - in progress.
-	//TODO: Do the postmessage for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too.
+	//TODO: Do the postmessage for any other UI calls inside hooks (e.g., ShowWindow, SetForegroundWindow attempts, etc.) — postmessage them too. There's one exception for this the tryBringForegroundToFrontAt(which does SendMessage WM_NULL then setWindowPos both sync not async) in RMB down! must happen in mouseProc else some ordering issue happens and a window will get sent to back!
 
 	case WM_INJECT_SEQUENCE:
 		//avoids injecting from the hook
@@ -5736,7 +5705,7 @@ func initLogFile() {
 		}
 
 		// #nosec: G302 // we want 0644 not 0600 because winbollocks runs as admin usually and want user to can read the log without becoming admin to do so.
-		f, err := os.OpenFile( // FIXME: G703: Path traversal via taint analysis (gosec)
+		f, err := os.OpenFile( // doneFIXME: G703: Path traversal via taint analysis (gosec)
 			// logFilename,
 			// Combine it with a guaranteed safe log directory if needed, or use the sanitized name
 			safeFilename,
@@ -5875,38 +5844,31 @@ func logf(format string, args ...any) {
 	}
 }
 
-func injectLetterE() {
-	injectKeyTap('E')
-}
+// func injectLetterE() {
+// 	injectKeyTap('E')
+// }
 
-func injectKeyTap(vk uint16) {
-	inputs := []wincoe.KEYANDMOUSE_INPUT{
-		{
-			Type: wincoe.INPUT_KEYBOARD,
-			Ki: wincoe.KEYBDINPUT{
-				WVk: vk,
-			},
-		},
-		{
-			Type: wincoe.INPUT_KEYBOARD,
-			Ki: wincoe.KEYBDINPUT{
-				WVk:     vk,
-				DwFlags: wincoe.KEYEVENTF_KEYUP,
-			},
-		},
-	}
+// func injectKeyTap(vk uint16) {
+// 	inputs := []wincoe.KEYANDMOUSE_INPUT{
+// 		{
+// 			Type: wincoe.INPUT_KEYBOARD,
+// 			Ki: wincoe.KEYBDINPUT{
+// 				WVk: vk,
+// 			},
+// 		},
+// 		{
+// 			Type: wincoe.INPUT_KEYBOARD,
+// 			Ki: wincoe.KEYBDINPUT{
+// 				WVk:     vk,
+// 				DwFlags: wincoe.KEYEVENTF_KEYUP,
+// 			},
+// 		},
+// 	}
 
-	// res1 := procSendInput.Call(
-	// 	uintptr(len(inputs)),
-	// 	uintptr(unsafe.Pointer(&inputs[0])),
-	// 	unsafe.Sizeof(inputs[0]),
-	// )
-	if res1 := wincoe.SendInput(inputs); res1.Failed() || res1.R1 != uintptr(len(inputs)) {
-		logf("SendInput failed to inject %d events, injected=%d == ret=%d err=%v", len(inputs), res1.R1, res1.R1, res1.Err)
-	}
-	//logf("sizeof(INPUT)=%d", unsafe.Sizeof(INPUT{}))
-	//logf("sizeof(KEYBDINPUT)=%d", unsafe.Sizeof(KEYBDINPUT{}))
-}
+// 	if res1 := wincoe.SendInput(inputs); res1.Failed() || res1.R1 != uintptr(len(inputs)) {
+// 		logf("SendInput failed to inject %d events, injected=%d == ret=%d err=%v", len(inputs), res1.R1, res1.R1, res1.Err)
+// 	}
+// }
 
 /*
 5️⃣ Why this wiring is correct (sanity check)
@@ -6914,9 +6876,9 @@ func installCtrlHandlerIfConsole() {
 	}
 }
 
-func todo() {
-	panic("TODO: not yet implemented")
-}
+// func todo() {
+// 	panic("TODO: not yet implemented")
+// }
 
 func unreachable() {
 	panic("unreachable code was reached, bad assumptions or programmer then ;p")
