@@ -7535,18 +7535,21 @@ func drainMoveChannelCoalesced() {
 	}
 	coalesceOrder = coalesceOrder[:0]
 
-	// Track High-Water Mark, mirroring drainMoveChannel's identical
-	// tracking (previously only done in the non-coalesced path). Captured
-	// once here, before the drain loop below empties the channel, so it
-	// reflects the deepest backlog this batch actually saw.
-	currentFill := uint64(len(moveDataChan))
-	if raised, _ := updateHighWaterMark(&maxChannelFillForMoveEvents, currentFill, &moveChannelCASFailures); raised {
-		logf("New MoveOrResize Channel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
-			withCommas(currentFill), withCommas(droppedMoveOrResizeEvents.Load()))
-	}
+	//doneFIXME: "Since mouseProc runs on a separate hook thread and can enqueue into moveDataChan during this drain, the single upfront sample can actually miss a higher peak that occurs mid-drain. drainMoveChannel's per-iteration re-sampling doesn't have this gap. This is a minor precision loss (telemetry only, not correctness), but worth being aware of — recommend matching drainMoveChannel's per-iteration sampling for consistency:
+	// ... Suggested fix — move the high-water-mark check inside the drain loop in drainMoveChannelCoalesced, sampling on each iteration rather than once upfront:" - Claude 5 Sonnet Extra (no thinking)
 
 	// 1. Non-blocking full drain of the channel
 	for {
+		// Track High-Water Mark, mirroring drainMoveChannel's identical
+		// tracking (previously only done in the non-coalesced path). Captured
+		// once here, before the drain loop below empties the channel, so it
+		// reflects the deepest backlog this batch actually saw.
+		currentFill := uint64(len(moveDataChan))
+		if raised, _ := updateHighWaterMark(&maxChannelFillForMoveEvents, currentFill, &moveChannelCASFailures); raised {
+			logf("New MoveOrResize Channel Peak: %s events queued (Dropped: %s (due to throttling(most likely) or less-likely due to channel full))",
+				withCommas(currentFill), withCommas(droppedMoveOrResizeEvents.Load()))
+		}
+
 		select {
 		case data := <-moveDataChan:
 			if _, exists := coalesceMap[data.Hwnd]; !exists {
@@ -8108,6 +8111,14 @@ var startupTerminalHwnd windows.Handle
 //
 // A nil h or a zero *h is treated as "nothing to close" and is a silent
 // no-op.
+//
+// closeHandleLogged is main's own copy of wincoe.CloseHandleLogged, logging
+// via logf instead of wincoe.Logger. Deliberately NOT delegating to
+// wincoe.CloseHandleLogged: that function reads wincoe.Logger, which is a
+// no-op discard logger until initWincoeLogging() runs (see its own doc
+// comment) -- any call to this helper before that point would silently
+// vanish if it delegated. Keep this duplicate rather than risk that
+// ordering hazard.
 func closeHandleLogged(h *windows.Handle, context2 string) {
 	if h == nil || *h == 0 {
 		return

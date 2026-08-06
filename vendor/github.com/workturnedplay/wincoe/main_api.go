@@ -1433,8 +1433,12 @@ var (
 
 	// procGetTopWindow/procGetWindow: like procGetForegroundWindow, 0 is a
 	// legitimate "no such window in that relationship" result (empty
-	// desktop, no more siblings, etc.), not an unambiguous failure signal,
-	// so these are bound CheckNone and callers must check the HWND itself.
+	// desktop, no more siblings, etc.), not an unambiguous failure signal.
+	// Bound CheckNullWithLastError rather than CheckNone: a genuine failure
+	// (e.g. an invalid/destroyed hwnd) does set GetLastError, so this lets
+	// WinResult.Failed() distinguish "no window in that relationship" (r1==0,
+	// no error) from "the call actually failed" (r1==0, error set) — callers
+	// should still treat r1==0 as "nothing found" whenever .Succeeded().
 	procGetTopWindow = NewBoundProc1(User32, "GetTopWindow", CheckNullWithLastError) // was CheckNone
 	procGetWindow    = NewBoundProc2(User32, "GetWindow", CheckNullWithLastError)    // was CheckNone
 
@@ -1679,7 +1683,7 @@ func QueryFullProcessName(pid uint32) (string, error) {
 		return "", fmt.Errorf("OpenProcess failed for PID %d: %w", pid, err0)
 	}
 	//defer windows.CloseHandle(hProc)
-	defer closeHandleLogged(&hProc, "QueryFullProcessName:OpenProcess hProc")
+	defer CloseHandleLogged(&hProc, "QueryFullProcessName:OpenProcess hProc")
 
 	// Start with MAX_PATH (260)
 	//Yes, size remains a uint32 on both x86 and x64. This is because the Windows API function QueryFullProcessImageNameW
@@ -1875,7 +1879,7 @@ func GetProcessName(pid uint32) (string, error) {
 		return "", err
 	}
 	//defer windows.CloseHandle(snapshot)
-	defer closeHandleLogged(&snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
+	defer CloseHandleLogged(&snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
 
 	var entry windows.ProcessEntry32
 	entry.Size = uint32(unsafe.Sizeof(entry))
@@ -3162,7 +3166,7 @@ var (
 // 	}
 // }
 
-// closeHandleLogged closes *h (if non-zero), zeroing *h immediately
+// CloseHandleLogged closes *h (if non-zero), zeroing *h immediately
 // beforehand so no caller can ever observe or reuse a handle value that's
 // already been handed to CloseHandle -- whether or not the close itself
 // succeeds. Logs (via logf) if CloseHandle fails, but never returns an
@@ -3178,7 +3182,7 @@ var (
 //
 // A nil h or a zero *h is treated as "nothing to close" and is a silent
 // no-op.
-func closeHandleLogged(h *windows.Handle, context string) {
+func CloseHandleLogged(h *windows.Handle, context string) {
 	if h == nil || *h == 0 {
 		return
 	}
@@ -3315,7 +3319,7 @@ func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string,
 	if cerr != nil {
 		return false, "", fmt.Errorf("CreateFile failed: %w", cerr)
 	}
-	defer closeHandleLogged(&h, "inspectExistingStagingFile:CreateFile h")
+	defer CloseHandleLogged(&h, "inspectExistingStagingFile:CreateFile h")
 
 	var info windows.ByHandleFileInformation
 	if gerr := windows.GetFileInformationByHandle(h, &info); gerr != nil {
