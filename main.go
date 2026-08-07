@@ -5668,7 +5668,7 @@ func initWincoeLogging() {
 		In practice this can't happen because wincoe's defensive paths are never reached during teardown, but it's worth knowing the constraint exists.
 	*/
 	bridge := slog.New(&slogBridge{})
-	wincoe.Logger.Store(bridge)
+	wincoe.SetLogger(bridge)
 	wincoe.SetBugLogger(bridge)
 }
 

@@ -70,12 +70,37 @@ import (
 // package var here would be a genuine, -race-detectable data race between
 // Reload() and any in-flight request hitting one of those paths.
 //
-// Set via: wincoe.Logger.Store(someLogger)
-// Read via: wincoe.Logger.Load()
-var Logger atomic.Pointer[slog.Logger]
+// logger stores the process-wide fallback logger used by package-level
+// helpers that cannot receive a logger explicitly.
+//
+// Keep the atomic pointer private so callers cannot store nil and violate
+// the package invariant. Use SetLogger and getLogger instead.
+var (
+	logger        atomic.Pointer[slog.Logger]
+	discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+)
 
 func init() {
-	Logger.Store(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// Guarantee baseline initialization before any goroutines spawn.
+	logger.Store(discardLogger)
+}
+
+// SetLogger enforces the non-nil invariant at the mutation boundary.
+func SetLogger(l *slog.Logger) {
+	if l == nil {
+		// Defense-in-depth: Never allow a nil pointer into the atomic storage.
+		// Immediately swap to the discard logger to prevent downstream dereference panics.
+		logger.Store(discardLogger)
+		return
+	}
+	logger.Store(l)
+}
+
+// getLogger provides branchless, atomic read access.
+// By enforcing the invariant in SetLogger, the read path is stripped of overhead.
+func getLogger() *slog.Logger {
+	// Guaranteed non-nil by init() and SetLogger().
+	return logger.Load()
 }
 
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -188,22 +213,55 @@ func EnableVirtualTerminalProcessing() error {
 	}
 }
 
-// WithConsoleColor temporarily changes text attribute, runs fn, then restores original
-func WithConsoleColor(outputHandle windows.Handle, color uint16, fn func()) (errRet error) {
+// WithConsoleColor temporarily changes the console text attributes, invokes
+// fn, and restores the original attributes before returning.
+//
+// If fn panics, the original panic is preserved. A restoration failure during
+// panic unwinding is logged because there is no ordinary error return path
+// available without replacing or obscuring the panic.
+func WithConsoleColor(
+	outputHandle windows.Handle,
+	color uint16,
+	fn func(),
+) (errRet error) {
+	if fn == nil {
+		return errors.New("WithConsoleColor: nil callback")
+	}
+
 	originalColor, err := GetConsoleScreenBufferAttributes(outputHandle)
 	if err != nil {
-		return fmt.Errorf("GetConsoleScreenBufferInfo failed: %w", err)
+		return fmt.Errorf("WithConsoleColor: get original console attributes: %w", err)
 	}
-	defer func() {
-		// Always restore (even on panic inside fn)
-		if resetErr := SetConsoleTextAttribute(outputHandle, originalColor); resetErr != nil { //NVM nolint:errcheck // because nothing to do with the error.
-			errRet = fmt.Errorf("SetConsoleTextAttribute failed to reset back to original color %d, err: %w", originalColor, resetErr) // Only overwrite if the main logic succeeded
-		}
-	}()
-	// Set new color
+
 	if err := SetConsoleTextAttribute(outputHandle, color); err != nil {
-		return fmt.Errorf("SetConsoleTextAttribute failed to set new color %d, err: %w", color, err)
+		return fmt.Errorf(
+			"WithConsoleColor: set console color %d: %w",
+			color,
+			err,
+		)
 	}
+
+	defer func() {
+		resetErr := SetConsoleTextAttribute(outputHandle, originalColor)
+		if resetErr == nil {
+			return
+		}
+
+		if recovered := recover(); recovered != nil {
+			getLogger().Error(
+				"WithConsoleColor: failed to restore console color while unwinding panic",
+				slog.Uint64("original_color", uint64(originalColor)),
+				SafeErr(resetErr),
+			)
+			panic(recovered)
+		}
+
+		errRet = fmt.Errorf(
+			"WithConsoleColor: restore original console color %d: %w",
+			originalColor,
+			resetErr,
+		)
+	}()
 
 	fn()
 	return nil
@@ -267,8 +325,7 @@ func ClearStdinIfTermIsNOTRaw() (hadInput bool) {
 	}
 
 	if flushErr := windows.FlushConsoleInputBuffer(h); flushErr != nil {
-		log := Logger.Load() // safe atomic read
-		log.Debug("ClearStdinIfTermIsNOTRaw: FlushConsoleInputBuffer failed", SafeErr(flushErr))
+		getLogger().Debug("ClearStdinIfTermIsNOTRaw: FlushConsoleInputBuffer failed", SafeErr(flushErr))
 	}
 	return true
 }
@@ -276,8 +333,7 @@ func ClearStdinIfTermIsNOTRaw() (hadInput bool) {
 func ReadKeySequence() {
 	var b [1]byte
 	if _, err := os.Stdin.Read(b[:]); err != nil {
-		log := Logger.Load() // safe atomic read
-		log.Debug("ReadKeySequence: os.Stdin.Read failed", SafeErr(err))
+		getLogger().Debug("ReadKeySequence: os.Stdin.Read failed", SafeErr(err))
 	}
 }
 
@@ -313,7 +369,7 @@ const (
 // already wrap this in WithConsoleEventRaw which does its own mode protection.
 func ClearStdin() (hadKey bool) {
 	h := syscall.Handle(os.Stdin.Fd())
-	log := Logger.Load() // safe atomic read
+	log := getLogger() // safe atomic read
 
 	for {
 		// Peek a single event (non-destructive, non-blocking).
@@ -397,7 +453,7 @@ func WithConsoleEventRaw(fn func()) {
 
 	var oldMode uint32
 	if err := windows.GetConsoleMode(h, &oldMode); err != nil {
-		log := Logger.Load() // safe atomic read
+		log := getLogger() // safe atomic read
 		log.Warn("WithConsoleEventRaw: GetConsoleMode failed; NOT running fn() without raw-mode toggling", SafeErr(err))
 		// fn()
 		return
@@ -410,12 +466,12 @@ func WithConsoleEventRaw(fn func()) {
 	newMode &^= windows.ENABLE_ECHO_INPUT
 
 	if err := windows.SetConsoleMode(h, newMode); err != nil {
-		log := Logger.Load() // safe atomic read
+		log := getLogger() // safe atomic read
 		log.Warn("WithConsoleEventRaw: SetConsoleMode failed to enter raw mode, NOT running fn() without raw-mode toggling", SafeErr(err))
 		return
 	}
 	defer func() {
-		log := Logger.Load() // safe atomic read
+		log := getLogger() // safe atomic read
 		err2 := windows.SetConsoleMode(h, oldMode)
 		if err2 != nil {
 			log.Warn("WithConsoleEventRaw: SetConsoleMode failed to restore old mode, ignoring", SafeErr(err2))
@@ -552,11 +608,11 @@ func Flush() {
 	// Errors here are expected and harmless when no console is attached
 	// (-H=windowsgui build, or after FreeConsole), hence Debug not Warn/Error.
 	if err := os.Stderr.Sync(); err != nil {
-		Logger.Load().Debug("Flush: os.Stderr.Sync failed (harmless if no console is attached)", SafeErr(err))
+		getLogger().Debug("Flush: os.Stderr.Sync failed (harmless if no console is attached)", SafeErr(err))
 	}
 	//fmt.Printf("[GoR:%d] !flushing stdout\n", GoRoutineId())
 	if err := os.Stdout.Sync(); err != nil {
-		Logger.Load().Debug("Flush: os.Stdout.Sync failed (harmless if no console is attached)", SafeErr(err))
+		getLogger().Debug("Flush: os.Stdout.Sync failed (harmless if no console is attached)", SafeErr(err))
 	}
 }
 
@@ -1128,22 +1184,59 @@ func validateProcName(proc interface{ Name() string }) { //string {
 		If you only used proc == nil, execution would continue, and as soon as you tried calling proc.Name(),
 		Go would panic with a nil pointer dereference.
 	*/
-	// Robust nil check handling both untyped nil and typed nil interface pointers
-	//if proc == nil || (reflect.ValueOf(proc).Kind() == reflect.Ptr && reflect.ValueOf(proc).IsNil()) {
-	if proc == nil || (reflect.ValueOf(proc).Kind() == reflect.Pointer && reflect.ValueOf(proc).IsNil()) {
-		panic2(fmt.Sprintf("validateAndGetOp: nil proc (type: %T)", proc))
+	if isNilInterfaceValue(proc) {
+		panic2(fmt.Sprintf("validateProcName: nil proc (type: %T)", proc))
 	}
 	pname := proc.Name()
 	op := strings.TrimSpace(pname)
 	if op == "" {
-		panic2(fmt.Sprintf("Shouldn't have empty name in proc (type: %T) unless you set it afterwards by mistake directly via `LazyProc.Name=`, you had %q", proc, pname))
+		panic2(fmt.Sprintf("validateProcName: shouldn't have empty name in proc (type: %T) unless you set it afterwards by mistake directly via `LazyProc.Name=`, you had %q", proc, pname))
 		//panic2("BUG: impossible to have empty name in proc/LazyProc/LazyProcish/BoundProc, unless it was overwritten after which shouldn't have been!")
 	}
 	if pname != op {
-		panic2(fmt.Sprintf("BUG: proc name %q is different than validated proc name %q and it didn't fail earlier!",
+		panic2(fmt.Sprintf("BUG: in validateProcName: proc name %q is different than validated proc name %q and it didn't fail earlier!",
 			pname, op))
 	}
 	// return //op
+}
+
+// validateProcNameString validates a procedure name before windows.NewProc
+// receives it. This catches invalid constructor input at the earliest point.
+func validateProcNameString(name string) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		panic2("validateProcNameString: empty procedure name")
+	}
+	if trimmed != name {
+		panic2(fmt.Sprintf(
+			"validateProcNameString: procedure name contains leading or trailing whitespace: %q",
+			name,
+		))
+	}
+}
+
+// isNilInterfaceValue reports whether v is either a nil interface or contains
+// a typed nil value of any nil-capable kind.
+//
+// Calling reflect.Value.IsNil for a non-nil-capable kind panics, so the kind
+// must always be checked first.
+func isNilInterfaceValue(v any) bool {
+	if v == nil {
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() { //nolint:exhaustive // we check only these, for wtw reason.
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // makeWinResult packages raw call outputs into a WinResult using your check function.
@@ -1998,7 +2091,7 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 	}
 	defer func() {
 		if xerr := windows.CloseServiceHandle(scm); xerr != nil {
-			Logger.Load().Debug("CloseServiceHandle failed in GetServiceNamesFromPIDUncached:OpenSCManager", slog.String("err", xerr.Error()))
+			getLogger().Debug("CloseServiceHandle failed in GetServiceNamesFromPIDUncached:OpenSCManager", slog.String("err", xerr.Error()))
 		}
 	}()
 
@@ -3189,7 +3282,7 @@ func CloseHandleLogged(h *windows.Handle, context string) {
 	saved := *h
 	*h = 0 // zero first -- see doc comment above.
 	if err := windows.CloseHandle(saved); err != nil {
-		Logger.Load().Debug("CloseHandle failed.",
+		getLogger().Debug("CloseHandle failed.",
 			//"context", context, "err", err, //XXX: yeah this works, doesn't need slog.String("context", context) and the other for err! but I'm not gonna use this pattern!
 			slog.String("context", context),
 			SafeErr(err),
