@@ -3964,7 +3964,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	// Always pass the event down the chain so other apps don't break
 	//res1111 := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
 	res1111 := wincoe.CallNextHookEx(0, nCode, wParam, uintptr(lParam))
-	if nowDiff := time.Since(start); nowDiff > Duration5ms {
+	if nowDiff := time.Since(start); nowDiff > Duration5ms { //this gets hit for 5,6,7-8ms usually when it does get hit! like 5 times per hour or less.
 		logf("stutter4 %d ns", nowDiff.Nanoseconds()) // 1 million ns is 1 ms
 	}
 

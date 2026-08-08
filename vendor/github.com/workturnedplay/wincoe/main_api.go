@@ -5923,9 +5923,13 @@ func IsWindowsReservedFileName(name string) bool {
 	// dots and spaces that Windows itself strips before resolving the name.
 	baseName := strings.ToUpper(strings.TrimRight(filepath.Base(name), ". "))
 
-	if _, reserved := ReservedFileNames[baseName]; reserved {
-		return true
+	// Windows device names remain reserved when followed by an extension:
+	// CON.txt, COM1.log, NUL.foo, etc. Only the device-name stem matters.
+	stem := baseName
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
 	}
 
-	return false
+	_, reserved := ReservedFileNames[stem]
+	return reserved
 }
