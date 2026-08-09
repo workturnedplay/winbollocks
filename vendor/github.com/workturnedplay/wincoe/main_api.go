@@ -52,15 +52,11 @@ import (
 	"time"
 )
 
-// Logger - exported global logger. Defaults to a "do nothing" logger.
-// So if this wincoe lib ever wants to log things it uses this Logger to do so, currently it doesn't need to!
+// logger is the process-wide fallback logger used by package-level helpers
+// (e.g. panic2, GetBugLogger) that cannot receive a logger explicitly. Set it
+// via SetLogger; read it via getLogger. Defaults to a "do nothing" (discard)
+// logger until the caller (lib user) calls wincoe.SetLogger(...).
 //
-// Set this in caller(lib user) like:
-//
-// wincoe.Logger = slog.Default()
-//
-// this way this wincoe lib will log to where caller wants.
-// var Logger *slog.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 // Logger is stored behind an atomic.Pointer because it can be swapped
 // concurrently (dnsbollocks.LoggerManager.ApplyConfig does this on every
 // config Reload) while other goroutines are reading it via panic2() from

@@ -1,5 +1,7 @@
 todo:
 
+* that bug i hit when I used RShift tap to prevent start menu from popping after a gesture got triggered, when LShift was held from before winkey, switching to RControl side-steppted it but maybe the same issue is likely possible for RControl via LControl, test this and if so, can probably switch between RControl and RShift depending on which isn't held, unless both LShift and LControl are held then I dno, and also if actually the RControl/RShift are held should probably use the opposing ones (LControl/LShift) as the tapper(s)
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
