@@ -865,11 +865,17 @@ func postShiftMirrorToggleIfNeeded(intendedShiftDown bool) {
 		return // already in the requested state, or OS key-repeat; avoid a redundant post
 	}
 
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		logf("postShiftMirrorToggleIfNeeded: mainMsgHwnd is 0 (intendedShiftDown=%v); skipping WM_APPLY_SHIFT_MIRROR post -- the mirror toggle simply won't apply for this transition", intendedShiftDown)
+		return
+	}
+
 	var shiftFlag uintptr
 	if intendedShiftDown {
 		shiftFlag = 1
 	}
-	if res := wincoe.PostMessage(loadMainMsgHwnd(), WM_APPLY_SHIFT_MIRROR, uintptr(session.targetWnd), shiftFlag); res.Failed() {
+	if res := wincoe.PostMessage(msgHwnd, WM_APPLY_SHIFT_MIRROR, uintptr(session.targetWnd), shiftFlag); res.Failed() {
 		logf("postShiftMirrorToggleIfNeeded: PostMessage WM_APPLY_SHIFT_MIRROR (intendedShiftDown=%v) failed: %v", intendedShiftDown, res.Err)
 	}
 }
@@ -2443,13 +2449,30 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		actually it is my hook thread that calls SetCapture in 2 places one for move and one for resize!
 	*/
 	if releaseCapture {
+		// needsDirectFallback covers BOTH the pre-existing "mainMsgHwnd is
+		// 0" case AND a genuine PostMessage failure (e.g. a full message
+		// queue): either way, the asynchronous WM_DO_RELEASE_CAPTURE path
+		// can't be relied upon to ever actually run, so without this,
+		// activeSession/captureHeldForSession above would already read as
+		// "released" while the real Win32 mouse capture stays held
+		// indefinitely, with no other code path left to correct it.
+		// Calling wincoe.ReleaseCapture() directly here is the same narrow,
+		// deliberate hook-thread exception this function already made for
+		// the mainMsgHwnd==0 case; broadening it to a failed post keeps
+		// that exception self-consistent instead of only catching one of
+		// its two possible causes.
+		needsDirectFallback := false
 		if msgHwnd != 0 {
 			if res := wincoe.PostMessage(msgHwnd, WM_DO_RELEASE_CAPTURE, 0, 0); res.Failed() {
-				logf("softReset: PostMessage WM_DO_RELEASE_CAPTURE failed: %v", res.Err)
+				logf("softReset: PostMessage WM_DO_RELEASE_CAPTURE failed: %v; falling back to direct ReleaseCapture", res.Err)
+				needsDirectFallback = true
 			}
 		} else {
 			// fallback, but should rarely hit
 			logf("mainMsgHwnd is 0 in softReset when trying to send a WM_DO_RELEASE_CAPTURE, falling back to calling ReleaseCapture now!")
+			needsDirectFallback = true
+		}
+		if needsDirectFallback {
 			if res := wincoe.ReleaseCapture(); res.Failed() {
 				logf("softReset: fallback ReleaseCapture failed: %v", res.Err)
 			}
@@ -2462,12 +2485,25 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		//hideOverlay() //doneFIXME: move this to wndProc ! else u hit stutter7 occasionally!
 		// Instead of calling hideOverlay() synchronously on the hook thread,
 		// post it asynchronously to your main thread's message window loop.
+		//
+		// If the post can't actually be delivered (mainMsgHwnd is 0, or
+		// PostMessage itself fails), roll overlayIsShowing back to true
+		// rather than leaving it falsely reporting "hidden" while the
+		// overlay window is still genuinely on screen. hideOverlay() must
+		// stay main-thread-only (see this codebase's own "Main-thread-only
+		// rule"), so there's no synchronous fallback available here the way
+		// the capture-release above has one; instead this keeps the flag an
+		// accurate (or safely over-, never under-) approximation of
+		// visibility so the NEXT resize gesture's updateOverlay()/
+		// softReset() pair gets a fair, un-desynced chance to hide it.
 		if msgHwnd != 0 {
 			if res := wincoe.PostMessage(msgHwnd, WM_HIDE_OVERLAY, 0, 0); res.Failed() {
-				logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v", res.Err)
+				logf("softReset: PostMessage WM_HIDE_OVERLAY failed: %v; rolling overlayIsShowing back to true so a later gesture's teardown can retry hiding it", res.Err)
+				overlayIsShowing.Store(true)
 			}
 		} else {
-			logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0")
+			logf("softReset: unexpected: failed to hideOverlay due to mainMsgHwnd being 0; rolling overlayIsShowing back to true so a later gesture's teardown can retry hiding it")
+			overlayIsShowing.Store(true)
 		}
 	}
 } //softReset
@@ -7519,6 +7555,12 @@ var (
 // drainMoveChannelCoalesced implements event coalescing (latest-wins per window)
 // while preserving approximate inter-window ordering using a first-seen slice.
 // This directly addresses the rubber-banding issue described.
+//
+// Z-order commands (WindowMoveData.ZOrderAction != zOrderActionNone) are the
+// one exception to "latest wins": they are one-shot commands with their own
+// side effects and reservation state, not interchangeable position
+// snapshots, so they are deliberately never folded into the per-HWND
+// coalescing map below -- see the ZOrderAction check inside the drain loop.
 func drainMoveChannelCoalesced() {
 	// // latest holds only the most recent state for each window
 	//coalesceMap := make(map[windows.Handle]WindowMoveData, 8)
@@ -7552,6 +7594,33 @@ func drainMoveChannelCoalesced() {
 
 		select {
 		case data := <-moveDataChan:
+			if data.ZOrderAction != zOrderActionNone {
+				// Z-order actions (Win+MMB send-to-back / Win+Shift+MMB
+				// restore) are one-shot commands carrying their own side
+				// effects and reservation state (see WindowMoveData's own
+				// doc comments on ZOrderAction/SentToBackRestoreID) -- they
+				// are NOT interchangeable position snapshots like ordinary
+				// move/resize data, so they must never be silently folded
+				// into (and lost behind) a later position-only update for
+				// the same HWND via the per-HWND "latest wins" map below.
+				// Apply them immediately, in the exact order dequeued, and
+				// let handleActualMoveOrResize's own SetWindowPos-failure
+				// path (which already calls abandonPendingZOrderAction)
+				// handle a destroyed/invalid target -- no separate
+				// isWindowValid pre-check is needed here for that reason.
+				//
+				// This can reorder a Z-order action relative to an ordinary
+				// move/resize for the SAME window that was originally
+				// enqueued earlier in this same batch (the ordinary one
+				// only actually runs later, in applyBatch below). That's
+				// harmless here: every Z-order command in this codebase
+				// uses SWP_NOMOVE|SWP_NOSIZE, and every ordinary move/resize
+				// uses SWP_NOZORDER -- the two never touch the same
+				// SetWindowPos fields, so applying them in either relative
+				// order converges to the identical final window state.
+				handleActualMoveOrResize(data, true)
+				continue
+			}
 			if _, exists := coalesceMap[data.Hwnd]; !exists {
 				coalesceOrder = append(coalesceOrder, data.Hwnd) // record first appearance order
 			}
@@ -7571,6 +7640,13 @@ applyBatch:
 		}
 
 		if !isWindowValid(hwnd) {
+			// data here is always a plain move/resize snapshot (ZOrderAction
+			// == zOrderActionNone): Z-order commands are diverted to the
+			// immediate path above and never enter coalesceMap. This makes
+			// abandonPendingZOrderAction a guaranteed no-op below, kept only
+			// as cheap, self-documenting defense-in-depth against that
+			// invariant ever being broken by a future change.
+			abandonPendingZOrderAction(data)
 			continue
 		}
 
@@ -8145,27 +8221,63 @@ func markGestureUsedOnce() {
 	}
 }
 
+// ringDoorbell posts WM_DO_SETWINDOWPOS to wake the main thread's drain loop
+// (drainMoveChannel/drainMoveChannelCoalesced via wndProc's WM_DO_SETWINDOWPOS
+// case), but only if no such wakeup is already believed to be in flight
+// (tracked via doorbellPending), so a burst of enqueues between two drains
+// only ever triggers one PostMessage.
+//
+// context is only used in the failure log.
+//
+// All current callers of enqueueMoveOrResize (and therefore this) run
+// exclusively on the single, dedicated hook thread -- Windows hook callback
+// delivery for a given hook is itself inherently serialized, and nothing in
+// this codebase calls enqueueMoveOrResize from the main thread or any other
+// goroutine. That single-caller invariant is what makes the plain
+// (non-CAS) rollback below safe: there's no other thread that could race
+// this rollback against a concurrent doorbellPending.CompareAndSwap(false, true).
+//
+// If the CompareAndSwap wins but the PostMessage attempt itself fails --
+// mainMsgHwnd momentarily 0 (very early startup, or after
+// deinitMainMsgHwnd during shutdown), or PostMessage itself reporting a
+// real failure (e.g. a full message queue) -- doorbellPending is rolled
+// back to false so a LATER enqueue can retry the wakeup. Without this
+// rollback, doorbellPending would get stuck true forever: every future
+// call's CompareAndSwap(false, true) would then silently no-op, and
+// nothing else in this codebase ever resets doorbellPending except
+// WM_DO_SETWINDOWPOS's own handler in wndProc -- so a single transient
+// PostMessage failure could otherwise permanently stall drainage of
+// moveDataChan for the rest of the process's life.
+func ringDoorbell(context3 string) {
+	if !doorbellPending.CompareAndSwap(false, true) {
+		return // a wakeup is already in flight; it will drain our data too
+	}
+
+	main := loadMainMsgHwnd()
+	if main == 0 {
+		logf("ringDoorbell: couldn't post WM_DO_SETWINDOWPOS for %s because mainMsgHwnd was 0; rolling back doorbellPending so a later enqueue can retry the wakeup", context3)
+		doorbellPending.Store(false)
+		return
+	}
+
+	// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
+	//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
+	if res := wincoe.PostMessage(main, WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
+		logf("ringDoorbell: PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v; rolling back doorbellPending so a later enqueue can retry the wakeup", context3, res.Err)
+		doorbellPending.Store(false)
+	}
+}
+
 // enqueueMoveOrResize submits data to moveDataChan and wakes the main thread's
 // message loop to drain it. context is only used in the failure log.
 func enqueueMoveOrResize(data WindowMoveData, context3 string) bool { //Existing callers are allowed to ignore a returned value in Go, so this does not require changing every call site.
 	// Send to your mover channel
 	select {
 	case moveDataChan <- data:
-		// SUCCESS: The data was copied into the buffered channel.
-		// Only ring the doorbell if it hasn't been rung yet
-		if doorbellPending.CompareAndSwap(false, true) {
-			// Now we ring the "Doorbell" to wake up the Main Thread.
-			// PostThreadMessage(and PostMessage, but not SendMessage!) is an asynchronous "fire and forget" call.
-			//the reason we use PostMessage and not PostThreadMessage here is because while systray menu popup is open it runs its own msg loop and calls my wndProc so it will ignore all of these doorbells until popup is closed if i use postThreadMessage!
-
-			if main := loadMainMsgHwnd(); main != 0 {
-				if res := wincoe.PostMessage(main, WM_DO_SETWINDOWPOS, 0, 0); res.Failed() {
-					logf("enqueueMoveOrResize:PostMessage of WM_DO_SETWINDOWPOS for %s failed: %v", context3, res.Err)
-				}
-			} else {
-				logf("enqueueMoveOrResize:PostMessage of WM_DO_SETWINDOWPOS for %s failed because mainMsgHwnd was 0", context3)
-			}
-		}
+		// SUCCESS: The data was copied into the buffered channel. Wake the
+		// main thread's drain loop -- see ringDoorbell's own doc comment for
+		// why a failed wakeup attempt is rolled back rather than left stuck.
+		ringDoorbell(context3)
 		return true
 	default:
 		// FAIL: The channel (2048 slots) is completely full.
