@@ -1,7 +1,5 @@
 todo:
 
-* that bug i hit when I used RShift tap to prevent start menu from popping after a gesture got triggered, when LShift was held from before winkey, switching to RControl side-steppted it but maybe the same issue is likely possible for RControl via LControl, test this and if so, can probably switch between RControl and RShift depending on which isn't held, unless both LShift and LControl are held then I dno, and also if actually the RControl/RShift are held should probably use the opposing ones (LControl/LShift) as the tapper(s)
-
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
@@ -38,6 +36,8 @@ dontdothis:
  If you try to strictly use HWND for windows and Handle for Mutexes/DCs/Processes, you will end up fighting Go's strong typing. You'll constantly be doing windows.HWND(myHandle) or windows.Handle(myHwnd) just to pass variables into basic functions like SetWindowPos, because Go does not allow implicit conversion between defined types, even if their underlying types are identical."
 
 worksasintended(don't fix):
+
+//N/A//* that bug i hit when I used RShift tap to prevent start menu from popping after a gesture got triggered, when LShift was held from before winkey, switching to RControl side-steppted it but maybe the same issue is likely possible for RControl via LControl, test this and if so, can probably switch between RControl and RShift depending on which isn't held, unless both LShift and LControl are held then I dno, and also if actually the RControl/RShift are held should probably use the opposing ones (LControl/LShift) as the tapper(s); // Closed after checking the proposed RControl analogue. Unlike Shift, Ctrl cannot be held during a gesture, so LCtrl held before Win prevents the gesture from starting in the first place. Releasing Win afterward legitimately invokes the Start menu; there is no gesture-related Start-menu suppression case to fix. Therefore the RControl/LControl counterpart of the RShift workaround is not applicable.
 
 //* **The Issue (Thread blocking in `RetryFileOp`):** You wrap the truncation fallback in a `RetryFileOp` loop with `maxAttempts` and `backoff`.
 // * **Why it's wrong:** If this code executes synchronously on a thread responsible for message pumping, window hooks, or UI rendering (which the rest of your architecture implies), a blocking backoff loop will freeze the thread. This risks triggering a Windows "Not Responding" state or causing the OS to silently drop your global mouse/keyboard hooks due to timeout.
