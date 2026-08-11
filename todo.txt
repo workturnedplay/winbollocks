@@ -1,5 +1,7 @@
 todo:
 
+* pressing shift during resize won't cursor-warp to opposing corner while inside virtualbox ie. in a guest OS, i mean, it does but the virtualbox host will still position it where it is on the host so in the same place where gesture started(approximately, if it moved) so it immediately shrinks the window during shift and any mouse movement(or button input) happens! so maybe we need to avoid doing the warping feature fully if under virtualbox or possibly other VMs too, but unsure if we can detect this by looking at whether it jumped or not because it would seem too flakey; instead we should probably detect if running inside virtualization ? If we don't already have this under a systray bool setting we should, and if running under virtualization make it default to false, else to true and this should be good a enough mitigation. Unless, better ideas?
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
