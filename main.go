@@ -46,6 +46,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 
 	"github.com/workturnedplay/wincoe"
 )
@@ -260,6 +261,7 @@ const (
 	MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK = 17
 	MENU_TOGGLE_UNFOCUS_SENT_TO_BACK               = 18
 	MENU_SHOW_INPUT_STATE                          = 19
+	MENU_TOGGLE_SHIFT_MIRROR_RESIZE                = 20
 )
 
 const (
@@ -652,6 +654,29 @@ var bypassGesturesWhenFullscreen atomic.Bool
 
 var useThreadAttachInputForFocus atomic.Bool
 
+// shiftMirrorResizeEnabled gates the Shift-held resize-mirroring
+// accelerator (see handleShiftMirrorToggle): whether pressing Shift
+// mid-resize warps the cursor to the diametrically-opposite resize zone
+// via SetCursorPos.
+//
+// Defaults to false when winbollocks is detected running inside a
+// hypervisor guest (see isVirtualized/detectVirtualization). VirtualBox
+// (and plausibly other hypervisors emulating the same kind of
+// absolute-positioning virtual pointing device, e.g. a USB tablet HID, for
+// the same "seamless mouse without a guest driver" reason) does not
+// reliably honor SetCursorPos as a real warp while that device is active:
+// the host keeps reporting its own idea of the pointer's position
+// (approximately the gesture's start position) on the very next input
+// event, silently overriding our warp. The next WM_MOUSEMOVE delta then
+// gets computed against a cursor position nowhere near
+// session.state.startPt/the intended mirrored point, collapsing the
+// window toward zero size the instant Shift is pressed.
+//
+// Toggleable via systray regardless of the detected default -- some VMs
+// or configurations (relative PS/2 mouse, no absolute-pointing device)
+// won't actually exhibit the problem despite being detected as virtualized.
+var shiftMirrorResizeEnabled atomic.Bool
+
 /* ---------------- Utilities ---------------- */
 
 func getResizeZone(pt wincoe.POINT, r wincoe.RECT) int {
@@ -771,6 +796,16 @@ func handleShiftMirrorToggle(session *dragSession, cursorPt wincoe.POINT, shiftD
 	if shiftDown == session.shiftMirrorActive {
 		return nil // already in the requested state
 	}
+	if shiftDown && !shiftMirrorResizeEnabled.Load() {
+		// See the identical entry-direction-only gate and its doc comment
+		// in postShiftMirrorToggleIfNeeded -- this is the same check
+		// re-verified here in case a WM_APPLY_SHIFT_MIRROR entry message
+		// was already queued before the setting was toggled off. The
+		// absence of this check on the shiftDown==false path is what lets
+		// an already-mirrored session (started before the toggle) still
+		// unwind normally when Shift is released.
+		return nil
+	}
 
 	var liveRect wincoe.RECT
 	if res := wincoe.GetWindowRect(session.targetWnd, &liveRect); res.Failed() {
@@ -863,6 +898,18 @@ func postShiftMirrorToggleIfNeeded(intendedShiftDown bool) {
 	}
 	if session.shiftMirrorActive == intendedShiftDown {
 		return // already in the requested state, or OS key-repeat; avoid a redundant post
+	}
+	if intendedShiftDown && !shiftMirrorResizeEnabled.Load() {
+		// Entering mirror mode is disabled (see shiftMirrorResizeEnabled's
+		// doc comment, e.g. detected virtualization). Deliberately checked
+		// only for the ENTRY direction (intendedShiftDown == true): if a
+		// session is already mirrored -- reachable if the setting was on
+		// when it started, or got toggled off mid-resize -- the Shift
+		// RELEASE (intendedShiftDown == false) must still be allowed
+		// through so handleShiftMirrorToggle can unwind it properly rather
+		// than leaving the session stuck mirrored for the rest of the
+		// gesture.
+		return
 	}
 
 	msgHwnd := loadMainMsgHwnd()
@@ -1537,6 +1584,113 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	rid := *ridPtr
 
 	return rid, nil
+}
+
+/* ---------------- Virtualization Detection ---------------- */
+
+// vmRegistrySignatureSource identifies a single registry (path, valueName)
+// pair worth inspecting for hypervisor fingerprints. path is relative to
+// HKEY_LOCAL_MACHINE.
+type vmRegistrySignatureSource struct {
+	path  string
+	value string
+}
+
+// vmRegistrySignatureSources lists BIOS/firmware-identification registry
+// values that most common hypervisors (VirtualBox, VMware, Hyper-V,
+// QEMU/KVM, Xen, Parallels) rewrite to identify themselves to the guest
+// OS. Deliberately BIOS/firmware fingerprints rather than e.g. a
+// VBoxGuest/VBoxService registry-key presence check: those would only
+// catch a VirtualBox guest with Guest Additions installed, but the
+// absolute-pointing virtual USB-tablet device this detection exists for
+// (see shiftMirrorResizeEnabled's doc comment) is commonly present by
+// default in VirtualBox regardless of whether Guest Additions are
+// installed.
+//
+// None of these keys/values are guaranteed to exist -- a missing one is
+// the normal, expected case on real hardware (or a hypervisor that
+// doesn't rewrite that particular field) and is not treated as an error by
+// detectVirtualization, only as "no match here, try the next source".
+var vmRegistrySignatureSources = []vmRegistrySignatureSource{
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "SystemManufacturer"},
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "SystemProductName"},
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "SystemFamily"},
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "SystemVersion"},
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "BaseBoardManufacturer"},
+	{`HARDWARE\DESCRIPTION\System\BIOS`, "BaseBoardProduct"},
+	{`HARDWARE\DESCRIPTION\System`, "SystemBiosVersion"}, // typically REG_MULTI_SZ
+	{`HARDWARE\DESCRIPTION\System`, "VideoBiosVersion"},  // typically REG_MULTI_SZ
+}
+
+// vmSignatureSubstrings are matched case-insensitively against every
+// string value read from vmRegistrySignatureSources. "virtual machine"
+// covers both Hyper-V's and QEMU's common SystemProductName strings;
+// "innotek gmbh" is VirtualBox's legacy (pre-Oracle) BIOS vendor string,
+// still seen alongside the modern "VirtualBox" string on some installs.
+var vmSignatureSubstrings = []string{
+	"virtualbox",
+	"innotek gmbh",
+	"vmware",
+	"virtual machine",
+	"hyper-v",
+	"kvm",
+	"qemu",
+	"xen",
+	"parallels",
+}
+
+// matchVMSignature reports the first substring from vmSignatureSubstrings
+// found in s (case-insensitively), or "" if none match.
+func matchVMSignature(s string) string {
+	lower := strings.ToLower(s)
+	for _, sig := range vmSignatureSubstrings {
+		if strings.Contains(lower, sig) {
+			return sig
+		}
+	}
+	return ""
+}
+
+// detectVirtualization reports whether winbollocks appears to be running
+// inside a hypervisor guest, by inspecting BIOS/firmware-identification
+// registry values (see vmRegistrySignatureSources's doc comment for why
+// this approach was chosen over a Guest-Additions-presence check).
+//
+// A missing registry key/value anywhere in vmRegistrySignatureSources is
+// the ordinary case on real hardware and is silently treated as "no match
+// there, try the next source" rather than as a failure -- there is nothing
+// actionable to report from an absent optional BIOS field, and detection
+// failing entirely fails open to "not virtualized" (i.e. the pre-existing
+// default behavior), which is the safe direction for real-hardware users.
+//
+// evidence describes which specific (path, value) matched, purely for
+// diagnostic logging by the caller; it is empty when detected is false.
+func detectVirtualization() (detected bool, evidence string) {
+	for _, src := range vmRegistrySignatureSources {
+		k, err := registry.OpenKey(registry.LOCAL_MACHINE, src.path, registry.QUERY_VALUE)
+		if err != nil {
+			continue // key doesn't exist or isn't readable; not diagnostic, just try the next source
+		}
+
+		if s, _, err := k.GetStringValue(src.value); err == nil && s != "" {
+			if hit := matchVMSignature(s); hit != "" {
+				k.Close() //nolint:errcheck // best-effort close of a read-only registry key opened purely for this one-shot startup detection; nothing actionable follows a Close failure here
+				return true, fmt.Sprintf(`HKLM\%s\%s=%q (matched %q)`, src.path, src.value, s, hit)
+			}
+		}
+
+		if ss, _, err := k.GetStringsValue(src.value); err == nil {
+			for _, s := range ss {
+				if hit := matchVMSignature(s); hit != "" {
+					k.Close() //nolint:errcheck // see the comment on the identical Close() call above
+					return true, fmt.Sprintf(`HKLM\%s\%s=%q (matched %q, among %d value(s))`, src.path, src.value, s, hit, len(ss))
+				}
+			}
+		}
+
+		k.Close() //nolint:errcheck // see the comment on the identical Close() call above
+	}
+	return false, ""
 }
 
 /* ---------------- Tray ---------------- */
@@ -5248,6 +5402,21 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
+				var shiftMirrorFlags uint32 = wincoe.MF_STRING
+				if shiftMirrorResizeEnabled.Load() {
+					shiftMirrorFlags |= wincoe.MF_CHECKED
+				}
+				var shiftMirrorText string
+				if isVirtualized {
+					shiftMirrorText = "Shift-held resize cursor-warp accelerator (defaulted OFF: virtualization detected; host may fight the warp and instantly shrink the window)"
+				} else {
+					shiftMirrorText = "Shift-held resize cursor-warp accelerator (warps cursor to the opposite edge/corner mid-resize)"
+				}
+				appendMenuChecked(hMenu, shiftMirrorFlags,
+					MENU_TOGGLE_SHIFT_MIRROR_RESIZE, shiftMirrorText)
+			}
+
+			{
 				// Read-only diagnostic row, grayed/disabled so it can never
 				// be "selected" -- it's informational only. Recomputed
 				// fresh every time this menu is popped (this whole hMenu is
@@ -5425,6 +5594,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
 				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
+
+			case MENU_TOGGLE_SHIFT_MIRROR_RESIZE:
+				shiftMirrorResizeEnabled.Store(!shiftMirrorResizeEnabled.Load())
 
 			case MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS:
 				useThreadAttachInputForFocus.Store(!useThreadAttachInputForFocus.Load())
@@ -6352,6 +6524,16 @@ Since you are doing Win32 stuff (message loops, handles, etc.), here is what you
 
 		also don't use logf() here because it calls windows stuff to detect if it has console!
 */
+// isVirtualized and virtualizationEvidence are set once, in the same
+// init() as isAdmin below, for the identical ordering reason isAdmin's own
+// comment documents: shiftMirrorResizeEnabled's default depends on
+// isVirtualized, so detection must happen before that default is set. See
+// detectVirtualization's doc comment for what's actually being detected.
+var (
+	isVirtualized          bool
+	virtualizationEvidence string
+)
+
 var isAdmin bool // Package level
 func init() {
 	// This runs automatically before main()
@@ -6363,6 +6545,8 @@ func init() {
 	*/
 	token := windows.GetCurrentProcessToken()
 	isAdmin = token.IsElevated() // must init this before setting missedGestureRecoveryEnabled which depends on it, so either put it in same init() and do it first(like now), or put its init() before the init() of missedGestureRecoveryEnabled
+
+	isVirtualized, virtualizationEvidence = detectVirtualization() // must init this before setting shiftMirrorResizeEnabled below, same reasoning as isAdmin above
 
 	//defaults:
 	const bringToFrontByDefaultOnGesture = true
@@ -6398,6 +6582,8 @@ func init() {
 	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
 
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
+
+	shiftMirrorResizeEnabled.Store(!isVirtualized) // default off under a detected hypervisor guest; see its own doc comment
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -7021,6 +7207,11 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	startupTerminalHwnd = getForegroundWindow()
 
 	logf("Started %s %s", selfName, GetVersion())
+	if isVirtualized {
+		logf("Detected running under virtualization (%s); Shift-mirror resize cursor-warp accelerator defaults to disabled (toggle via systray if you find it actually works fine for you)", virtualizationEvidence)
+	} else {
+		logf("No virtualization signature detected; Shift-mirror resize cursor-warp accelerator defaults to enabled")
+	}
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
 
 	if writeProfile {
