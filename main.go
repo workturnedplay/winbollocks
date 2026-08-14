@@ -263,6 +263,7 @@ const (
 	MENU_SHOW_INPUT_STATE                          = 19
 	MENU_TOGGLE_SHIFT_MIRROR_RESIZE                = 20
 	MENU_TOGGLE_RADIAL_CENTER_RESIZE               = 21
+	MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE           = 22
 )
 
 const (
@@ -704,6 +705,22 @@ var shiftMirrorResizeEnabled atomic.Bool
 //
 // Shift-mirror is never used in ZONE_CENTER regardless of this flag.
 var radialCenterResizeEnabled atomic.Bool
+
+// allowShiftHeldBeforeResizeGesture gates whether Shift may already be
+// held when winkey+RMB starts a resize (i.e. shift+winkey+RMB):
+//
+//	true (default): start the resize and apply the Shift effect immediately
+//	— edge/corner zones get shift-mirror (resize begins from the opposite
+//	edge/corner; releasing Shift does not warp back to the pre-start point,
+//	because there was no pre-mirror baseline from a mid-gesture toggle),
+//	center+radial gets centerShrinkActive seeded so the drag shrinks.
+//
+//	false: require Shift up at RMB-down (original behavior); shift+winkey+RMB
+//	does not start a resize gesture.
+//
+// Mid-gesture Shift press/release is unaffected either way (shift-mirror /
+// radial shrink still work once a resize is already active).
+var allowShiftHeldBeforeResizeGesture atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -3833,9 +3850,10 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							} else {
 								logf("failed to begin Move gesture(the why should be above ^) while trying to start it as recovery")
 							}
-						case keyDown(wincoe.VK_RBUTTON):
-							// Shift may already be held (shift+winkey+RMB); same
-							// as the real WM_RBUTTONDOWN path below.
+						case keyDown(wincoe.VK_RBUTTON) && (!shiftDown || allowShiftHeldBeforeResizeGesture.Load()):
+							// Shift may already be held (shift+winkey+RMB) when
+							// allowShiftHeldBeforeResizeGesture is on; same as
+							// the real WM_RBUTTONDOWN path below.
 							started, bypassed := tryBeginResizeGestureAt(info.Pt, true, shiftDown)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
@@ -4216,11 +4234,14 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// var shiftDown bool = keyDown(VK_SHIFT)
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
-		// Winkey+RMB starts resize; Shift may already be held (same end
-		// state as winkey+RMB then pressing Shift): edge/corner →
-		// shift-mirror, center+radial → shrink polarity. Alt/Ctrl still
+		// Winkey+RMB starts resize. When allowShiftHeldBeforeResizeGesture
+		// is on (default), Shift may already be held (same end state as
+		// winkey+RMB then pressing Shift): edge/corner → shift-mirror,
+		// center+radial → shrink polarity. When off, Shift held at
+		// RMB-down blocks the gesture (original behavior). Alt/Ctrl still
 		// disqualify so we don't steal e.g. Win+Shift+Ctrl chords.
-		if winDown && !altDown && !ctrlDown {
+		shiftOk := !shiftDown || allowShiftHeldBeforeResizeGesture.Load()
+		if winDown && !altDown && !ctrlDown && shiftOk {
 			started, bypassed := tryBeginResizeGestureAt(info.Pt, false, shiftDown)
 			if bypassed {
 				break // target is fullscreen; let event through
@@ -4235,6 +4256,10 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				// centerShrinkActive inside tryBeginResizeGestureAt so the
 				// drag shrinks from the first mouse move without relying
 				// on a later key-transition or live GetAsyncKeyState.
+				// Note: starting already-mirrored means there is no
+				// pre-mirror baseline, so releasing Shift will not return
+				// the cursor to the physical start point — intentional
+				// for now (see allowShiftHeldBeforeResizeGesture).
 				if sess := activeSession.Load(); sess != nil && sess.resizeZone != ZONE_CENTER {
 					postShiftMirrorToggleIfNeeded(true)
 				}
@@ -5595,6 +5620,16 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
+				var shiftBeforeFlags uint32 = wincoe.MF_STRING
+				if allowShiftHeldBeforeResizeGesture.Load() {
+					shiftBeforeFlags |= wincoe.MF_CHECKED
+				}
+				shiftBeforeText := "Allow Shift held before Win+RMB to start resize (shift+winkey+RMB; corners start mirrored from opposite edge)"
+				appendMenuChecked(hMenu, shiftBeforeFlags,
+					MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE, shiftBeforeText)
+			}
+
+			{
 				// Read-only diagnostic row, grayed/disabled so it can never
 				// be "selected" -- it's informational only. Recomputed
 				// fresh every time this menu is popped (this whole hMenu is
@@ -5778,6 +5813,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			case MENU_TOGGLE_RADIAL_CENTER_RESIZE:
 				radialCenterResizeEnabled.Store(!radialCenterResizeEnabled.Load())
+
+			case MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE:
+				allowShiftHeldBeforeResizeGesture.Store(!allowShiftHeldBeforeResizeGesture.Load())
 
 			case MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS:
 				useThreadAttachInputForFocus.Store(!useThreadAttachInputForFocus.Load())
@@ -6765,6 +6803,7 @@ func init() {
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
 
 	shiftMirrorResizeEnabled.Store(!isVirtualized) // default off under a detected hypervisor guest; see its own doc comment
+	allowShiftHeldBeforeResizeGesture.Store(true)  // default on; shift+winkey+RMB starts resize with Shift effect applied
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
