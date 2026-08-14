@@ -2269,9 +2269,15 @@ func reassertGestureCursorSetCursor(h windows.Handle) {
 	_ = wincoe.SetCursor(h)
 }
 
+// gestureCursorTimerArmed tracks whether we successfully started the reassert
+// timer. stopGestureCursorTimer only calls KillTimer when this is true, so the
+// double clearGestureCursor path (softReset + WM_DO_RELEASE_CAPTURE) does not
+// spam "KillTimer failed" for an already-dead timer.
+var gestureCursorTimerArmed atomic.Bool
+
 // startGestureCursorTimer arms a 16ms WM_TIMER on mainMsgHwnd so SetCursor is
 // reasserted even when the mouse is still (or the target outpaces our move drain).
-// Idempotent: SetTimer with the same id resets the interval.
+// Idempotent: SetTimer with the same id resets the interval; armed stays true.
 func startGestureCursorTimer() {
 	msgHwnd := loadMainMsgHwnd()
 	if msgHwnd == 0 {
@@ -2279,23 +2285,34 @@ func startGestureCursorTimer() {
 	}
 	if _, res := wincoe.SetTimer(msgHwnd, gestureCursorTimerID, gestureCursorTimerMs, 0); res.Failed() {
 		logf("startGestureCursorTimer: SetTimer failed: %v", res.Err)
+		return
 	}
+	gestureCursorTimerArmed.Store(true)
 }
 
-// stopGestureCursorTimer kills the reassert timer. Safe if the timer was never started.
+// stopGestureCursorTimer kills the reassert timer if we previously armed it.
+// Idempotent and silent when the timer was never started or already stopped —
+// that is the normal path when softReset and WM_DO_RELEASE_CAPTURE both clear.
 func stopGestureCursorTimer() {
+	if !gestureCursorTimerArmed.CompareAndSwap(true, false) {
+		return
+	}
 	msgHwnd := loadMainMsgHwnd()
 	if msgHwnd == 0 {
+		// Window already gone; timer dies with it. armed already cleared above.
 		return
 	}
 	if res := wincoe.KillTimer(msgHwnd, gestureCursorTimerID); res.Failed() {
-		// Timer may already be gone (e.g. window destroyed); not worth more than a debug-ish log.
+		// Only log when we believed the timer was live: genuine failure, not
+		// a double-stop. Still not fatal — worst case a few extra WM_TIMERs
+		// until the window is destroyed.
 		logf("stopGestureCursorTimer: KillTimer failed: %v", res.Err)
 	}
 }
 
 // clearGestureCursor restores all system cursors (SPI_SETCURSORS) and stops the
-// reassert timer. Idempotent for the system-cursor side; always attempts KillTimer.
+// reassert timer. Fully idempotent: safe to call from both softReset and
+// WM_DO_RELEASE_CAPTURE without log spam.
 func clearGestureCursor() {
 	stopGestureCursorTimer()
 	if !gestureSystemCursorActive.CompareAndSwap(true, false) {
