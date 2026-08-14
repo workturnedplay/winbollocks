@@ -7,8 +7,3 @@ dontfix:
 
 
 done:
-
-//* make all proc*() to resolve the DLLs early and not be lazy!!! else they might happen to take long time on first use and/or might clobber the lasterr somehow(unlikely, if using only the 3rd arg returned via LazyProc.Call())
-
-//* move all proc*() from winbollocks and dnsbollocks into wincoe, and all wrappers for them.
-

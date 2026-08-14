@@ -2105,6 +2105,98 @@ func updateTrayTooltipInputStateIfChanged() {
 	}
 }
 
+/* ---------------- Gesture cursors ---------------- */
+
+// Shared system cursor handles, loaded once in initGestureCursors.
+// LoadCursorW(NULL, IDC_*) returns OS-owned shared cursors — never DestroyCursor.
+var (
+	cursorArrow windows.Handle
+	cursorMove  windows.Handle // IDC_SIZEALL
+	cursorNWSE  windows.Handle // IDC_SIZENWSE  \
+	cursorNESW  windows.Handle // IDC_SIZENESW  /
+	cursorNS    windows.Handle // IDC_SIZENS
+	cursorWE    windows.Handle // IDC_SIZEWE
+)
+
+// initGestureCursors loads the system cursors used during move/resize gestures.
+// Failures are logged; missing handles simply mean applyGestureCursor becomes a no-op
+// for that shape (Windows keeps whatever cursor was last set).
+func initGestureCursors() {
+	load := func(id uintptr, name string) windows.Handle {
+		h, res := wincoe.LoadCursor(0, id)
+		if res.Failed() || h == 0 {
+			logf("initGestureCursors: LoadCursor(%s) failed: %v", name, res.Err)
+			return 0
+		}
+		return h
+	}
+	cursorArrow = load(wincoe.IDC_ARROW, "IDC_ARROW")
+	cursorMove = load(wincoe.IDC_SIZEALL, "IDC_SIZEALL")
+	cursorNWSE = load(wincoe.IDC_SIZENWSE, "IDC_SIZENWSE")
+	cursorNESW = load(wincoe.IDC_SIZENESW, "IDC_SIZENESW")
+	cursorNS = load(wincoe.IDC_SIZENS, "IDC_SIZENS")
+	cursorWE = load(wincoe.IDC_SIZEWE, "IDC_SIZEWE")
+}
+
+// cursorForSession returns the HCURSOR appropriate for the active gesture.
+// Opposing resize zones share one dual-direction icon (e.g. TL and BR both
+// use IDC_SIZENWSE), so Shift-mirror mid-gesture never needs a shape change
+// solely because the zone flipped — the icon already encodes both directions.
+// ZONE_CENTER: radial mode → four-way (omnidirectional); default geometric-
+// mean mode → NWSE (anti-diagonal bias matches the geometry).
+func cursorForSession(s *dragSession) windows.Handle {
+	if s == nil {
+		return cursorArrow
+	}
+	if s.mode == ModeMove {
+		return cursorMove
+	}
+	// ModeResize
+	switch s.resizeZone {
+	case ZONE_TOP_LEFT, ZONE_BOT_RIGHT:
+		return cursorNWSE
+	case ZONE_TOP_RIGHT, ZONE_BOT_LEFT:
+		return cursorNESW
+	case ZONE_TOP_CENTER, ZONE_BOT_CENTER:
+		return cursorNS
+	case ZONE_MID_LEFT, ZONE_MID_RIGHT:
+		return cursorWE
+	case ZONE_CENTER:
+		if radialCenterResizeEnabled.Load() {
+			return cursorMove
+		}
+		return cursorNWSE
+	default:
+		return cursorArrow
+	}
+}
+
+// applyGestureCursor forces the move/resize cursor shape. Must be re-applied
+// on every WM_MOUSEMOVE while a session is active: target windows keep
+// restoring their own cursor via WM_SETCURSOR, and a low-level mouse hook
+// does not suppress that. Safe from the hook thread; no allocations.
+//
+// SetCursor returns only the previous HCURSOR (0 is legitimate) and has no
+// failure signal — same model as SetCapture — so the return is intentionally
+// discarded here; we only need to force the shape.
+func applyGestureCursor(s *dragSession) {
+	h := cursorForSession(s)
+	if h == 0 {
+		return
+	}
+	_ = wincoe.SetCursor(h)
+}
+
+// clearGestureCursor restores the standard arrow after a gesture ends.
+// softReset is the single teardown path for every exit (button-up, winkey-up,
+// ESC cancel, UIPI block, WTS lock, etc.), so one call site is enough.
+func clearGestureCursor() {
+	if cursorArrow == 0 {
+		return
+	}
+	_ = wincoe.SetCursor(cursorArrow)
+}
+
 /* ---------------- Drag Logic ---------------- */
 
 func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery, wasMaximized bool, preRestoreRect wincoe.RECT) bool {
@@ -2154,7 +2246,7 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		}
 	}
 
-	activeSession.Store(&dragSession{
+	sess := &dragSession{
 		targetWnd:                hwnd,
 		mode:                     ModeMove,
 		state:                    dragState{startPt: pt, startRect: r},
@@ -2162,7 +2254,9 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		wasMaximizedAtStart:      wasMaximized,
 		originalRect:             r,
 		originalPt:               pt,
-	})
+	}
+	activeSession.Store(sess)
+	applyGestureCursor(sess)
 	return true
 }
 
@@ -2440,7 +2534,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 	// (shift+winkey+RMB). Edge/corner zones ignore this field; they use
 	// shift-mirror via postShiftMirrorToggleIfNeeded after we return.
 	centerShrink := shiftDown && zone == ZONE_CENTER && radialCenterResizeEnabled.Load()
-	activeSession.Store(&dragSession{
+	sess := &dragSession{
 		targetWnd: wantTargetWnd,
 		mode:      ModeResize,
 		state:     dragState{startPt: pt, startRect: r},
@@ -2452,7 +2546,9 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		originalRect:             r,
 		originalPt:               pt,
 		centerShrinkActive:       centerShrink,
-	})
+	}
+	activeSession.Store(sess)
+	applyGestureCursor(sess)
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
 	// 	panic("bad coding: nil session after storing new resize session")
@@ -2715,6 +2811,7 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	//do this first
 	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
 	captureHeldForSession.Store(nil)
+	clearGestureCursor() // stop forcing the move/resize shape so normal WM_SETCURSOR behavior resumes
 	msgHwnd := loadMainMsgHwnd()
 	/*
 		The Problem: If you call it in the hook, you are releasing capture on the Hook Thread. But window capture is thread-specific.
@@ -3906,6 +4003,11 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				break // No drag or resize is active (and nothing to recover), do nothing!
 			}
 		}
+		// Re-assert the gesture cursor every move: DefWindowProc / the target
+		// window keep applying their own cursor via WM_SETCURSOR. Opposing
+		// zones share the same dual-direction icon, so Shift-mirror does not
+		// need a separate shape update beyond this per-move refresh.
+		applyGestureCursor(session)
 		switch session.mode {
 		case ModeMove:
 			if requireWinDownHeldDuringGesture.Load() {
@@ -7433,6 +7535,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		logf("No virtualization signature detected; Shift-mirror resize cursor-warp accelerator defaults to enabled")
 	}
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
+	initGestureCursors()
 
 	if writeProfile {
 		// In main(), before the GetMessage loop:
