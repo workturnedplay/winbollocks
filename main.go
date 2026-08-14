@@ -521,6 +521,16 @@ type dragSession struct {
 	shiftMirrorActive bool
 	mirrorReturnZone  int
 	mirrorReturnPt    wincoe.POINT
+
+	// centerShrinkActive is the Shift polarity for ZONE_CENTER when
+	// radialCenterResizeEnabled is on: false = distance grows, true =
+	// distance shrinks. Set at gesture start if Shift was already held
+	// (shift+winkey+RMB), and updated on every real Shift transition via
+	// WM_APPLY_SHIFT_MIRROR (which replaces activeSession with a copy that
+	// has this field flipped — same RCU pattern as shift-mirror). Mouse-
+	// move resize reads THIS field rather than live GetAsyncKeyState so a
+	// Shift held before the gesture still takes effect for the whole drag.
+	centerShrinkActive bool
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -2306,7 +2316,13 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 // used by both the real WM_RBUTTONDOWN handler and the missed-gesture
 // recovery path from WM_MOUSEMOVE. See tryBeginMoveGestureAt's doc comment
 // for the (started, bypassed) return-value contract.
-func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (started, bypassed bool) {
+//
+// shiftDown is the caller's already-sampled Shift state at the moment the
+// gesture is requested (e.g. from modifierKeyState on WM_RBUTTONDOWN). When
+// true and the hit zone is ZONE_CENTER with radial mode on, the new session
+// starts with centerShrinkActive set so the drag shrinks without requiring
+// a later Shift key-transition event.
+func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool, shiftDown bool) (started, bypassed bool) {
 	wantTargetWnd, res0 := wincoe.RootWindowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window(tryBeginMoveGestureAt:RootWindowFromPoint res:%v), window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)", res0)
@@ -2402,17 +2418,23 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (st
 		logf("Refusing resize start: invalid window size %dx%d gotten for target HWND=0x%X", w, h, wantTargetWnd)
 		return false, false
 	}
+	zone := getResizeZone(pt, r)
+	// Seed radial shrink polarity when Shift is already held at start
+	// (shift+winkey+RMB). Edge/corner zones ignore this field; they use
+	// shift-mirror via postShiftMirrorToggleIfNeeded after we return.
+	centerShrink := shiftDown && zone == ZONE_CENTER && radialCenterResizeEnabled.Load()
 	activeSession.Store(&dragSession{
 		targetWnd: wantTargetWnd,
 		mode:      ModeResize,
 		state:     dragState{startPt: pt, startRect: r},
 
-		resizeZone:               getResizeZone(pt, r),
+		resizeZone:               zone,
 		initialAspectRatio:       float64(w) / float64(h),
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 		wasMaximizedAtStart:      wasMaximized,
 		originalRect:             r,
 		originalPt:               pt,
+		centerShrinkActive:       centerShrink,
 	})
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
@@ -3814,15 +3836,19 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 						case keyDown(wincoe.VK_RBUTTON):
 							// Shift may already be held (shift+winkey+RMB); same
 							// as the real WM_RBUTTONDOWN path below.
-							started, bypassed := tryBeginResizeGestureAt(info.Pt, true)
+							started, bypassed := tryBeginResizeGestureAt(info.Pt, true, shiftDown)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
 							}
 							markGestureUsedOnce()
 							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
 							if started {
+								// Edge/corner: apply shift-mirror. Center+radial
+								// already seeded centerShrinkActive in tryBeginResizeGestureAt.
 								if shiftDown {
-									postShiftMirrorToggleIfNeeded(true)
+									if sess := activeSession.Load(); sess != nil && sess.resizeZone != ZONE_CENTER {
+										postShiftMirrorToggleIfNeeded(true)
+									}
 								}
 								// See the identical comment in the LMB/ModeMove case above.
 								if injectButtonUpOnMissedGestureRecovery.Load() {
@@ -4075,13 +4101,12 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// zone (original or mirrored) is currently active by the time
 			// any WM_MOUSEMOVE is processed.
 			if !ShouldThrottle() {
-				// Shift state for radial center-resize; edge/corner zones
-				// ignore it (mirror is driven by key-transition posts).
-				// Reading GetAsyncKeyState here is fine: we are on a mouse
-				// event, not inside the Shift key-transition callback where
-				// the async state can lag the event being handled.
-				shiftDown := keyDown(wincoe.VK_SHIFT)
-				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone, shiftDown) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
+				// Radial center shrink polarity comes from the session
+				// (seeded at gesture start if Shift was already held, and
+				// updated on Shift transitions via WM_APPLY_SHIFT_MIRROR),
+				// not from live GetAsyncKeyState — so shift+winkey+RMB
+				// shrinks for the whole drag. Edge/corner zones ignore it.
+				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone, session.centerShrinkActive) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
 				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 				if asyncResize.Load() {
 					flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -4196,7 +4221,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// shift-mirror, center+radial → shrink polarity. Alt/Ctrl still
 		// disqualify so we don't steal e.g. Win+Shift+Ctrl chords.
 		if winDown && !altDown && !ctrlDown {
-			started, bypassed := tryBeginResizeGestureAt(info.Pt, false)
+			started, bypassed := tryBeginResizeGestureAt(info.Pt, false, shiftDown)
 			if bypassed {
 				break // target is fullscreen; let event through
 			}
@@ -4205,10 +4230,14 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			if !started {
 				logf("Failed to begin Resize gesture (reason why should be above ^) on winkey+RMB pressed")
 			} else if shiftDown {
-				// Match "winkey+RMB, then Shift becomes held": post the
-				// same transition the keyboard hook would have sent on a
-				// real Shift-down after the gesture was already active.
-				postShiftMirrorToggleIfNeeded(true)
+				// Edge/corner: apply shift-mirror as if Shift was pressed
+				// after winkey+RMB. Center+radial already seeded
+				// centerShrinkActive inside tryBeginResizeGestureAt so the
+				// drag shrinks from the first mouse move without relying
+				// on a later key-transition or live GetAsyncKeyState.
+				if sess := activeSession.Load(); sess != nil && sess.resizeZone != ZONE_CENTER {
+					postShiftMirrorToggleIfNeeded(true)
+				}
 			}
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
@@ -5135,14 +5164,25 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		}
 
 		// Center zone: shift-mirror is a no-op. When radial center-resize
-		// is enabled, re-apply size from the current cursor with the new
-		// Shift polarity so pressing/releasing Shift takes effect even
-		// without further mouse motion.
+		// is enabled, publish the new shrink polarity onto a replacement
+		// session (RCU — never mutate the live struct) and re-apply size
+		// from the current cursor so pressing/releasing Shift takes effect
+		// even without further mouse motion.
 		if session.resizeZone == ZONE_CENTER {
 			if !radialCenterResizeEnabled.Load() {
 				return 0
 			}
-			nx, ny, nw, nh := calculateResize(session, cursorPt, ZONE_CENTER, shiftDown)
+			if session.centerShrinkActive == shiftDown {
+				// Redundant post (e.g. auto-repeat) or already seeded at
+				// gesture start with this polarity; still re-apply size in
+				// case the cursor moved since, but skip the Store.
+			} else {
+				next := *session
+				next.centerShrinkActive = shiftDown
+				activeSession.Store(&next)
+				session = &next
+			}
+			nx, ny, nw, nh := calculateResize(session, cursorPt, ZONE_CENTER, session.centerShrinkActive)
 			flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 			if asyncResize.Load() {
 				flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -8540,9 +8580,11 @@ func closeHandleLogged(h *windows.Handle, context2 string) {
 
 func modifierKeyState() (winDown, shiftDown, ctrlDown, altDown bool) {
 	winDown = keyDown(wincoe.VK_LWIN) || keyDown(wincoe.VK_RWIN)
-	shiftDown = keyDown(wincoe.VK_SHIFT)
-	ctrlDown = keyDown(wincoe.VK_CONTROL)
-	altDown = keyDown(wincoe.VK_MENU)
+	// Check generic + left/right: some paths only light up one of them
+	// (same rationale as keyboardProc's Shift VK handling).
+	shiftDown = keyDown(wincoe.VK_SHIFT) || keyDown(wincoe.VK_LSHIFT) || keyDown(wincoe.VK_RSHIFT)
+	ctrlDown = keyDown(wincoe.VK_CONTROL) || keyDown(wincoe.VK_LCONTROL) || keyDown(wincoe.VK_RCONTROL)
+	altDown = keyDown(wincoe.VK_MENU) || keyDown(wincoe.VK_LMENU) || keyDown(wincoe.VK_RMENU)
 	return
 }
 
