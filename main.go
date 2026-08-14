@@ -240,6 +240,14 @@ const (
 	WM_DO_RELEASE_CAPTURE = wincoe.WM_USER + 215
 	WM_CANCEL_GESTURE     = wincoe.WM_USER + 220
 	WM_APPLY_SHIFT_MIRROR = wincoe.WM_USER + 225
+
+	// gestureCursorTimerID is the SetTimer nIDEvent used to reassert SetCursor
+	// while a move/resize is active (fights apps that force a private cursor
+	// every mouse message — Electron/VS Code, mintty/git-bash, etc.).
+	gestureCursorTimerID = 1
+	// gestureCursorTimerMs is the reassert interval. 16ms ≈ 60Hz is enough to
+	// win the race against most targets without measurable CPU cost.
+	gestureCursorTimerMs = 16
 )
 const (
 	MENU_EXIT                                      = 1
@@ -2107,16 +2115,25 @@ func updateTrayTooltipInputStateIfChanged() {
 
 /* ---------------- Gesture cursors ---------------- */
 
-// Shared system cursor handles, loaded once in initGestureCursors.
+// Shared system cursor templates, loaded once in initGestureCursors.
 // LoadCursorW(NULL, IDC_*) returns OS-owned shared cursors — never DestroyCursor.
+// SetSystemCursor destroys the handle it receives, so we always CopyIcon first.
 var (
-	cursorArrow windows.Handle
-	cursorMove  windows.Handle // IDC_SIZEALL
-	cursorNWSE  windows.Handle // IDC_SIZENWSE  \
-	cursorNESW  windows.Handle // IDC_SIZENESW  /
-	cursorNS    windows.Handle // IDC_SIZENS
-	cursorWE    windows.Handle // IDC_SIZEWE
+	cursorMove windows.Handle // IDC_SIZEALL
+	cursorNWSE windows.Handle // IDC_SIZENWSE  \
+	cursorNESW windows.Handle // IDC_SIZENESW  /
+	cursorNS   windows.Handle // IDC_SIZENS
+	cursorWE   windows.Handle // IDC_SIZEWE
 )
+
+// gestureSystemCursorActive is true while OCR_NORMAL has been replaced via
+// SetSystemCursor. Must be restored with SPI_SETCURSORS on every exit path
+// (including process teardown), or the user's arrow stays wrong until logoff.
+var gestureSystemCursorActive atomic.Bool
+
+// gestureSystemCursorShape is the shared template handle last installed into
+// OCR_NORMAL. Used to skip redundant SetSystemCursor when the shape is unchanged.
+var gestureSystemCursorShape atomic.Uintptr
 
 // initGestureCursors loads the system cursors used during move/resize gestures.
 // Failures are logged; missing handles simply mean applyGestureCursor becomes a no-op
@@ -2130,7 +2147,6 @@ func initGestureCursors() {
 		}
 		return h
 	}
-	cursorArrow = load(wincoe.IDC_ARROW, "IDC_ARROW")
 	cursorMove = load(wincoe.IDC_SIZEALL, "IDC_SIZEALL")
 	cursorNWSE = load(wincoe.IDC_SIZENWSE, "IDC_SIZENWSE")
 	cursorNESW = load(wincoe.IDC_SIZENESW, "IDC_SIZENESW")
@@ -2138,7 +2154,7 @@ func initGestureCursors() {
 	cursorWE = load(wincoe.IDC_SIZEWE, "IDC_SIZEWE")
 }
 
-// cursorForSession returns the HCURSOR appropriate for the active gesture.
+// cursorForSession returns the shared template HCURSOR for the active gesture.
 // Opposing resize zones share one dual-direction icon (e.g. TL and BR both
 // use IDC_SIZENWSE), so Shift-mirror mid-gesture never needs a shape change
 // solely because the zone flipped — the icon already encodes both directions.
@@ -2146,7 +2162,7 @@ func initGestureCursors() {
 // mean mode → NWSE (anti-diagonal bias matches the geometry).
 func cursorForSession(s *dragSession) windows.Handle {
 	if s == nil {
-		return cursorArrow
+		return 0
 	}
 	if s.mode == ModeMove {
 		return cursorMove
@@ -2167,41 +2183,128 @@ func cursorForSession(s *dragSession) windows.Handle {
 		}
 		return cursorNWSE
 	default:
-		return cursorArrow
+		return 0
 	}
 }
 
-// applyGestureCursor forces the move/resize cursor shape.
+// ocrIDsToReplace lists every common system cursor slot we overwrite with the
+// gesture shape. Apps that LoadCursor(NULL, IDC_*) for any of these then get
+// our cursor. Apps that use private CreateCursor/LoadImage handles still need
+// the SetCursor reassert path (see reassertGestureCursorSetCursor).
+var ocrIDsToReplace = [...]uint32{
+	wincoe.OCR_NORMAL,
+	wincoe.OCR_IBEAM,
+	wincoe.OCR_WAIT,
+	wincoe.OCR_CROSS,
+	wincoe.OCR_UP,
+	wincoe.OCR_SIZENWSE,
+	wincoe.OCR_SIZENESW,
+	wincoe.OCR_SIZEWE,
+	wincoe.OCR_SIZENS,
+	wincoe.OCR_SIZEALL,
+	wincoe.OCR_NO,
+	wincoe.OCR_HAND,
+	wincoe.OCR_APPSTARTING,
+}
+
+// applyGestureCursor forces the move/resize cursor shape system-wide by
+// replacing the common OCR_* system cursor slots via SetSystemCursor, and
+// starts a short-interval timer that reasserts SetCursor while capture is held.
 //
-// MUST be called from the main thread while it holds mouse capture (or owns
-// the window under the cursor). MSDN: SetCursor has no effect if the mouse is
-// not captured AND is not over a window of the calling thread. Our WH_MOUSE_LL
-// hook runs on the hook thread, which neither owns the target window nor holds
-// capture (SetCapture is taken on mainMsgHwnd from handleActualMoveOrResize),
-// so calling this from mouseProc is a guaranteed no-op — do not put it there.
+// Two layers, because neither alone covers every target:
 //
-// Call sites: handleActualMoveOrResize (after SetCapture) and wndProc's
-// WM_SETCURSOR handler. SetCursor returns only the previous HCURSOR (0 is
-// legitimate) with no failure signal — same model as SetCapture — so the
-// return is intentionally discarded; we only need to force the shape.
+//  1. SetSystemCursor — apps that load system cursors (Task Manager, conhost,
+//     Firefox, …) pick up our shape automatically.
+//  2. SetCursor reassert under capture — apps with private cursors
+//     (Electron/VS Code, mintty/git-bash, …) call SetCursor every move; we
+//     race them from the main thread that holds capture. Last SetCursor wins
+//     for that frame; a 16ms timer keeps us competitive without relying only
+//     on move-drain frequency.
+//
+// Pair every successful install with clearGestureCursor / SPI_SETCURSORS or
+// the system cursors stay wrong until logoff.
 func applyGestureCursor(s *dragSession) {
 	h := cursorForSession(s)
+	if h == 0 {
+		return
+	}
+	if gestureSystemCursorActive.Load() && windows.Handle(gestureSystemCursorShape.Load()) == h {
+		// Shape already installed; still reassert SetCursor (private-cursor apps).
+		reassertGestureCursorSetCursor(h)
+		return
+	}
+
+	anyOK := false
+	for _, id := range ocrIDsToReplace {
+		copyy, res := wincoe.CopyIcon(h)
+		if res.Failed() || copyy == 0 {
+			logf("applyGestureCursor: CopyIcon failed for OCR=0x%x: %v", id, res.Err)
+			continue
+		}
+		// SetSystemCursor takes ownership of copy and destroys it.
+		if res2 := wincoe.SetSystemCursor(copyy, id); res2.Failed() {
+			logf("applyGestureCursor: SetSystemCursor(OCR=0x%x) failed: %v", id, res2.Err)
+			continue
+		}
+		anyOK = true
+	}
+	if !anyOK {
+		logf("applyGestureCursor: every SetSystemCursor attempt failed; falling back to SetCursor-only")
+	} else {
+		gestureSystemCursorShape.Store(uintptr(h))
+		gestureSystemCursorActive.Store(true)
+	}
+
+	reassertGestureCursorSetCursor(h)
+	startGestureCursorTimer()
+}
+
+// reassertGestureCursorSetCursor calls SetCursor with the gesture shape.
+// Effective only when the calling thread holds mouse capture (or owns the
+// window under the cursor). Used from main-thread paths after SetCapture.
+func reassertGestureCursorSetCursor(h windows.Handle) {
 	if h == 0 {
 		return
 	}
 	_ = wincoe.SetCursor(h)
 }
 
-// clearGestureCursor restores the standard arrow after a gesture ends.
-// Prefer calling this from the main thread (same SetCursor thread-affinity
-// rule as applyGestureCursor). softReset may run on the hook thread; in that
-// case the call is a no-op, and ReleaseCapture + the next natural WM_SETCURSOR
-// to whatever is under the mouse restores the correct shape anyway.
-func clearGestureCursor() {
-	if cursorArrow == 0 {
+// startGestureCursorTimer arms a 16ms WM_TIMER on mainMsgHwnd so SetCursor is
+// reasserted even when the mouse is still (or the target outpaces our move drain).
+// Idempotent: SetTimer with the same id resets the interval.
+func startGestureCursorTimer() {
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
 		return
 	}
-	_ = wincoe.SetCursor(cursorArrow)
+	if _, res := wincoe.SetTimer(msgHwnd, gestureCursorTimerID, gestureCursorTimerMs, 0); res.Failed() {
+		logf("startGestureCursorTimer: SetTimer failed: %v", res.Err)
+	}
+}
+
+// stopGestureCursorTimer kills the reassert timer. Safe if the timer was never started.
+func stopGestureCursorTimer() {
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		return
+	}
+	if res := wincoe.KillTimer(msgHwnd, gestureCursorTimerID); res.Failed() {
+		// Timer may already be gone (e.g. window destroyed); not worth more than a debug-ish log.
+		logf("stopGestureCursorTimer: KillTimer failed: %v", res.Err)
+	}
+}
+
+// clearGestureCursor restores all system cursors (SPI_SETCURSORS) and stops the
+// reassert timer. Idempotent for the system-cursor side; always attempts KillTimer.
+func clearGestureCursor() {
+	stopGestureCursorTimer()
+	if !gestureSystemCursorActive.CompareAndSwap(true, false) {
+		return
+	}
+	gestureSystemCursorShape.Store(0)
+	if res := wincoe.SystemParametersInfo(wincoe.SPI_SETCURSORS, 0, nil, 0); res.Failed() {
+		logf("clearGestureCursor: SystemParametersInfo(SPI_SETCURSORS) failed: %v — system arrow may stay wrong until logoff", res.Err)
+	}
 }
 
 /* ---------------- Drag Logic ---------------- */
@@ -2263,9 +2366,9 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		originalPt:               pt,
 	}
 	activeSession.Store(sess)
-	// Cursor is applied on the main thread once capture is taken (see
-	// handleActualMoveOrResize / WM_SETCURSOR) — SetCursor from the hook
-	// thread has no effect while the mouse is over another process's window.
+	// SetSystemCursor is global (no thread-affinity); apply immediately so
+	// the shape changes on button-down, not only after the first move drain.
+	applyGestureCursor(sess)
 	return true
 }
 
@@ -2557,9 +2660,9 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		centerShrinkActive:       centerShrink,
 	}
 	activeSession.Store(sess)
-	// Cursor is applied on the main thread once capture is taken (see
-	// handleActualMoveOrResize / WM_SETCURSOR) — SetCursor from the hook
-	// thread has no effect while the mouse is over another process's window.
+	// SetSystemCursor is global (no thread-affinity); apply immediately so
+	// the shape changes on button-down, not only after the first move drain.
+	applyGestureCursor(sess)
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
 	// 	panic("bad coding: nil session after storing new resize session")
@@ -5230,6 +5333,23 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			return 1 // TRUE: cursor handled
 		}
 		// No active gesture: let DefWindowProc set the class cursor.
+		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
+
+	case wincoe.WM_TIMER:
+		// Periodic SetCursor reassert while a gesture is active. Needed for
+		// targets that force a private cursor every mouse message (VS Code,
+		// mintty/git-bash, …): last SetCursor wins, so we keep re-stating ours
+		// from the capture-holding main thread at ~60Hz.
+		if wParam == gestureCursorTimerID {
+			if session := activeSession.Load(); session != nil {
+				reassertGestureCursorSetCursor(cursorForSession(session))
+			} else {
+				// Session ended without killing the timer (shouldn't happen if
+				// clearGestureCursor always runs); self-heal.
+				stopGestureCursorTimer()
+			}
+			return 0
+		}
 		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
 
 	case WM_HIDE_OVERLAY:
