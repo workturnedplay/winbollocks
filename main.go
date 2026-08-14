@@ -2171,14 +2171,19 @@ func cursorForSession(s *dragSession) windows.Handle {
 	}
 }
 
-// applyGestureCursor forces the move/resize cursor shape. Must be re-applied
-// on every WM_MOUSEMOVE while a session is active: target windows keep
-// restoring their own cursor via WM_SETCURSOR, and a low-level mouse hook
-// does not suppress that. Safe from the hook thread; no allocations.
+// applyGestureCursor forces the move/resize cursor shape.
 //
-// SetCursor returns only the previous HCURSOR (0 is legitimate) and has no
-// failure signal — same model as SetCapture — so the return is intentionally
-// discarded here; we only need to force the shape.
+// MUST be called from the main thread while it holds mouse capture (or owns
+// the window under the cursor). MSDN: SetCursor has no effect if the mouse is
+// not captured AND is not over a window of the calling thread. Our WH_MOUSE_LL
+// hook runs on the hook thread, which neither owns the target window nor holds
+// capture (SetCapture is taken on mainMsgHwnd from handleActualMoveOrResize),
+// so calling this from mouseProc is a guaranteed no-op — do not put it there.
+//
+// Call sites: handleActualMoveOrResize (after SetCapture) and wndProc's
+// WM_SETCURSOR handler. SetCursor returns only the previous HCURSOR (0 is
+// legitimate) with no failure signal — same model as SetCapture — so the
+// return is intentionally discarded; we only need to force the shape.
 func applyGestureCursor(s *dragSession) {
 	h := cursorForSession(s)
 	if h == 0 {
@@ -2188,8 +2193,10 @@ func applyGestureCursor(s *dragSession) {
 }
 
 // clearGestureCursor restores the standard arrow after a gesture ends.
-// softReset is the single teardown path for every exit (button-up, winkey-up,
-// ESC cancel, UIPI block, WTS lock, etc.), so one call site is enough.
+// Prefer calling this from the main thread (same SetCursor thread-affinity
+// rule as applyGestureCursor). softReset may run on the hook thread; in that
+// case the call is a no-op, and ReleaseCapture + the next natural WM_SETCURSOR
+// to whatever is under the mouse restores the correct shape anyway.
 func clearGestureCursor() {
 	if cursorArrow == 0 {
 		return
@@ -2256,7 +2263,9 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		originalPt:               pt,
 	}
 	activeSession.Store(sess)
-	applyGestureCursor(sess)
+	// Cursor is applied on the main thread once capture is taken (see
+	// handleActualMoveOrResize / WM_SETCURSOR) — SetCursor from the hook
+	// thread has no effect while the mouse is over another process's window.
 	return true
 }
 
@@ -2548,7 +2557,9 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		centerShrinkActive:       centerShrink,
 	}
 	activeSession.Store(sess)
-	applyGestureCursor(sess)
+	// Cursor is applied on the main thread once capture is taken (see
+	// handleActualMoveOrResize / WM_SETCURSOR) — SetCursor from the hook
+	// thread has no effect while the mouse is over another process's window.
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
 	// 	panic("bad coding: nil session after storing new resize session")
@@ -4003,11 +4014,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				break // No drag or resize is active (and nothing to recover), do nothing!
 			}
 		}
-		// Re-assert the gesture cursor every move: DefWindowProc / the target
-		// window keep applying their own cursor via WM_SETCURSOR. Opposing
-		// zones share the same dual-direction icon, so Shift-mirror does not
-		// need a separate shape update beyond this per-move refresh.
-		applyGestureCursor(session)
+		// Gesture cursor is forced from the main thread (handleActualMoveOrResize
+		// after SetCapture, plus WM_SETCURSOR on mainMsgHwnd). SetCursor from
+		// this hook thread is a no-op while the mouse is over another process.
 		switch session.mode {
 		case ModeMove:
 			if requireWinDownHeldDuringGesture.Load() {
@@ -4809,6 +4818,14 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			  - Claude 4.6 Sonnet High Thinking
 		*/
 		captureHeldForSession.Store(cur)
+		// Now that THIS thread holds capture, SetCursor is allowed to affect
+		// the global cursor even though the mouse is over another process's
+		// window (MSDN SetCursor thread-affinity rule).
+		applyGestureCursor(cur)
+	} else if cur := activeSession.Load(); cur != nil {
+		// Capture already held for this session: re-assert the shape each
+		// drain in case something else briefly changed it.
+		applyGestureCursor(cur)
 	}
 
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
@@ -5203,6 +5220,18 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		}
 		return 0 // Handled
 
+	case wincoe.WM_SETCURSOR:
+		// While we hold capture on this window during a move/resize, Windows
+		// routes WM_SETCURSOR here. Returning TRUE after SetCursor stops
+		// DefWindowProc from restoring the class cursor (arrow). Without this,
+		// even a main-thread SetCursor can lose a race to the default handler.
+		if session := activeSession.Load(); session != nil {
+			applyGestureCursor(session)
+			return 1 // TRUE: cursor handled
+		}
+		// No active gesture: let DefWindowProc set the class cursor.
+		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
+
 	case WM_HIDE_OVERLAY:
 		hideOverlay()
 		return 0
@@ -5239,6 +5268,10 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 	// 	return 0
 
 	case WM_DO_RELEASE_CAPTURE:
+		// Restore arrow while we still hold capture so SetCursor is allowed
+		// (main thread + capture). softReset's own clearGestureCursor may have
+		// run on the hook thread and been a no-op.
+		clearGestureCursor()
 		prev := wincoe.GetCapture()     //CheckNone
 		res1 := wincoe.ReleaseCapture() //CheckBool
 		if res1.Failed() {
