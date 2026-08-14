@@ -951,41 +951,46 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x,
 	if zone == ZONE_CENTER {
 		// UNIFORM CENTER RESIZE
 		//
-		// Aspect-locked path must let BOTH mouse axes contribute (so pure
-		// horizontal is not a no-op on a portrait window, and vice versa)
-		// without a hard axis switch. A max(|dx|,|dy|) "dominant component"
-		// choice is discontinuous on the |dx|==|dy| diagonals: crossing the
-		// anti-diagonal (bottom-left ↔ top-right) can flip the sign of the
-		// driver in one sample and the window jumps/reverses. Averaging is
-		// continuous everywhere; a diagonal step of (1,1) contributes 1
-		// (not 2), matching the non-compounding requirement.
+		// Aspect-locked path must let BOTH mouse axes contribute without a
+		// hard axis switch (max(|dx|,|dy|) jumps/reverses on the
+		// anti-diagonal) and without a linear blend that zeroes on that
+		// same anti-diagonal ((dx+dy)/2 == 0 when dx == -dy).
 		//
-		// primary = (dx+dy)/2, then *2 on the driven side => total size
-		// change of (dx+dy) on that side. Pure-axis motion is therefore
-		// half as sensitive as the old single-axis dx*2/dy*2 path; that is
-		// the cost of continuity + both-axes contribution with no diagonal
-		// compounding.
-		var dw, dh int32
-
+		// Method: propose a free center-resize from each axis independently,
+		// convert each to a scale factor relative to the start size, then
+		// take the geometric mean of those two scales. That is continuous
+		// in (dx,dy), never hard-switches, never fully cancels on the
+		// anti-diagonal (one axis growing and the other shrinking only
+		// partially offsets), and a pure diagonal does not simply add
+		// |dx|+|dy| into one driven side. Exact aspect is re-applied from
+		// the resulting uniform scale around the center.
 		if respectAspectRatio {
-			primary := (dx + dy) / 2
+			newW := float64(origW + dx*2)
+			newH := float64(origH + dy*2)
+			// Keep scales positive so Sqrt is defined; the safeMin floor
+			// below still enforces the real minimum pixel size.
+			if newW < 1 {
+				newW = 1
+			}
+			if newH < 1 {
+				newH = 1
+			}
+			scaleW := newW / float64(origW)
+			scaleH := newH / float64(origH)
+			scale := math.Sqrt(scaleW * scaleH)
+
 			if session.initialAspectRatio >= 1.0 {
-				// Landscape / square: drive width, derive height.
-				dw = primary * 2
-				dh = int32(float64(dw) / session.initialAspectRatio)
+				w = int32(math.Round(float64(origW) * scale))
+				h = int32(math.Round(float64(w) / session.initialAspectRatio))
 			} else {
-				// Portrait: drive height, derive width.
-				dh = primary * 2
-				dw = int32(float64(dh) * session.initialAspectRatio)
+				h = int32(math.Round(float64(origH) * scale))
+				w = int32(math.Round(float64(h) * session.initialAspectRatio))
 			}
 		} else {
 			// Free resize: each axis scales independently from center.
-			dw = dx * 2
-			dh = dy * 2
+			w = origW + dx*2
+			h = origH + dy*2
 		}
-
-		w = origW + dw
-		h = origH + dh
 
 		x = origL + (origW-w)/2
 		y = origT + (origH-h)/2
