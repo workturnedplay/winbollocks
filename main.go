@@ -679,6 +679,16 @@ var shiftMirrorResizeEnabled atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
+// absInt32 returns the absolute value of v. Kept local (instead of
+// math.Abs + float64 round-trip) so the hot resize path stays allocation-
+// free and branch-predictable on the common int32 deltas from the mouse.
+func absInt32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 func getResizeZone(pt wincoe.POINT, r wincoe.RECT) int {
 	w := r.Right - r.Left
 	h := r.Bottom - r.Top
@@ -950,17 +960,35 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x,
 
 	if zone == ZONE_CENTER {
 		// UNIFORM CENTER RESIZE
+		//
+		// When aspect ratio is locked we still want BOTH axes of mouse
+		// motion to be able to drive the resize (the previous code locked
+		// permanently to dx when the window was landscape, or dy when
+		// portrait — so pure movement on the "other" axis did nothing).
+		// We pick the dominant component by absolute magnitude so a
+		// diagonal does not compound into |dx|+|dy| (moving 1 on X and 1
+		// on Y contributes 1, not 2). Sign of the chosen component keeps
+		// the natural mapping: further bottom-right grows, further
+		// top-left shrinks, relative to the gesture start point.
 		var dw, dh int32
 
 		if respectAspectRatio {
+			primary := dx
+			if absInt32(dy) > absInt32(dx) {
+				primary = dy
+			}
 			if session.initialAspectRatio >= 1.0 {
-				dw = dx * 2
+				// Landscape / square: drive width from the dominant delta,
+				// derive height to keep the original aspect.
+				dw = primary * 2
 				dh = int32(float64(dw) / session.initialAspectRatio)
 			} else {
-				dh = dy * 2
+				// Portrait: drive height from the dominant delta, derive width.
+				dh = primary * 2
 				dw = int32(float64(dh) * session.initialAspectRatio)
 			}
 		} else {
+			// Free resize: each axis scales independently from center.
 			dw = dx * 2
 			dh = dy * 2
 		}
