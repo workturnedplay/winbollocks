@@ -2322,7 +2322,7 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 // true and the hit zone is ZONE_CENTER with radial mode on, the new session
 // starts with centerShrinkActive set so the drag shrinks without requiring
 // a later Shift key-transition event.
-func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool, shiftDown bool) (started, bypassed bool) {
+func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDown bool) (started, bypassed bool) {
 	wantTargetWnd, res0 := wincoe.RootWindowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window(tryBeginMoveGestureAt:RootWindowFromPoint res:%v), window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)", res0)
