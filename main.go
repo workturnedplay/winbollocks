@@ -3811,7 +3811,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							} else {
 								logf("failed to begin Move gesture(the why should be above ^) while trying to start it as recovery")
 							}
-						case !shiftDown && keyDown(wincoe.VK_RBUTTON):
+						case keyDown(wincoe.VK_RBUTTON):
+							// Shift may already be held (shift+winkey+RMB); same
+							// as the real WM_RBUTTONDOWN path below.
 							started, bypassed := tryBeginResizeGestureAt(info.Pt, true)
 							if bypassed {
 								break // target is fullscreen; nothing to recover this time
@@ -3819,6 +3821,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							markGestureUsedOnce()
 							logf("Recovering a missed winkey+RMB resize gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
 							if started {
+								if shiftDown {
+									postShiftMirrorToggleIfNeeded(true)
+								}
 								// See the identical comment in the LMB/ModeMove case above.
 								if injectButtonUpOnMissedGestureRecovery.Load() {
 									session2 := activeSession.Load() // it's updated in the above try
@@ -4186,7 +4191,11 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// var shiftDown bool = keyDown(VK_SHIFT)
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
-		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
+		// Winkey+RMB starts resize; Shift may already be held (same end
+		// state as winkey+RMB then pressing Shift): edge/corner →
+		// shift-mirror, center+radial → shrink polarity. Alt/Ctrl still
+		// disqualify so we don't steal e.g. Win+Shift+Ctrl chords.
+		if winDown && !altDown && !ctrlDown {
 			started, bypassed := tryBeginResizeGestureAt(info.Pt, false)
 			if bypassed {
 				break // target is fullscreen; let event through
@@ -4195,6 +4204,11 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 			if !started {
 				logf("Failed to begin Resize gesture (reason why should be above ^) on winkey+RMB pressed")
+			} else if shiftDown {
+				// Match "winkey+RMB, then Shift becomes held": post the
+				// same transition the keyboard hook would have sent on a
+				// real Shift-down after the gesture was already active.
+				postShiftMirrorToggleIfNeeded(true)
 			}
 
 			if nowDiff := time.Since(start); nowDiff > Duration5ms {
