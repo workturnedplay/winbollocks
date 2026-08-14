@@ -262,6 +262,7 @@ const (
 	MENU_TOGGLE_UNFOCUS_SENT_TO_BACK               = 18
 	MENU_SHOW_INPUT_STATE                          = 19
 	MENU_TOGGLE_SHIFT_MIRROR_RESIZE                = 20
+	MENU_TOGGLE_RADIAL_CENTER_RESIZE               = 21
 )
 
 const (
@@ -657,7 +658,10 @@ var useThreadAttachInputForFocus atomic.Bool
 // shiftMirrorResizeEnabled gates the Shift-held resize-mirroring
 // accelerator (see handleShiftMirrorToggle): whether pressing Shift
 // mid-resize warps the cursor to the diametrically-opposite resize zone
-// via SetCursorPos.
+// via SetCursorPos. Has no effect while the active resize zone is
+// ZONE_CENTER -- mirroring center onto itself is a no-op, and Shift in
+// the center zone is either ignored (default) or used by
+// radialCenterResizeEnabled instead.
 //
 // Defaults to false when winbollocks is detected running inside a
 // hypervisor guest (see isVirtualized/detectVirtualization). VirtualBox
@@ -676,6 +680,20 @@ var useThreadAttachInputForFocus atomic.Bool
 // or configurations (relative PS/2 mouse, no absolute-pointing device)
 // won't actually exhibit the problem despite being detected as virtualized.
 var shiftMirrorResizeEnabled atomic.Bool
+
+// radialCenterResizeEnabled selects the ZONE_CENTER resize model:
+//
+//	false (default): geometric-mean of the per-axis free-resize scales
+//	(aspect-locked). Shift is ignored in the center zone.
+//
+//	true: Euclidean distance from the gesture start point drives a uniform
+//	size change in every direction (no anti-diagonal dead zone). Distance
+//	grows the window; holding Shift inverts to shrink. Pressing or releasing
+//	Shift re-applies immediately even without further mouse motion (see
+//	postShiftMirrorToggleIfNeeded / WM_APPLY_SHIFT_MIRROR center branch).
+//
+// Shift-mirror is never used in ZONE_CENTER regardless of this flag.
+var radialCenterResizeEnabled atomic.Bool
 
 /* ---------------- Utilities ---------------- */
 
@@ -793,6 +811,11 @@ func mirrorPointInRect(pt wincoe.POINT, r wincoe.RECT) wincoe.POINT {
 // first one was processed; see postShiftMirrorToggleIfNeeded's doc
 // comment).
 func handleShiftMirrorToggle(session *dragSession, cursorPt wincoe.POINT, shiftDown bool) *dragSession {
+	// Center zone has no opposite edge; shift-mirror is never applied there
+	// (radial center-resize consumes Shift instead when enabled).
+	if session.resizeZone == ZONE_CENTER {
+		return nil
+	}
 	if shiftDown == session.shiftMirrorActive {
 		return nil // already in the requested state
 	}
@@ -896,20 +919,34 @@ func postShiftMirrorToggleIfNeeded(intendedShiftDown bool) {
 	if session == nil || session.mode != ModeResize {
 		return // no active resize gesture; nothing to mirror
 	}
-	if session.shiftMirrorActive == intendedShiftDown {
-		return // already in the requested state, or OS key-repeat; avoid a redundant post
-	}
-	if intendedShiftDown && !shiftMirrorResizeEnabled.Load() {
-		// Entering mirror mode is disabled (see shiftMirrorResizeEnabled's
-		// doc comment, e.g. detected virtualization). Deliberately checked
-		// only for the ENTRY direction (intendedShiftDown == true): if a
-		// session is already mirrored -- reachable if the setting was on
-		// when it started, or got toggled off mid-resize -- the Shift
-		// RELEASE (intendedShiftDown == false) must still be allowed
-		// through so handleShiftMirrorToggle can unwind it properly rather
-		// than leaving the session stuck mirrored for the rest of the
-		// gesture.
-		return
+
+	// ZONE_CENTER: shift-mirror is meaningless (opposite of center is
+	// center). Shift is either ignored (default) or used by radial
+	// center-resize mode to invert grow↔shrink and must re-apply even
+	// without further mouse motion.
+	if session.resizeZone == ZONE_CENTER {
+		if !radialCenterResizeEnabled.Load() {
+			return
+		}
+		// Fall through to post; handler applies radial resize with the
+		// new Shift polarity. No shiftMirrorActive dedup — radial has no
+		// sticky mirror state, and both press and release must fire.
+	} else {
+		if session.shiftMirrorActive == intendedShiftDown {
+			return // already in the requested state, or OS key-repeat; avoid a redundant post
+		}
+		if intendedShiftDown && !shiftMirrorResizeEnabled.Load() {
+			// Entering mirror mode is disabled (see shiftMirrorResizeEnabled's
+			// doc comment, e.g. detected virtualization). Deliberately checked
+			// only for the ENTRY direction (intendedShiftDown == true): if a
+			// session is already mirrored -- reachable if the setting was on
+			// when it started, or got toggled off mid-resize -- the Shift
+			// RELEASE (intendedShiftDown == false) must still be allowed
+			// through so handleShiftMirrorToggle can unwind it properly rather
+			// than leaving the session stuck mirrored for the rest of the
+			// gesture.
+			return
+		}
 	}
 
 	msgHwnd := loadMainMsgHwnd()
@@ -927,7 +964,15 @@ func postShiftMirrorToggleIfNeeded(intendedShiftDown bool) {
 	}
 }
 
-func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x, y, w, h int32) {
+// calculateResize computes the window rect for a resize gesture.
+// shiftDown is the authoritative Shift state for this sample: callers that
+// already know it from a key-transition event (WM_APPLY_SHIFT_MIRROR) must
+// pass it explicitly, because GetAsyncKeyState observed from inside a
+// low-level keyboard-hook callback can lag the transition currently being
+// handled. The mouse-move path may pass keyDown(VK_SHIFT) instead.
+// shiftDown only affects ZONE_CENTER when radialCenterResizeEnabled is set;
+// edge/corner zones ignore it (Shift there is handled by shift-mirror).
+func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int, shiftDown bool) (x, y, w, h int32) {
 	drag := session.state
 	// zone is passed explicitly (rather than read from session.resizeZone
 	// directly) so callers can supply a Shift-mirrored zone (see
@@ -949,22 +994,36 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int) (x,
 	origH := origB - origT
 
 	if zone == ZONE_CENTER {
-		// UNIFORM CENTER RESIZE
-		//
-		// Aspect-locked path must let BOTH mouse axes contribute without a
-		// hard axis switch (max(|dx|,|dy|) jumps/reverses on the
-		// anti-diagonal) and without a linear blend that zeroes on that
-		// same anti-diagonal ((dx+dy)/2 == 0 when dx == -dy).
-		//
-		// Method: propose a free center-resize from each axis independently,
-		// convert each to a scale factor relative to the start size, then
-		// take the geometric mean of those two scales. That is continuous
-		// in (dx,dy), never hard-switches, never fully cancels on the
-		// anti-diagonal (one axis growing and the other shrinking only
-		// partially offsets), and a pure diagonal does not simply add
-		// |dx|+|dy| into one driven side. Exact aspect is re-applied from
-		// the resulting uniform scale around the center.
-		if respectAspectRatio {
+		// UNIFORM CENTER RESIZE — two modes, selected by radialCenterResizeEnabled.
+		if radialCenterResizeEnabled.Load() {
+			// Radial: Euclidean distance from the gesture start drives a
+			// uniform size change in every direction (no anti-diagonal dead
+			// zone). Distance grows; Shift inverts to shrink. Sensitivity
+			// matches pure-axis center resize (2 px size change per 1 px of
+			// cursor travel) applied to the long side of the aspect pair.
+			dist := math.Hypot(float64(dx), float64(dy))
+			signed := dist
+			if shiftDown {
+				signed = -dist
+			}
+			primary := int32(math.Round(2 * signed))
+			if respectAspectRatio {
+				if session.initialAspectRatio >= 1.0 {
+					w = origW + primary
+					h = int32(math.Round(float64(w) / session.initialAspectRatio))
+				} else {
+					h = origH + primary
+					w = int32(math.Round(float64(h) * session.initialAspectRatio))
+				}
+			} else {
+				w = origW + primary
+				h = origH + primary
+			}
+		} else if respectAspectRatio {
+			// Default: geometric mean of the per-axis free-resize scales.
+			// Both axes contribute, continuous (no dominant-axis jump),
+			// anti-diagonal only weakly cancels instead of hard-zeroing.
+			// Shift is ignored in this mode.
 			newW := float64(origW + dx*2)
 			newH := float64(origH + dy*2)
 			// Keep scales positive so Sqrt is defined; the safeMin floor
@@ -4011,7 +4070,13 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			// zone (original or mirrored) is currently active by the time
 			// any WM_MOUSEMOVE is processed.
 			if !ShouldThrottle() {
-				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
+				// Shift state for radial center-resize; edge/corner zones
+				// ignore it (mirror is driven by key-transition posts).
+				// Reading GetAsyncKeyState here is fine: we are on a mouse
+				// event, not inside the Shift key-transition callback where
+				// the async state can lag the event being handled.
+				shiftDown := keyDown(wincoe.VK_SHIFT)
+				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone, shiftDown) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
 				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
 				if asyncResize.Load() {
 					flags |= wincoe.SWP_ASYNCWINDOWPOS
@@ -5055,6 +5120,31 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			return 0
 		}
 
+		// Center zone: shift-mirror is a no-op. When radial center-resize
+		// is enabled, re-apply size from the current cursor with the new
+		// Shift polarity so pressing/releasing Shift takes effect even
+		// without further mouse motion.
+		if session.resizeZone == ZONE_CENTER {
+			if !radialCenterResizeEnabled.Load() {
+				return 0
+			}
+			nx, ny, nw, nh := calculateResize(session, cursorPt, ZONE_CENTER, shiftDown)
+			flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
+			if asyncResize.Load() {
+				flags |= wincoe.SWP_ASYNCWINDOWPOS
+			}
+			enqueueMoveOrResize(WindowMoveData{
+				Hwnd:       session.targetWnd,
+				X:          nx,
+				Y:          ny,
+				W:          nw,
+				H:          nh,
+				Flags:      flags,
+				ResizeZone: ZONE_CENTER,
+			}, "WM_APPLY_SHIFT_MIRROR/radial-center")
+			return 0
+		}
+
 		handleShiftMirrorToggle(session, cursorPt, shiftDown)
 		return 0
 
@@ -5434,10 +5524,20 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				if isVirtualized {
 					shiftMirrorText = "Shift-held resize cursor-warp accelerator (defaulted OFF: virtualization detected; host may fight the warp and instantly shrink the window)"
 				} else {
-					shiftMirrorText = "Shift-held resize cursor-warp accelerator (warps cursor to the opposite edge/corner mid-resize)"
+					shiftMirrorText = "Shift-held resize cursor-warp accelerator (warps cursor to the opposite edge/corner mid-resize; ignored in center zone)"
 				}
 				appendMenuChecked(hMenu, shiftMirrorFlags,
 					MENU_TOGGLE_SHIFT_MIRROR_RESIZE, shiftMirrorText)
+			}
+
+			{
+				var radialFlags uint32 = wincoe.MF_STRING
+				if radialCenterResizeEnabled.Load() {
+					radialFlags |= wincoe.MF_CHECKED
+				}
+				radialText := "Center-zone radial resize (distance grows; hold Shift to shrink; applies on Shift press/release even without mouse move)"
+				appendMenuChecked(hMenu, radialFlags,
+					MENU_TOGGLE_RADIAL_CENTER_RESIZE, radialText)
 			}
 
 			{
@@ -5621,6 +5721,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			case MENU_TOGGLE_SHIFT_MIRROR_RESIZE:
 				shiftMirrorResizeEnabled.Store(!shiftMirrorResizeEnabled.Load())
+
+			case MENU_TOGGLE_RADIAL_CENTER_RESIZE:
+				radialCenterResizeEnabled.Store(!radialCenterResizeEnabled.Load())
 
 			case MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS:
 				useThreadAttachInputForFocus.Store(!useThreadAttachInputForFocus.Load())
