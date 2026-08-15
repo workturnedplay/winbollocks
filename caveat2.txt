@@ -1,0 +1,40 @@
+# Win32 Input Handling & Win-Key Masking Caveats
+
+## 1. Console Auto-Scrolling & Modifier Whitelisting (`VK_E8` vs. Valid VKs)
+
+* **The Issue:** `conhost.exe` uses a hardcoded internal whitelist to classify `KEY_EVENT` inputs. Any virtual key code outside this whitelist (including unassigned/OEM codes like `VK_E8`) is treated as a standard typing key.
+* **The Consequence:** Injecting `VK_E8` to mask a Win-key release forces `cmd.exe` to auto-scroll its viewport to the current cursor line.
+* **The Fix:** Must use a virtual key code residing in `conhost`'s modifier whitelist (e.g., `VK_SHIFT`, `VK_CONTROL`, `VK_MENU`).
+
+---
+
+## 2. The Shift-State Collapsing Limitation
+
+* **The Issue:** Windows explorer tracks aggregate modifier bitmasks (`VK_SHIFT`) rather than raw scan codes when deciding whether to invoke the Start menu upon `VK_LWIN` release.
+* **The Consequence:** If `LShift` is physically held down, sending an `RShift` down/up tap does not register a `0 -> 1` state transition on the aggregate bitfield. Explorer fails to disarm the Start menu hook, and the menu pops up.
+
+---
+
+## 3. The 4-Event State-Restoring Approach & TOCTOU Race Condition
+
+* **The Attempt:** To bypass Shift-state collapsing, construct a single 4-event `SendInput` batch:
+1. Temporarily release `LShift` (`KEYEVENTF_KEYUP`)
+2. Tap `RShift` (`DOWN` -> `UP`)
+3. Restore `LShift` (`0`)
+
+
+* **The Fatal Flaw (TOCTOU):** A severe Time-of-Check to Time-of-Use race condition exists between the initial `GetAsyncKeyState` state evaluation and the kernel processing the injected `SendInput` queue.
+* **The Failure Mode:** If the user physically releases `LShift` during the microsecond window between check and execution, the synthetic `LShift` re-press executes blindly, leaving `LShift` permanently stuck down in the OS input state table. Pure user-mode Win32 APIs lack atomic check-and-inject primitives for modifier bits.
+
+---
+
+## 4. The Pragmatic Solution: `RCtrl` (`0xA3`) present in v0.12.0+
+
+* **Why It Works:** `RCtrl` (`VK_RCONTROL` / `0xA3`) operates on an entirely separate bitmask from Shift, avoiding accessibility and layout state machines.
+* **Key Advantages:**
+* Requires zero pre-check state evaluation, entirely eliminating the TOCTOU race window.
+* Works universally whether `LCtrl` is physically held or not.
+* Recognized by `conhost.exe` as a valid modifier, preventing viewport auto-scrolling in `cmd.exe`.
+* Safely satisfies `explorer.exe`'s Start menu suppression criteria on Win-key release.
+
+full convo.(only visible to me): https://gemini.google.com/app/c666066ca4ed92a1

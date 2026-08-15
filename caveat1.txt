@@ -40,5 +40,5 @@ Workaround: repeat the gesture once, launch winbollocks in a fresh Terminal wind
 
 doneTODO: Investigate using GetForegroundWindow() reconciliation (e.g. on EVENT_SYSTEM_CAPTURESTART) instead of relying solely on EVENT_SYSTEM_FOREGROUND notifications, as the WinEvent stream appears to occasionally omit this transition.
 
-this ^ is the workaround currently, in 0.5.0!
+this ^ is the workaround currently, in 0.5.0+
 ---------------------
