@@ -1,5 +1,13 @@
 todo:
 
+* with rustdesk on a client with winbollocks(aka our program) running, winkey is detected as down in async state, but likely ignored in our keyboard hook due to ignoring all injected keys and rustdesk likely injects it! So how do we "fix" this without opening it to our own injected events like winkey UP. Or I guess we don't inject winkey down so that could be excepted ? also worth checking if mouse events are injected as well, plus buttons, by rustdesk, then this means they're ignored as well?! this will probably me way harder to except then, if we can even except the keyboard one at all (unsure fully yet).
+
+* snap to edges (should be a bool) when moving or resizing.
+
+* option to stop all logging to file (if given the right cmdline arg, but also from systray bool setting)
+
+* maybe remember systray settings, keep them in registry?! or in-file would be better, ideal, because can be moved easily.
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
