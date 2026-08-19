@@ -272,6 +272,9 @@ const (
 	MENU_TOGGLE_SHIFT_MIRROR_RESIZE                = 20
 	MENU_TOGGLE_RADIAL_CENTER_RESIZE               = 21
 	MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE           = 22
+	MENU_TOGGLE_VIRTUALIZATION_DETECTION           = 23
+	MENU_TOGGLE_SNAP_TO_EDGES                      = 24
+	MENU_TOGGLE_DISABLE_FILE_LOGGING               = 25
 )
 
 const (
@@ -730,6 +733,50 @@ var radialCenterResizeEnabled atomic.Bool
 // radial shrink still work once a resize is already active).
 var allowShiftHeldBeforeResizeGesture atomic.Bool
 
+// virtualizationDetectionEnabled gates whether isVirtualized/
+// virtualizationEvidence (see detectVirtualization, computed unconditionally
+// once at startup regardless of this toggle) are allowed to influence
+// shiftMirrorResizeEnabled's default and the tray menu's own diagnostic
+// text -- see isEffectivelyVirtualized. Defaults to true, matching this
+// project's prior always-on detection behavior. Toggling this off after
+// startup does not retroactively change shiftMirrorResizeEnabled (that
+// default was already applied once, in init()); it only affects newly
+// displayed diagnostic text and any future logic that consults
+// isEffectivelyVirtualized() going forward. Toggleable via systray;
+// persisted like every other systray toggle (see persistedSettings).
+var virtualizationDetectionEnabled atomic.Bool
+
+// snapToEdgesEnabled gates whether an in-progress winkey+LMB move or
+// winkey+RMB resize snaps whichever window edges the current gesture is
+// actively touching flush against the target window's monitor work-area
+// edges, once within snapToEdgesThresholdPx of them (see
+// applySnapToEdgesForMove/applySnapToEdgesForResize). Off by default:
+// besides being a new behavior change to how the mouse tracks during a
+// drag, checking this also adds a MonitorFromWindow + GetMonitorInfo call
+// pair to mouseProc's WM_MOUSEMOVE hot path on the hook thread whenever a
+// gesture is active -- both are cheap, local, non-blocking USER32 getters
+// (no cross-process messaging, so none of the "could hang the hook thread"
+// concerns that apply to e.g. SetWindowPos on an unresponsive target
+// window -- see forceForeground's own SendMessageTimeout hang-guard for
+// contrast), but it's still new per-move-event cost that didn't exist
+// before this feature, kept strictly opt-in until proven negligible in
+// practice. Toggleable via systray; persisted like every other systray
+// toggle (see persistedSettings).
+var snapToEdgesEnabled atomic.Bool
+
+// disableFileLogging, when true, suppresses internalLogger's log-FILE write
+// path entirely -- see internalLogger's own doc comment for exactly what
+// this does and does not affect (console/devbuild output is untouched).
+// Set from the "-nolog"/"--nolog" command-line flag at startup (see
+// parseDisableFileLoggingCmdlineFlag, checked before initLogFile() is ever
+// reachable so the log file isn't even created in that case) and
+// independently toggleable at runtime via systray. Defaults to false (file
+// logging stays on unless explicitly disabled). Persisted like every other
+// systray toggle, except an explicit command-line flag takes precedence
+// over a persisted value from an earlier session -- see
+// disableFileLoggingForcedByCmdline.
+var disableFileLogging atomic.Bool
+
 /* ---------------- Utilities ---------------- */
 
 func getResizeZone(pt wincoe.POINT, r wincoe.RECT) int {
@@ -783,6 +830,177 @@ func oppositeResizeZone(zone int) int {
 	default: // ZONE_CENTER, or any unexpected value
 		return zone
 	}
+}
+
+// snapToEdgesThresholdPx is how close (in screen pixels) a window edge must
+// come to its monitor's work-area edge before applySnapToEdgesForMove/
+// applySnapToEdgesForResize pull it flush against that edge. Kept generous
+// enough to catch typical mouse overshoot/undershoot at normal drag speeds
+// without being so wide that it snaps when the user clearly isn't aiming
+// for the edge. Measured in physical pixels, which is consistent with how
+// every other coordinate in this file is already treated -- see
+// todo.txt's note that Per-Monitor-V2 DPI awareness gives this process
+// unvirtualized physical-pixel coordinates uniformly across monitors of
+// differing scale factors.
+const snapToEdgesThresholdPx int32 = 12
+
+// edgeSnapMask flags which rectangle edges are eligible to be snapped to
+// the nearest monitor work-area edge by applySnapToEdgesForResize. Bits
+// combine for resize zones that move more than one edge (e.g. a corner).
+type edgeSnapMask uint8
+
+const (
+	snapEdgeLeft edgeSnapMask = 1 << iota
+	snapEdgeTop
+	snapEdgeRight
+	snapEdgeBottom
+)
+
+// snapEdgeMaskForResizeZone reports which rectangle edges the given resize
+// zone actually moves, so applySnapToEdgesForResize only ever snaps edges
+// THIS specific drag is touching -- an edge the current gesture never
+// moves must never be silently relocated to a nearby monitor border out
+// from under the user (e.g. dragging only the right edge must never also
+// snap the untouched left edge). ZONE_CENTER moves all four edges
+// symmetrically around a fixed center, which isn't a meaningful "snap a
+// single edge to the screen border" operation, so it deliberately returns
+// 0 (no snapping).
+func snapEdgeMaskForResizeZone(zone int) edgeSnapMask {
+	switch zone {
+	case ZONE_TOP_LEFT:
+		return snapEdgeLeft | snapEdgeTop
+	case ZONE_TOP_CENTER:
+		return snapEdgeTop
+	case ZONE_TOP_RIGHT:
+		return snapEdgeTop | snapEdgeRight
+	case ZONE_MID_LEFT:
+		return snapEdgeLeft
+	case ZONE_MID_RIGHT:
+		return snapEdgeRight
+	case ZONE_BOT_LEFT:
+		return snapEdgeLeft | snapEdgeBottom
+	case ZONE_BOT_CENTER:
+		return snapEdgeBottom
+	case ZONE_BOT_RIGHT:
+		return snapEdgeRight | snapEdgeBottom
+	default: // ZONE_CENTER, or any unexpected value
+		return 0
+	}
+}
+
+// absInt32 returns the absolute value of v. math.Abs operates on float64
+// and would round-trip through a lossy conversion for the plain pixel-delta
+// integers used throughout the snap-to-edges logic, so this tiny int32
+// helper avoids that entirely.
+func absInt32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// monitorWorkAreaFor returns the work-area rect (RcWork -- excludes the
+// taskbar and any other reserved screen real estate, unlike RcMonitor) of
+// the monitor nearest hwnd, and false if hwnd has no associated monitor (a
+// zero HMONITOR) or GetMonitorInfo fails.
+func monitorWorkAreaFor(hwnd windows.Handle) (wincoe.RECT, bool) {
+	hMon := wincoe.MonitorFromWindow(hwnd, wincoe.MONITOR_DEFAULTTONEAREST)
+	if hMon == 0 {
+		return wincoe.RECT{}, false
+	}
+	var mi wincoe.MONITORINFO
+	if res := wincoe.GetMonitorInfo(hMon, &mi); res.Failed() {
+		logf("monitorWorkAreaFor: GetMonitorInfo failed for HWND=0x%X: %v", hwnd, res.Err)
+		return wincoe.RECT{}, false
+	}
+	return mi.RcWork, true
+}
+
+// snappedEdgeOrOriginal returns workEdge if target is already within
+// snapToEdgesThresholdPx of it, or target unchanged otherwise.
+func snappedEdgeOrOriginal(target, workEdge int32) int32 {
+	if absInt32(target-workEdge) <= snapToEdgesThresholdPx {
+		return workEdge
+	}
+	return target
+}
+
+// applySnapToEdgesForMove nudges the whole window flush against whichever
+// monitor work-area edge(s) it's already within snapToEdgesThresholdPx of,
+// preserving w/h exactly -- a move never resizes. No-op (returns x, y
+// unchanged) if snapToEdgesEnabled is off or hwnd's monitor can't be
+// determined.
+//
+// Left takes priority over right (and top over bottom) if a window is
+// somehow within threshold of both opposite edges at once -- only possible
+// for a window narrower/shorter than 2*snapToEdgesThresholdPx, in which
+// case either choice is equally reasonable.
+func applySnapToEdgesForMove(hwnd windows.Handle, x, y, w, h int32) (int32, int32) {
+	if !snapToEdgesEnabled.Load() {
+		return x, y
+	}
+	work, ok := monitorWorkAreaFor(hwnd)
+	if !ok {
+		return x, y
+	}
+
+	switch {
+	case absInt32(x-work.Left) <= snapToEdgesThresholdPx:
+		x = work.Left
+	case absInt32((x+w)-work.Right) <= snapToEdgesThresholdPx:
+		x = work.Right - w
+	}
+
+	switch {
+	case absInt32(y-work.Top) <= snapToEdgesThresholdPx:
+		y = work.Top
+	case absInt32((y+h)-work.Bottom) <= snapToEdgesThresholdPx:
+		y = work.Bottom - h
+	}
+
+	return x, y
+}
+
+// applySnapToEdgesForResize snaps whichever of l/t/r/b are set in mask
+// flush against hwnd's monitor work-area edge, if already within
+// snapToEdgesThresholdPx of it. Edges not set in mask are returned
+// completely unchanged -- see snapEdgeMaskForResizeZone's doc comment for
+// why only the edges the active resize zone actually moves are ever
+// eligible.
+//
+// No-op (returns l, t, r, b unchanged) if snapToEdgesEnabled is off, hwnd's
+// monitor can't be determined, mask is 0, or the snap would invert the
+// rect (a defensive floor that should never actually trigger in practice,
+// since snapToEdgesThresholdPx is far smaller than any realistic minimum
+// window size -- but a snapped-into-degenerate rect is worth refusing
+// outright rather than silently handing the caller a nonsensical result).
+func applySnapToEdgesForResize(hwnd windows.Handle, l, t, r, b int32, mask edgeSnapMask) (int32, int32, int32, int32) {
+	if !snapToEdgesEnabled.Load() || mask == 0 {
+		return l, t, r, b
+	}
+	work, ok := monitorWorkAreaFor(hwnd)
+	if !ok {
+		return l, t, r, b
+	}
+
+	snappedL, snappedT, snappedR, snappedB := l, t, r, b
+	if mask&snapEdgeLeft != 0 {
+		snappedL = snappedEdgeOrOriginal(l, work.Left)
+	}
+	if mask&snapEdgeTop != 0 {
+		snappedT = snappedEdgeOrOriginal(t, work.Top)
+	}
+	if mask&snapEdgeRight != 0 {
+		snappedR = snappedEdgeOrOriginal(r, work.Right)
+	}
+	if mask&snapEdgeBottom != 0 {
+		snappedB = snappedEdgeOrOriginal(b, work.Bottom)
+	}
+
+	if snappedL >= snappedR || snappedT >= snappedB {
+		return l, t, r, b
+	}
+	return snappedL, snappedT, snappedR, snappedB
 }
 
 // mirrorPointInRect reflects pt through the center of r -- a combined
@@ -1115,6 +1333,8 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int, shi
 			newB += dy
 		}
 
+		newL, newT, newR, newB = applySnapToEdgesForResize(session.targetWnd, newL, newT, newR, newB, snapEdgeMaskForResizeZone(zone))
+
 		x, y = newL, newT
 		w, h = newR-newL, newB-newT
 	}
@@ -1167,19 +1387,44 @@ const (
 	shiftFlags = wincoe.KEYEVENTF_SCANCODE | wincoe.KEYEVENTF_EXTENDED // make it RCtrl aka Right Ctrl key(with that KEYEVENTF_EXTENDED) instead of LCtrl
 )
 
+// ourInputExtraInfoMarker is written into the DwExtraInfo field of every
+// KEYBDINPUT/MOUSEINPUT event WE synthesize via wincoe.SendInput (shift-tap
+// Start-menu suppression, the LMB-click-to-focus fallback, and the
+// missed-gesture-recovery button-up injections). mouseProc/keyboardProc use
+// it to tell OUR OWN synthetic input (which must keep being ignored, exactly
+// as before, to avoid recursively re-triggering gesture logic off of our own
+// injected events) apart from input injected by something else entirely --
+// most notably a remote-control tool like RustDesk/TeamViewer/AnyDesk, which
+// necessarily delivers the remote operator's real keystrokes and clicks via
+// SendInput on the controlled machine and therefore also arrives flagged
+// LLKHF_INJECTED/LLMHF_INJECTED, even though it represents genuine user
+// intent that should be able to trigger our winkey+mouse gestures like any
+// physical input would.
+//
+// Chosen as an arbitrary, distinctive 64-bit value ("WBLK" repeated) rather
+// than e.g. 1: a well-behaved third-party injector that ALSO happens to tag
+// its own input via dwExtraInfo (some do, for their own analogous
+// ignore-my-own-injections filtering) is exceedingly unlikely to pick this
+// exact value by chance.
+// const ourInputExtraInfoMarker uintptr = 0x57424C4B57424C4B
+// Option 2: 8-character truncation ("WINBOLLX")
+const ourInputExtraInfoMarker uintptr = 0x57494E424F4C4C58
+
 var shiftTapInputs = [...]wincoe.KEYANDMOUSE_INPUT{
 	{
 		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WScan:   shiftScanCode,
-			DwFlags: shiftFlags,
+			WScan:       shiftScanCode,
+			DwFlags:     shiftFlags,
+			DwExtraInfo: ourInputExtraInfoMarker,
 		},
 	},
 	{
 		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WScan:   shiftScanCode,
-			DwFlags: shiftFlags | wincoe.KEYEVENTF_KEYUP,
+			WScan:       shiftScanCode,
+			DwFlags:     shiftFlags | wincoe.KEYEVENTF_KEYUP,
+			DwExtraInfo: ourInputExtraInfoMarker,
 		},
 	},
 }
@@ -1284,8 +1529,9 @@ var shitTapThenLWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 	{
 		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WVk:     wincoe.VK_LWIN,
-			DwFlags: wincoe.KEYEVENTF_KEYUP,
+			WVk:         wincoe.VK_LWIN,
+			DwFlags:     wincoe.KEYEVENTF_KEYUP,
+			DwExtraInfo: ourInputExtraInfoMarker,
 		},
 	},
 }
@@ -1297,8 +1543,9 @@ var shitTapThenRWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 	{
 		Type: wincoe.INPUT_KEYBOARD,
 		Ki: wincoe.KEYBDINPUT{
-			WVk:     wincoe.VK_RWIN,
-			DwFlags: wincoe.KEYEVENTF_KEYUP,
+			WVk:         wincoe.VK_RWIN,
+			DwFlags:     wincoe.KEYEVENTF_KEYUP,
+			DwExtraInfo: ourInputExtraInfoMarker,
 		},
 	},
 }
@@ -1375,10 +1622,28 @@ var lmbClickInputs = func() [2]wincoe.KEYANDMOUSE_INPUT {
 
 	// Fill the union as MOUSEINPUT
 	mouseInputView(&inputs[0]).DwFlags = wincoe.MOUSEEVENTF_LEFTDOWN
+	mouseInputView(&inputs[0]).DwExtraInfo = ourInputExtraInfoMarker
 	mouseInputView(&inputs[1]).DwFlags = wincoe.MOUSEEVENTF_LEFTUP
+	mouseInputView(&inputs[1]).DwExtraInfo = ourInputExtraInfoMarker
 
 	//Your inject (MOUSEEVENTF_LEFTDOWN/UP): Defaults relative (Dx/Dy=0 = no move, click at current cursor).
 
+	return inputs
+}()
+
+// rmbUpInputs is the single-event MOUSEINPUT template for injecting a bare
+// RMB-up (see injectRMBUp/injectMouseButtonUp). Kept as its own
+// package-level array, tagged with ourInputExtraInfoMarker like every other
+// self-injected input array in this file, rather than trying to mutate
+// lmbClickInputs (which is LMB-only and also read concurrently from
+// injectLMBClickAtCoords), so SendInput's go:uintptrescapes zero-allocation
+// guarantee is preserved: building a fresh local slice on every call would
+// allocate.
+var rmbUpInputs = func() [1]wincoe.KEYANDMOUSE_INPUT {
+	var inputs [1]wincoe.KEYANDMOUSE_INPUT
+	inputs[0].Type = wincoe.INPUT_MOUSE
+	mouseInputView(&inputs[0]).DwFlags = wincoe.MOUSEEVENTF_RIGHTUP
+	mouseInputView(&inputs[0]).DwExtraInfo = ourInputExtraInfoMarker
 	return inputs
 }()
 
@@ -1530,6 +1795,7 @@ func injectLMBClickAtCoords(x, y int32) {
 		wincoe.MOUSEEVENTF_VIRTUALDESK |
 		wincoe.MOUSEEVENTF_MOVE |
 		wincoe.MOUSEEVENTF_LEFTDOWN
+	m0.DwExtraInfo = ourInputExtraInfoMarker
 
 	// Release LMB at the same location.
 	// m1 := (*MOUSEINPUT)(unsafe.Pointer(&inputs[1].Ki))
@@ -1541,6 +1807,7 @@ func injectLMBClickAtCoords(x, y int32) {
 			wincoe.MOUSEEVENTF_VIRTUALDESK |
 			wincoe.MOUSEEVENTF_MOVE |
 			wincoe.MOUSEEVENTF_LEFTUP
+	m1.DwExtraInfo = ourInputExtraInfoMarker
 
 	//you can "save and restore" the cursor position. Since GetCursorPos and SetCursorPos are extremely fast
 	// and don't involve the message queue, this will happen so quickly (sub-millisecond) that the user won't perceive the jump.
@@ -2110,6 +2377,255 @@ func updateTrayTooltipInputStateIfChanged() {
 	//if res := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&tipUpdate))); res.Failed() {
 	if res := wincoe.ShellNotifyIcon(wincoe.NIM_MODIFY, &tipUpdate); res.Failed() {
 		logf("updateTrayTooltipInputStateIfChanged: Shell_NotifyIconW(NIM_MODIFY) failed to refresh tray tooltip, err: %v", res.Err)
+	}
+}
+
+/* ---------------- Settings persistence ---------------- */
+
+// persistedSetting describes one boolean systray toggle that's saved to
+// settingsFilePath and restored at startup, keyed by name so the on-disk
+// format stays a simple, human-readable and human-editable "name =
+// true/false" list (matching this project's existing readcfg.env
+// convention) rather than a positional or binary format that would
+// silently corrupt if fields were ever reordered.
+type persistedSetting struct {
+	name string
+	get  func() bool
+	set  func(bool)
+
+	// skip, if non-nil and returns true, makes loadSettings ignore this
+	// setting's persisted value entirely for this run (keeping whatever
+	// value it already has instead of whatever's on disk). Used only by
+	// the disableFileLogging entry, so an explicit "-nolog"/"--nolog"
+	// command-line flag takes precedence over a stale persisted value from
+	// an earlier session -- see disableFileLoggingForcedByCmdline. Every
+	// other entry leaves this nil.
+	skip func() bool
+}
+
+// atomicBoolSetting constructs the get/set closures for the overwhelmingly
+// common case (a plain *atomic.Bool toggle with no skip condition), so each
+// ordinary entry in persistedSettings below is a single line.
+func atomicBoolSetting(name string, v *atomic.Bool) persistedSetting {
+	return persistedSetting{
+		name: name,
+		get:  v.Load,
+		set:  v.Store,
+	}
+}
+
+// settingsFilePath is the on-disk location of the persisted systray toggle
+// state. Deliberately a plain file next to the executable (matching this
+// project's existing readcfg.env/*_debug.log convention of resolving
+// relative to the process's current working directory, which
+// run.bat/runasadmin.bat already cd into before launching) rather than the
+// Windows registry: a file travels with the exe if the whole folder is
+// copied/moved elsewhere.
+const settingsFilePath = selfName + "_settings.ini"
+
+// fileWriterLoggerPtr backs settingsFileWriter's liveLogger (see
+// wincoe.NewWin11SafeFileWriter). Populated by initWincoeLogging() at the
+// same time as wincoe's own package-level logger, so settingsFileWriter's
+// internal diagnostic logging (e.g. a failed ReplaceFileW fallback) is
+// routed through the exact same async logChan-backed pipeline as
+// everything else in this codebase, rather than falling back to
+// GetBugLogger()'s raw-stderr default.
+var fileWriterLoggerPtr atomic.Pointer[slog.Logger]
+
+// settingsFileWriter performs the actual crash-safe write in saveSettings
+// (staging file + atomic ReplaceFileW swap on Windows -- see
+// win11SafeFileWriter's own doc comment in wincoe). Constructed once at
+// package init with generous-but-bounded retry parameters (matching the
+// kind of transient Windows file-lock contention -- Defender, Search
+// Indexer, backup agents -- RetryFileOp's own doc comment in wincoe already
+// documents); actual I/O is fully deferred until SafeWriteFile is called,
+// so constructing this before fileWriterLoggerPtr is populated is safe
+// (see GetLoggerOrFallback's nil-tolerant behavior).
+var settingsFileWriter = wincoe.NewWin11SafeFileWriter(true, 3, 50, &fileWriterLoggerPtr)
+
+// disableFileLoggingForcedByCmdline records whether "-nolog"/"--nolog" was
+// passed at the command line (see parseDisableFileLoggingCmdlineFlag). When
+// true, loadSettings() skips restoring a persisted "disableFileLogging"
+// value from settingsFilePath -- an explicit, just-now-typed command-line
+// flag is a stronger signal of current intent than whatever was saved from
+// some earlier session, and should not be silently overridden by it.
+//
+// Read and written only from the main goroutine before any other goroutine
+// could observe it (parseDisableFileLoggingCmdlineFlag runs at the very top
+// of main(), loadSettings() runs later in runApplication() but still
+// before go hookWorker()/anything else that could race it), so this is
+// deliberately a plain bool rather than an atomic -- consistent with this
+// file's existing isAdmin/isVirtualized package vars, which follow the
+// identical set-once-early/read-later-without-a-race pattern.
+var disableFileLoggingForcedByCmdline bool
+
+// persistedSettings is the single source of truth for which boolean
+// systray toggles survive a restart, and under what on-disk key name.
+// Adding a new persisted toggle means adding exactly one line here (via
+// atomicBoolSetting) -- saveSettings/loadSettings both iterate this table
+// generically instead of hand-rolling per-field (de)serialization code.
+var persistedSettings = []persistedSetting{
+	atomicBoolSetting("focusOnDrag", &focusOnDrag),
+	atomicBoolSetting("doLMBClick2FocusAsFallback", &doLMBClick2FocusAsFallback),
+	atomicBoolSetting("ratelimitOnMove", &ratelimitOnMove),
+	atomicBoolSetting("shouldLogDragRate", &shouldLogDragRate),
+	atomicBoolSetting("asyncResize", &asyncResize),
+	atomicBoolSetting("requireWinDownHeldDuringGesture", &requireWinDownHeldDuringGesture),
+	atomicBoolSetting("coalesceMoveResizeEvents", &coalesceMoveResizeEvents),
+	atomicBoolSetting("immediateOverlayRepaint", &immediateOverlayRepaint),
+	atomicBoolSetting("missedGestureRecoveryEnabled", &missedGestureRecoveryEnabled),
+	atomicBoolSetting("injectButtonUpOnMissedGestureRecovery", &injectButtonUpOnMissedGestureRecovery),
+	atomicBoolSetting("bringToFrontOnDrag", &bringToFrontOnDrag),
+	atomicBoolSetting("focusOnResize", &focusOnResize),
+	atomicBoolSetting("bringToFrontOnResize", &bringToFrontOnResize),
+	atomicBoolSetting("bringToFrontOnBackgroundClick", &bringToFrontOnBackgroundClick),
+	atomicBoolSetting("unfocusSentToBackWindow", &unfocusSentToBackWindow),
+	atomicBoolSetting("bypassGesturesWhenFullscreen", &bypassGesturesWhenFullscreen),
+	atomicBoolSetting("shiftMirrorResizeEnabled", &shiftMirrorResizeEnabled),
+	atomicBoolSetting("radialCenterResizeEnabled", &radialCenterResizeEnabled),
+	atomicBoolSetting("allowShiftHeldBeforeResizeGesture", &allowShiftHeldBeforeResizeGesture),
+	atomicBoolSetting("useThreadAttachInputForFocus", &useThreadAttachInputForFocus),
+	atomicBoolSetting("virtualizationDetectionEnabled", &virtualizationDetectionEnabled),
+	atomicBoolSetting("snapToEdgesEnabled", &snapToEdgesEnabled),
+	{
+		name: "disableFileLogging",
+		get:  disableFileLogging.Load,
+		set:  disableFileLogging.Store,
+		skip: func() bool { return disableFileLoggingForcedByCmdline },
+	},
+}
+
+// toggleAndPersist flips v and immediately persists all current settings to
+// disk (see saveSettings), so a toggle made via the tray menu survives an
+// unclean exit (crash, kill, power loss) just as reliably as a clean one --
+// there's no separate "save on exit" step to miss.
+func toggleAndPersist(v *atomic.Bool) {
+	v.Store(!v.Load())
+	saveSettings()
+}
+
+// saveSettings serializes every entry in persistedSettings to
+// settingsFilePath as simple "name = true"/"name = false" lines (one per
+// line, matching this project's existing readcfg.env key=value
+// convention), written via wincoe's crash-safe FileWriter so a mid-write
+// crash or power loss can never leave a truncated, unparsable settings
+// file behind.
+//
+// Called synchronously from the main thread every time a systray toggle
+// changes (see toggleAndPersist) -- a human clicking a tray menu item is
+// far too infrequent an event for the resulting tiny, synchronous file
+// write to matter, and TrackPopupMenu already blocks the main thread in
+// its own modal loop for the whole time the menu is open regardless.
+//
+// Failures are logged but otherwise swallowed: settings persistence is a
+// convenience, never a correctness requirement, and refusing to continue
+// running winbollocks just because its settings file couldn't be written
+// would be a wildly disproportionate response to e.g. a temporarily
+// locked/read-only file.
+func saveSettings() {
+	var b strings.Builder
+	b.WriteString("# winbollocks systray settings -- auto-generated, edit while winbollocks is NOT running or your edits may be overwritten.\n")
+	for _, s := range persistedSettings {
+		fmt.Fprintf(&b, "%s = %t\n", s.name, s.get())
+	}
+
+	// #nosec G302 -- 0644 not 0600: winbollocks often runs elevated (see
+	// readcfg.env's identical reasoning for winbollocks_debug.log), and the
+	// user should be able to read/edit their own settings file without
+	// needing to become admin to do so.
+	if err := settingsFileWriter.SafeWriteFile(settingsFilePath, []byte(b.String()), 0644); err != nil {
+		logf("saveSettings: failed to write %q, err: %v", settingsFilePath, err)
+	}
+}
+
+// loadSettings reads settingsFilePath (if present) and applies any
+// recognized "name = true"/"name = false" lines onto the matching entry in
+// persistedSettings, overriding whatever default that toggle's own init()
+// already set. Must run after every init() function that seeds a default
+// for one of these toggles (e.g. shiftMirrorResizeEnabled's
+// virtualization-dependent default), and before the tray menu can first be
+// shown, so the very first time a person opens the tray menu it already
+// reflects their saved choices rather than a fresh default that then flips
+// out from under them shortly after.
+//
+// A missing file is the ordinary, expected first-run state and is silently
+// ignored, NOT logged as an error. An unrecognized key (e.g. a setting that
+// existed in an older version and was since removed) is skipped with a log
+// line rather than treated as fatal, so a settings file written by a newer
+// or older build of winbollocks never prevents startup. A malformed value
+// (anything strconv.ParseBool can't parse) for a recognized key is
+// likewise skipped with a log line, leaving that one toggle at whatever its
+// own init()-computed default already was.
+func loadSettings() {
+	data, err := os.ReadFile(settingsFilePath) //nolint:gosec // G304: settingsFilePath is a fixed, hardcoded constant, never derived from user/network input
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logf("loadSettings: failed to read %q, err: %v; continuing with defaults", settingsFilePath, err)
+		}
+		return
+	}
+
+	byName := make(map[string]*persistedSetting, len(persistedSettings))
+	for i := range persistedSettings {
+		byName[persistedSettings[i].name] = &persistedSettings[i]
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for lineNum, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, val, found := strings.Cut(line, "=")
+		if !found {
+			logf("loadSettings: %q line %d: missing '=', skipping: %q", settingsFilePath, lineNum+1, rawLine)
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+
+		setting, ok := byName[key]
+		if !ok {
+			logf("loadSettings: %q line %d: unrecognized setting %q, skipping", settingsFilePath, lineNum+1, key)
+			continue
+		}
+		if setting.skip != nil && setting.skip() {
+			logf("loadSettings: %q line %d: skipping persisted %q for this run (overridden by an explicit command-line flag)", settingsFilePath, lineNum+1, key)
+			continue
+		}
+
+		parsed, err := strconv.ParseBool(val)
+		if err != nil {
+			logf("loadSettings: %q line %d: setting %q has unparsable value %q, skipping (keeping computed default), err: %v", settingsFilePath, lineNum+1, key, val, err)
+			continue
+		}
+		setting.set(parsed)
+	}
+}
+
+// parseDisableFileLoggingCmdlineFlag scans os.Args for "-nolog" or
+// "--nolog" and, if found, stores disableFileLogging=true and records that
+// it was forced by the command line (see disableFileLoggingForcedByCmdline).
+// Deliberately hand-rolled instead of using the standard "flag" package:
+// this is a GUI-subsystem app (-H=windowsgui builds have no console for
+// flag.Usage/parse-error output to reach, and unrecognized-flag handling
+// that calls os.Exit(2) would be unexpectedly disruptive for a background
+// utility normally launched via run.bat/a shortcut rather than typed
+// interactively), and a single boolean switch doesn't need more than a
+// simple linear scan.
+//
+// Must run before initLogFile() is ever reachable -- including via
+// internalLogger's own lazy fallback -- which in practice means as early as
+// possible in main(), before any logf()/directLoggerf() call (even
+// installCtrlHandlerIfConsole's and ensureSingleInstance's) could trigger
+// that lazy path first.
+func parseDisableFileLoggingCmdlineFlag() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-nolog" || arg == "--nolog" {
+			disableFileLogging.Store(true)
+			disableFileLoggingForcedByCmdline = true
+			return
+		}
 	}
 }
 
@@ -3982,10 +4498,21 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	// no effect://nolint:govet,unsafeptr // because
 	// info := (*MSLLHOOKSTRUCT)(unsafe.Pointer(p.(uintptr)))
 
-	if info.Flags&wincoe.LLMHF_INJECTED != 0 {
-		// This mouse event was generated by SendInput
-		// Do NOT treat it as user input
-		//res2 := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
+	if info.Flags&wincoe.LLMHF_INJECTED != 0 && info.DwExtraInfo == ourInputExtraInfoMarker {
+		// This mouse event was generated by OUR OWN SendInput calls (see
+		// ourInputExtraInfoMarker's doc comment) -- do NOT treat it as user
+		// input, or the shift-tap/LMB-click-fallback/missed-gesture-recovery
+		// button-up sequences we inject ourselves could recursively
+		// re-trigger gesture logic off of their own synthetic events.
+		//
+		// An event that IS flagged LLMHF_INJECTED but does NOT carry our
+		// marker was synthesized by something else entirely -- most notably
+		// a remote-control tool (RustDesk, TeamViewer, AnyDesk, etc.), which
+		// necessarily delivers the remote operator's real clicks via
+		// SendInput on this machine and therefore also arrives flagged
+		// injected, even though it represents genuine user intent. Such
+		// events fall through below and are processed exactly like ordinary
+		// physical input.
 		res2 := wincoe.CallNextHookEx(0, nCode, wParam, uintptr(lParam))
 		if nowDiff := time.Since(start); nowDiff > Duration5ms {
 			logf("stutter2 %d ns", nowDiff.Nanoseconds())
@@ -4203,6 +4730,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				//XXX: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
 				newX := r.Left + dx
 				newY := r.Top + dy
+				newX, newY = applySnapToEdgesForMove(session.targetWnd, newX, newY, r.Right-r.Left, r.Bottom-r.Top)
 				// procSetWindowPos.Call(
 				// 	uintptr(targetWnd),
 				// 	0,
@@ -5814,6 +6342,16 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
+				var snapFlags uint32 = wincoe.MF_STRING
+				if snapToEdgesEnabled.Load() {
+					snapFlags |= wincoe.MF_CHECKED
+				}
+				snapText := fmt.Sprintf("Snap window edges to the monitor's work-area edges (within %dpx) while moving/resizing", snapToEdgesThresholdPx)
+				appendMenuChecked(hMenu, snapFlags,
+					MENU_TOGGLE_SNAP_TO_EDGES, snapText)
+			}
+
+			{
 				var immediateOverlayRepaintFlags uint32 = wincoe.MF_STRING
 				if immediateOverlayRepaint.Load() {
 					immediateOverlayRepaintFlags |= wincoe.MF_CHECKED
@@ -5867,12 +6405,27 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
+				var vmDetectFlags uint32 = wincoe.MF_STRING
+				if virtualizationDetectionEnabled.Load() {
+					vmDetectFlags |= wincoe.MF_CHECKED
+				}
+				var vmDetectText string
+				if isVirtualized {
+					vmDetectText = fmt.Sprintf("Detect virtualization and default Shift-mirror resize off accordingly (currently detected: %s)", virtualizationEvidence)
+				} else {
+					vmDetectText = "Detect virtualization and default Shift-mirror resize off accordingly (none currently detected)"
+				}
+				appendMenuChecked(hMenu, vmDetectFlags,
+					MENU_TOGGLE_VIRTUALIZATION_DETECTION, vmDetectText)
+			}
+
+			{
 				var shiftMirrorFlags uint32 = wincoe.MF_STRING
 				if shiftMirrorResizeEnabled.Load() {
 					shiftMirrorFlags |= wincoe.MF_CHECKED
 				}
 				var shiftMirrorText string
-				if isVirtualized {
+				if isEffectivelyVirtualized() {
 					shiftMirrorText = "Shift-held resize cursor-warp accelerator (defaulted OFF: virtualization detected; host may fight the warp and instantly shrink the window)"
 				} else {
 					shiftMirrorText = "Shift-held resize cursor-warp accelerator (warps cursor to the opposite edge/corner mid-resize; ignored in center zone)"
@@ -5899,6 +6452,16 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				shiftBeforeText := "Allow Shift held before Win+RMB to start resize (shift+winkey+RMB; corners start mirrored from opposite edge)"
 				appendMenuChecked(hMenu, shiftBeforeFlags,
 					MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE, shiftBeforeText)
+			}
+
+			{
+				var noFileLogFlags uint32 = wincoe.MF_STRING
+				if disableFileLogging.Load() {
+					noFileLogFlags |= wincoe.MF_CHECKED
+				}
+				noFileLogText := "Stop logging to file (console/devbuild output, if any, is unaffected)"
+				appendMenuChecked(hMenu, noFileLogFlags,
+					MENU_TOGGLE_DISABLE_FILE_LOGGING, noFileLogText)
 			}
 
 			{
@@ -6013,11 +6576,11 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			switch cmd {
 			case MENU_ACTIVATE_MOVE:
-				focusOnDrag.Store(!focusOnDrag.Load())
+				toggleAndPersist(&focusOnDrag)
 			case MENU_USE_LMB_TO_FOCUS_AS_FALLBACK:
-				doLMBClick2FocusAsFallback.Store(!doLMBClick2FocusAsFallback.Load())
+				toggleAndPersist(&doLMBClick2FocusAsFallback)
 			case MENU_RATELIMIT_MOVES:
-				ratelimitOnMove.Store(!ratelimitOnMove.Load())
+				toggleAndPersist(&ratelimitOnMove)
 				if !ratelimitOnMove.Load() {
 					moveCounter.Store(0)
 					actualPostCounter.Store(0)
@@ -6029,7 +6592,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 					lastPostedY.Store(-1)
 				}
 			case MENU_LOG_RATE_OF_MOVES:
-				shouldLogDragRate.Store(!shouldLogDragRate.Load())
+				toggleAndPersist(&shouldLogDragRate)
 				// If the user just turned logging ON, flush out old state
 				// so the very first log statement starts fresh!
 				if shouldLogDragRate.Load() { // When turning ON
@@ -6045,52 +6608,61 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				}
 
 			case MENU_TOGGLE_ASYNC_RESIZE:
-				asyncResize.Store(!asyncResize.Load())
+				toggleAndPersist(&asyncResize)
 
 			case MENU_TOGGLE_REQUIRE_WINDOWN:
-				requireWinDownHeldDuringGesture.Store(!requireWinDownHeldDuringGesture.Load())
+				toggleAndPersist(&requireWinDownHeldDuringGesture)
 
 			case MENU_TOGGLE_COALESCE_EVENTS:
-				coalesceMoveResizeEvents.Store(!coalesceMoveResizeEvents.Load())
+				toggleAndPersist(&coalesceMoveResizeEvents)
 
 			case MENU_TOGGLE_IMMEDIATE_OVERLAY_REPAINT:
-				immediateOverlayRepaint.Store(!immediateOverlayRepaint.Load())
+				toggleAndPersist(&immediateOverlayRepaint)
 
 			case MENU_TOGGLE_MISSED_GESTURE_RECOVERY:
-				missedGestureRecoveryEnabled.Store(!missedGestureRecoveryEnabled.Load())
+				toggleAndPersist(&missedGestureRecoveryEnabled)
 
 			case MENU_TOGGLE_INJECT_BUTTON_UP_ON_RECOVERY:
-				injectButtonUpOnMissedGestureRecovery.Store(!injectButtonUpOnMissedGestureRecovery.Load())
+				toggleAndPersist(&injectButtonUpOnMissedGestureRecovery)
 
 			case MENU_TOGGLE_BRING_TO_FRONT_ON_DRAG:
-				bringToFrontOnDrag.Store(!bringToFrontOnDrag.Load())
+				toggleAndPersist(&bringToFrontOnDrag)
 
 			case MENU_TOGGLE_ACTIVATE_RESIZE:
-				focusOnResize.Store(!focusOnResize.Load())
+				toggleAndPersist(&focusOnResize)
 
 			case MENU_TOGGLE_BRING_TO_FRONT_ON_RESIZE:
-				bringToFrontOnResize.Store(!bringToFrontOnResize.Load())
+				toggleAndPersist(&bringToFrontOnResize)
 
 			case MENU_TOGGLE_BRING_TO_FRONT_ON_BACKGROUND_CLICK:
-				bringToFrontOnBackgroundClick.Store(!bringToFrontOnBackgroundClick.Load())
+				toggleAndPersist(&bringToFrontOnBackgroundClick)
 
 			case MENU_TOGGLE_UNFOCUS_SENT_TO_BACK:
-				unfocusSentToBackWindow.Store(!unfocusSentToBackWindow.Load())
+				toggleAndPersist(&unfocusSentToBackWindow)
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
-				bypassGesturesWhenFullscreen.Store(!bypassGesturesWhenFullscreen.Load())
+				toggleAndPersist(&bypassGesturesWhenFullscreen)
 
 			case MENU_TOGGLE_SHIFT_MIRROR_RESIZE:
-				shiftMirrorResizeEnabled.Store(!shiftMirrorResizeEnabled.Load())
+				toggleAndPersist(&shiftMirrorResizeEnabled)
 
 			case MENU_TOGGLE_RADIAL_CENTER_RESIZE:
-				radialCenterResizeEnabled.Store(!radialCenterResizeEnabled.Load())
+				toggleAndPersist(&radialCenterResizeEnabled)
 
 			case MENU_TOGGLE_SHIFT_HELD_BEFORE_RESIZE:
-				allowShiftHeldBeforeResizeGesture.Store(!allowShiftHeldBeforeResizeGesture.Load())
+				toggleAndPersist(&allowShiftHeldBeforeResizeGesture)
 
 			case MENU_TOGGLE_USE_THREADATTACHINPUT_FOR_FOCUS:
-				useThreadAttachInputForFocus.Store(!useThreadAttachInputForFocus.Load())
+				toggleAndPersist(&useThreadAttachInputForFocus)
+
+			case MENU_TOGGLE_VIRTUALIZATION_DETECTION:
+				toggleAndPersist(&virtualizationDetectionEnabled)
+
+			case MENU_TOGGLE_SNAP_TO_EDGES:
+				toggleAndPersist(&snapToEdgesEnabled)
+
+			case MENU_TOGGLE_DISABLE_FILE_LOGGING:
+				toggleAndPersist(&disableFileLogging)
 
 			case MENU_EXIT:
 				//procUnhookWindowsHookEx.Call(uintptr(mouseHook))
@@ -6369,6 +6941,7 @@ func initWincoeLogging() {
 	bridge := slog.New(&slogBridge{})
 	wincoe.SetLogger(bridge)
 	wincoe.SetBugLogger(bridge)
+	fileWriterLoggerPtr.Store(bridge)
 }
 
 var (
@@ -6750,10 +7323,11 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		now is this mandatory
 		Without this, your injected Win-UP would recursively trigger injectShiftTapThenWinUp again and you’d summon an infinite keyboard demon 👹
 	*/
-	if k.Flags&wincoe.LLKHF_INJECTED != 0 {
-		// This key event was generated by SendInput
-		// Do NOT treat it as user input
-		//res2 := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
+	if k.Flags&wincoe.LLKHF_INJECTED != 0 && k.DwExtraInfo == ourInputExtraInfoMarker {
+		// See the identical, more detailed comment on the equivalent check
+		// in mouseProc: only OUR OWN tagged synthetic key events are
+		// filtered out here; an injected event from something else (e.g. a
+		// remote-control tool) falls through and is treated as real input.
 		res2 := wincoe.CallNextHookEx(0, nCode, wParam, uintptr(lParam))
 		return res2.R1
 	}
@@ -7025,6 +7599,16 @@ var (
 	virtualizationEvidence string
 )
 
+// isEffectivelyVirtualized reports whether virtualization should currently
+// be treated as detected for gating purposes, honoring the user's
+// virtualizationDetectionEnabled systray toggle. isVirtualized itself (the
+// raw detection result) is always computed unconditionally at startup --
+// see detectVirtualization -- this only gates whether that result is
+// allowed to actually influence behavior/defaults.
+func isEffectivelyVirtualized() bool {
+	return virtualizationDetectionEnabled.Load() && isVirtualized
+}
+
 var isAdmin bool // Package level
 func init() {
 	// This runs automatically before main()
@@ -7038,6 +7622,7 @@ func init() {
 	isAdmin = token.IsElevated() // must init this before setting missedGestureRecoveryEnabled which depends on it, so either put it in same init() and do it first(like now), or put its init() before the init() of missedGestureRecoveryEnabled
 
 	isVirtualized, virtualizationEvidence = detectVirtualization() // must init this before setting shiftMirrorResizeEnabled below, same reasoning as isAdmin above
+	virtualizationDetectionEnabled.Store(true)                     // default on; matches this project's prior always-on detection behavior -- see its own doc comment
 
 	//defaults:
 	const bringToFrontByDefaultOnGesture = true
@@ -7073,9 +7658,11 @@ func init() {
 	injectButtonUpOnMissedGestureRecovery.Store(false) // default off, see doc comment on the var
 
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
+	snapToEdgesEnabled.Store(true)            // default on actually
+	disableFileLogging.Store(false)           // default off; file logging stays on unless explicitly disabled via -nolog/--nolog or systray
 
-	shiftMirrorResizeEnabled.Store(!isVirtualized) // default off under a detected hypervisor guest; see its own doc comment
-	allowShiftHeldBeforeResizeGesture.Store(true)  // default on; shift+winkey+RMB starts resize with Shift effect applied
+	shiftMirrorResizeEnabled.Store(!isEffectivelyVirtualized()) // default off under a detected (and detection-enabled) hypervisor guest; see its own doc comment
+	allowShiftHeldBeforeResizeGesture.Store(true)               // default on; shift+winkey+RMB starts resize with Shift effect applied
 
 	lastPostedX.Store(-1)
 	lastPostedY.Store(-1)
@@ -7395,6 +7982,20 @@ func internalLogger(finalMsg string) {
 		return
 	}
 
+	if disableFileLogging.Load() {
+		// File logging is disabled (see disableFileLogging's own doc
+		// comment) -- deliberately never even opens/creates the log file
+		// while this is set, matching "-nolog"/"--nolog"'s literal promise
+		// of no logging to file at all. NOTE: since this codepath only
+		// runs when canUseConsoleStderr is false (a -H=windowsgui build
+		// with no console), this also means uncaught Go runtime
+		// panics/fatal errors -- which write directly to os.Stderr,
+		// bypassing this function entirely -- have nowhere to land for as
+		// long as file logging stays disabled and no console is attached.
+		// Accepted tradeoff for an explicitly opt-in feature.
+		return
+	}
+
 	lf := logFile.Load()
 	if lf == nil {
 		initLogFile()
@@ -7567,6 +8168,11 @@ func main() {
 	// 1. Lock THIS specific thread (Thread A) to the OS for Win32/Hooks.
 	runtime.LockOSThread() // first! in main() not in init() ! That runtime.LockOSThread() call in main is there because of a specific Windows requirement: Hooks and Message Loops are thread-bound.
 	token := theILockedMainThreadToken{}
+
+	// Must run before any logf()/directLoggerf() call can possibly reach
+	// internalLogger's lazy initLogFile() fallback -- see
+	// parseDisableFileLoggingCmdlineFlag's own doc comment.
+	parseDisableFileLoggingCmdlineFlag()
 	/*
 	   	When you call go func() { ... }(), you are telling the Go Scheduler to create a new goroutine.
 	   	Unless you explicitly call runtime.LockOSThread() inside that new goroutine,
@@ -7690,8 +8296,13 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	// --- DEFENSIVE FIX: EAGER INITIALIZATION ---
 	// Initialize the log file early so STD_ERROR_HANDLE is redirected
 	// before any complex logic runs.
-	initLogFile()
+	if !disableFileLogging.Load() {
+		initLogFile()
+	}
 	initWincoeLogging() // ← must be before any wincoe calls
+
+	settingsFileWriter.CheckPowerLossFile(settingsFilePath)
+	loadSettings()
 
 	// Capture the actual terminal/console window that launched us
 	//resFg := procGetForegroundWindow.Call()
@@ -7699,9 +8310,12 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	startupTerminalHwnd = getForegroundWindow()
 
 	logf("Started %s %s", selfName, GetVersion())
-	if isVirtualized {
+	switch {
+	case isVirtualized && virtualizationDetectionEnabled.Load():
 		logf("Detected running under virtualization (%s); Shift-mirror resize cursor-warp accelerator defaults to disabled (toggle via systray if you find it actually works fine for you)", virtualizationEvidence)
-	} else {
+	case isVirtualized:
+		logf("Detected running under virtualization (%s), but the virtualization-detection systray toggle is off; Shift-mirror resize cursor-warp accelerator defaults to enabled anyway", virtualizationEvidence)
+	default:
 		logf("No virtualization signature detected; Shift-mirror resize cursor-warp accelerator defaults to enabled")
 	}
 	initDarkMode() // ← Tell Windows to enable modern theme support for menus
@@ -8767,24 +9381,26 @@ func initForegroundIntegrityState() {
 // click-drag (e.g. a console extending a text selection) while we drive the
 // window move/resize ourselves.
 func injectMouseButtonUp(flag uint32) {
-	// inputs := []wincoe.KEYANDMOUSE_INPUT{
-	// 	{
-	// 		Type: INPUT_MOUSE,
-	// 		Ki:   wincoe.KEYBDINPUT{}, // union placeholder
-	// 	},
-	// }
+	// lmbClickInputs[1:] is a length-1 slice containing only the LEFTUP
+	// event; rmbUpInputs is likewise a length-1 array holding the RIGHTUP
+	// event -- see rmbUpInputs' own doc comment for why this needs its own
+	// pre-built, tagged array rather than being synthesized fresh here.
+	//
+	// XXX: this function used to unconditionally send lmbClickInputs[1:]
+	// (LEFTUP) regardless of the flag argument, silently injecting a bare
+	// LMB-up even when called as injectRMBUp() -- fixed here to actually
+	// dispatch based on flag.
+	var inputs []wincoe.KEYANDMOUSE_INPUT
+	switch flag {
+	case wincoe.MOUSEEVENTF_LEFTUP:
+		inputs = lmbClickInputs[1:]
+	case wincoe.MOUSEEVENTF_RIGHTUP:
+		inputs = rmbUpInputs[:]
+	default:
+		panic2(fmt.Sprintf("BUG: injectMouseButtonUp called with unsupported flag 0x%x", flag))
+	}
 
-	// //	(*MOUSEINPUT)(unsafe.Pointer(&inputs[0].Ki)).DwFlags = flag
-	// mouseInputView(&inputs[0]).DwFlags = flag
-
-	// res1 := procSendInput.Call(
-	// 	uintptr(len(inputs)),
-	// 	uintptr(unsafe.Pointer(&inputs[0])),
-	// 	unsafe.Sizeof(inputs[0]),
-	// )
-
-	// lmbClickInputs[1:] creates a slice of length 1 containing ONLY the LEFTUP event, ie. skips the first one
-	if res1 := wincoe.SendInput(lmbClickInputs[1:]); res1.Failed() || res1.R1 != 1 {
+	if res1 := wincoe.SendInput(inputs); res1.Failed() || res1.R1 != 1 {
 		logf("SendInput mouse button-up injection (flag=0x%x) failed: ret=%d err=%v", flag, res1.R1, res1.Err)
 	}
 }

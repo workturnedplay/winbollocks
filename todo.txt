@@ -1,16 +1,5 @@
 todos for winbollocks:
 
-* maybe make the detection of virtualbox be setable in systray (default to true)
-* are we also detecting vmware too? we should.
-
-* with rustdesk on a client with winbollocks(aka our program) running, winkey is detected as down in async state, but likely ignored in our keyboard hook due to ignoring all injected keys and rustdesk likely injects it! So how do we "fix" this without opening it to our own injected events like winkey UP. Or I guess we don't inject winkey down so that could be excepted ? also worth checking if mouse events are injected as well, plus buttons, by rustdesk, then this means they're ignored as well?! this will probably me way harder to except then, if we can even except the keyboard one at all (unsure fully yet).
-
-* snap to edges (should be a bool) when moving or resizing.
-
-* option to stop all logging to file (if given the right cmdline arg, but also from systray bool setting)
-
-* maybe remember systray settings, keep them in registry?! or in-file would be better, ideal, because can be moved easily.
-
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
@@ -99,3 +88,15 @@ hallucinated/hand-waved:
 
 
 done:
+//* maybe make the detection of virtualbox be setable in systray (default to true)
+//* are we also detecting vmware too? we should. "VMware is already covered — vmSignatureSubstrings already includes "vmware", matched against SystemManufacturer/SystemProductName/etc. in vmRegistrySignatureSources. No change needed there." - Claude
+
+//* with rustdesk on a client with winbollocks(aka our program) running, winkey is detected as down in async state, but likely ignored in our keyboard hook due to ignoring all injected keys and rustdesk likely injects it! So how do we "fix" this without opening it to our own injected events like winkey UP. Or I guess we don't inject winkey down so that could be excepted ? also worth checking if mouse events are injected as well, plus buttons, by rustdesk, then this means they're ignored as well?! this will probably me way harder to except then, if we can even except the keyboard one at all (unsure fully yet).
+
+//* snap to edges (should be a bool) when moving or resizing.
+
+//* option to stop all logging to file (if given the right cmdline arg, but also from systray bool setting)
+
+//* maybe remember systray settings, keep them in registry?! or in-file would be better, ideal, because can be moved easily.
+
+//Fix injectMouseButtonUp — while wiring the marker through here I found it silently ignores its flag argument and always injects an LMB-up, even when called via injectRMBUp() (used for RMB missed-gesture-recovery during a resize). The log line claims "Injecting synthetic RMB-up" but a bare LMB-up was actually being sent:
