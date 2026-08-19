@@ -1,5 +1,7 @@
 todos for winbollocks:
 
+* if i move or resize my own systray menu the mouse icon remains the last used (move or resize arrows) when LMB/RMB is released; this doesn't happen for normal windows though, unclear why but need to fix it.
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
