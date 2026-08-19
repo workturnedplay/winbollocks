@@ -2524,7 +2524,7 @@ func toggleAndPersist(v *atomic.Bool) {
 // locked/read-only file.
 func saveSettings() {
 	var b strings.Builder
-	b.WriteString("# winbollocks systray settings -- auto-generated, edit while winbollocks is NOT running or your edits may be overwritten.\n")
+	b.WriteString("# winbollocks systray settings -- auto-generated, edit while winbollocks is NOT running or your edits will be overwritten/lost!\n")
 	for _, s := range persistedSettings {
 		fmt.Fprintf(&b, "%s = %t\n", s.name, s.get())
 	}
