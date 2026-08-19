@@ -1257,6 +1257,7 @@ var (
 	Ntdll    = windows.NewLazySystemDLL("ntdll.dll")
 	Wtsapi32 = windows.NewLazySystemDLL("wtsapi32.dll")
 	Setupapi = windows.NewLazySystemDLL("setupapi.dll")
+	Dwmapi   = windows.NewLazySystemDLL("dwmapi.dll")
 
 	procGetExtendedUdpTable = NewBoundProc6(Iphlpapi, "GetExtendedUdpTable", CheckErrno)
 	procGetExtendedTcpTable = NewBoundProc6(Iphlpapi, "GetExtendedTcpTable", CheckErrno)
@@ -1568,6 +1569,13 @@ var (
 	procSetupDiGetDeviceRegistryProperty = NewBoundProc7(Setupapi, "SetupDiGetDeviceRegistryPropertyW", CheckBool)
 	procSetupDiSetClassInstallParams     = NewBoundProc4(Setupapi, "SetupDiSetClassInstallParamsW", CheckBool)
 	procSetupDiCallClassInstaller        = NewBoundProc3(Setupapi, "SetupDiCallClassInstaller", CheckBool)
+
+	// procDwmGetWindowAttribute is lazy (not eagerly resolved) purely for
+	// consistency with this file's other rarely-used, non-core-DLL procs
+	// (e.g. procSetProcessDpiAwarenessContext) -- dwmapi.dll and this
+	// specific export have been present on every Windows version since
+	// Vista, so eager resolution would also be safe.
+	procDwmGetWindowAttribute = NewLazyBoundProc4(Dwmapi, "DwmGetWindowAttribute", CheckHRESULT)
 )
 
 // auto runs before main(), loads the DLLs non-lazily.
@@ -3824,6 +3832,38 @@ func GetWindowRect(hwnd windows.Handle, rect *RECT) WinResult {
 // GetClientRect retrieves the coordinates of a window's client area.
 func GetClientRect(hwnd windows.Handle, rect *RECT) WinResult {
 	return procGetClientRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)))
+}
+
+// DWMWA_EXTENDED_FRAME_BOUNDS is the DwmGetWindowAttribute attribute that
+// retrieves a window's true visible bounds via the desktop window manager,
+// as opposed to GetWindowRect's rect, which additionally includes the
+// invisible resize-grab padding Windows 10+ adds around the left/right/
+// bottom edges (not the top) of resizable top-level windows.
+const DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+// DwmGetExtendedFrameBounds retrieves hwnd's true visible screen bounds via
+// DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS), as opposed to
+// GetWindowRect's rect, which additionally includes several pixels of
+// invisible resize-grab padding around the left/right/bottom edges (not the
+// top) of resizable top-level windows on Windows 10+. Callers that need to
+// align a window's actually-visible edge against something (e.g. snapping
+// to a monitor's work-area edge) should use the difference between this and
+// GetWindowRect rather than GetWindowRect alone, or the alignment will
+// visually undershoot by that padding on three of the four sides.
+//
+//go:uintptrescapes
+func DwmGetExtendedFrameBounds(hwnd windows.Handle) (RECT, error) {
+	var r RECT
+	res := procDwmGetWindowAttribute.Call(
+		uintptr(hwnd),
+		uintptr(DWMWA_EXTENDED_FRAME_BOUNDS),
+		uintptr(unsafe.Pointer(&r)),
+		unsafe.Sizeof(r),
+	)
+	if res.Failed() {
+		return RECT{}, fmt.Errorf("DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) failed: %w", res.Err)
+	}
+	return r, nil
 }
 
 const (

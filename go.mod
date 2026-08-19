@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/tc-hib/winres v0.3.1
-	github.com/workturnedplay/wincoe v0.10.8
+	github.com/workturnedplay/wincoe v0.10.9
 	golang.org/x/sys v0.47.0
 )
 

@@ -543,6 +543,20 @@ type dragSession struct {
 	// move resize reads THIS field rather than live GetAsyncKeyState so a
 	// Shift held before the gesture still takes effect for the whole drag.
 	centerShrinkActive bool
+
+	// visualInsetLeft/Top/Right/Bottom record how far GetWindowRect's rect
+	// extends beyond targetWnd's actual visible bounds on each side (see
+	// windowVisualEdgeInsets), captured once when this gesture began and
+	// carried through unchanged across any Shift-mirror toggle (same
+	// carried-through-unchanged treatment as originalRect/originalPt) --
+	// recomputing this on every WM_MOUSEMOVE would mean an extra
+	// GetWindowRect + DwmGetWindowAttribute (a DWM IPC round-trip, not a
+	// cheap local USER32 getter) on the hook thread's hottest path, which
+	// this codebase treats as a stutter risk worth avoiding (see e.g.
+	// Duration5ms's stutter-logging throughout mouseProc). A window's
+	// frame styling doesn't change mid-gesture, so these are safe to
+	// compute exactly once and reuse for the gesture's entire duration.
+	visualInsetLeft, visualInsetTop, visualInsetRight, visualInsetBottom int32
 }
 
 // A single atomic pointer handles the entire active state machine.
@@ -925,6 +939,52 @@ func snappedEdgeOrOriginal(target, workEdge int32) int32 {
 	return target
 }
 
+// windowVisualEdgeInsets returns how much GetWindowRect's rect extends
+// beyond hwnd's actual visible bounds on each side, via
+// wincoe.DwmGetExtendedFrameBounds. On Windows 10+, resizable top-level
+// windows carry several pixels of invisible resize-grab padding on the
+// left/right/bottom edges (not the top) that GetWindowRect includes but
+// which isn't part of what the user actually sees on screen -- snapping
+// the raw GetWindowRect edges to a monitor's work-area edge therefore
+// visually undershoots by that padding on three sides while looking
+// correct on the fourth (top). Callers should snap against R_edge±inset
+// (see applySnapToEdgesForMove/applySnapToEdgesForResize) rather than the
+// raw GetWindowRect edge directly.
+//
+// Returns all-zero insets (a no-op, falling back to the prior -- slightly
+// off -- snapping behavior) if either Win32 call fails, or if the computed
+// insets come back negative (which would indicate the "visual" rect is
+// somehow larger than the actual rect -- shouldn't happen for
+// DWMWA_EXTENDED_FRAME_BOUNDS, but untrustworthy data is worth ignoring
+// rather than acting on).
+//
+// Deliberately called only once per gesture (at gesture start -- see
+// dragSession.visualInsetLeft's doc comment) rather than on every mouse
+// move: DwmGetWindowAttribute is a round-trip to dwm.exe, not a cheap local
+// USER32 getter, and this codebase treats added latency on the hook
+// thread's hottest path as a stutter risk worth avoiding.
+func windowVisualEdgeInsets(hwnd windows.Handle) (left, top, right, bottom int32) {
+	var r wincoe.RECT
+	if res := wincoe.GetWindowRect(hwnd, &r); res.Failed() {
+		logf("windowVisualEdgeInsets: GetWindowRect failed for HWND=0x%X: %v; snap-to-edges will use unmodified GetWindowRect coordinates for this gesture", hwnd, res.Err)
+		return 0, 0, 0, 0
+	}
+	visual, err := wincoe.DwmGetExtendedFrameBounds(hwnd)
+	if err != nil {
+		logf("windowVisualEdgeInsets: DwmGetExtendedFrameBounds failed for HWND=0x%X: %v; snap-to-edges will use unmodified GetWindowRect coordinates for this gesture", hwnd, err)
+		return 0, 0, 0, 0
+	}
+	left = visual.Left - r.Left
+	top = visual.Top - r.Top
+	right = r.Right - visual.Right
+	bottom = r.Bottom - visual.Bottom
+	if left < 0 || top < 0 || right < 0 || bottom < 0 {
+		logf("windowVisualEdgeInsets: computed a negative inset for HWND=0x%X (left=%d top=%d right=%d bottom=%d); ignoring and using unmodified GetWindowRect coordinates for this gesture", hwnd, left, top, right, bottom)
+		return 0, 0, 0, 0
+	}
+	return left, top, right, bottom
+}
+
 // applySnapToEdgesForMove nudges the whole window flush against whichever
 // monitor work-area edge(s) it's already within snapToEdgesThresholdPx of,
 // preserving w/h exactly -- a move never resizes. No-op (returns x, y
@@ -935,27 +995,30 @@ func snappedEdgeOrOriginal(target, workEdge int32) int32 {
 // somehow within threshold of both opposite edges at once -- only possible
 // for a window narrower/shorter than 2*snapToEdgesThresholdPx, in which
 // case either choice is equally reasonable.
-func applySnapToEdgesForMove(hwnd windows.Handle, x, y, w, h int32) (int32, int32) {
+func applySnapToEdgesForMove(session *dragSession, x, y, w, h int32) (int32, int32) {
 	if !snapToEdgesEnabled.Load() {
 		return x, y
 	}
-	work, ok := monitorWorkAreaFor(hwnd)
+	work, ok := monitorWorkAreaFor(session.targetWnd)
 	if !ok {
 		return x, y
 	}
+	insetLeft, insetTop, insetRight, insetBottom := session.visualInsetLeft, session.visualInsetTop, session.visualInsetRight, session.visualInsetBottom
 
+	// Snap against the window's VISIBLE edge (x+insetLeft, etc.), not the
+	// raw GetWindowRect edge -- see windowVisualEdgeInsets's doc comment.
 	switch {
-	case absInt32(x-work.Left) <= snapToEdgesThresholdPx:
-		x = work.Left
-	case absInt32((x+w)-work.Right) <= snapToEdgesThresholdPx:
-		x = work.Right - w
+	case absInt32((x+insetLeft)-work.Left) <= snapToEdgesThresholdPx:
+		x = work.Left - insetLeft
+	case absInt32((x+w-insetRight)-work.Right) <= snapToEdgesThresholdPx:
+		x = work.Right + insetRight - w
 	}
 
 	switch {
-	case absInt32(y-work.Top) <= snapToEdgesThresholdPx:
-		y = work.Top
-	case absInt32((y+h)-work.Bottom) <= snapToEdgesThresholdPx:
-		y = work.Bottom - h
+	case absInt32((y+insetTop)-work.Top) <= snapToEdgesThresholdPx:
+		y = work.Top - insetTop
+	case absInt32((y+h-insetBottom)-work.Bottom) <= snapToEdgesThresholdPx:
+		y = work.Bottom + insetBottom - h
 	}
 
 	return x, y
@@ -974,27 +1037,39 @@ func applySnapToEdgesForMove(hwnd windows.Handle, x, y, w, h int32) (int32, int3
 // since snapToEdgesThresholdPx is far smaller than any realistic minimum
 // window size -- but a snapped-into-degenerate rect is worth refusing
 // outright rather than silently handing the caller a nonsensical result).
-func applySnapToEdgesForResize(hwnd windows.Handle, l, t, r, b int32, mask edgeSnapMask) (int32, int32, int32, int32) {
+func applySnapToEdgesForResize(session *dragSession, l, t, r, b int32, mask edgeSnapMask) (int32, int32, int32, int32) {
 	if !snapToEdgesEnabled.Load() || mask == 0 {
 		return l, t, r, b
 	}
-	work, ok := monitorWorkAreaFor(hwnd)
+	work, ok := monitorWorkAreaFor(session.targetWnd)
 	if !ok {
 		return l, t, r, b
 	}
+	insetLeft, insetTop, insetRight, insetBottom := session.visualInsetLeft, session.visualInsetTop, session.visualInsetRight, session.visualInsetBottom
 
+	// snappedEdgeOrOriginal is evaluated against the VISIBLE edge
+	// (l+insetLeft, r-insetRight, etc.), and the result converted back into
+	// GetWindowRect space -- see windowVisualEdgeInsets's doc comment.
 	snappedL, snappedT, snappedR, snappedB := l, t, r, b
 	if mask&snapEdgeLeft != 0 {
-		snappedL = snappedEdgeOrOriginal(l, work.Left)
+		if visual := snappedEdgeOrOriginal(l+insetLeft, work.Left); visual != l+insetLeft {
+			snappedL = visual - insetLeft
+		}
 	}
 	if mask&snapEdgeTop != 0 {
-		snappedT = snappedEdgeOrOriginal(t, work.Top)
+		if visual := snappedEdgeOrOriginal(t+insetTop, work.Top); visual != t+insetTop {
+			snappedT = visual - insetTop
+		}
 	}
 	if mask&snapEdgeRight != 0 {
-		snappedR = snappedEdgeOrOriginal(r, work.Right)
+		if visual := snappedEdgeOrOriginal(r-insetRight, work.Right); visual != r-insetRight {
+			snappedR = visual + insetRight
+		}
 	}
 	if mask&snapEdgeBottom != 0 {
-		snappedB = snappedEdgeOrOriginal(b, work.Bottom)
+		if visual := snappedEdgeOrOriginal(b-insetBottom, work.Bottom); visual != b-insetBottom {
+			snappedB = visual + insetBottom
+		}
 	}
 
 	if snappedL >= snappedR || snappedT >= snappedB {
@@ -1103,6 +1178,10 @@ func handleShiftMirrorToggle(session *dragSession, cursorPt wincoe.POINT, shiftD
 		initialAspectRatio:       float64(w) / float64(h),
 		originalRect:             session.originalRect, // carried through unchanged, see doc comment
 		originalPt:               session.originalPt,
+		visualInsetLeft:          session.visualInsetLeft,
+		visualInsetTop:           session.visualInsetTop,
+		visualInsetRight:         session.visualInsetRight,
+		visualInsetBottom:        session.visualInsetBottom,
 	}
 
 	if shiftDown {
@@ -1333,7 +1412,7 @@ func calculateResize(session *dragSession, currentPt wincoe.POINT, zone int, shi
 			newB += dy
 		}
 
-		newL, newT, newR, newB = applySnapToEdgesForResize(session.targetWnd, newL, newT, newR, newB, snapEdgeMaskForResizeZone(zone))
+		newL, newT, newR, newB = applySnapToEdgesForResize(session, newL, newT, newR, newB, snapEdgeMaskForResizeZone(zone))
 
 		x, y = newL, newT
 		w, h = newR-newL, newB-newT
@@ -2629,6 +2708,64 @@ func parseDisableFileLoggingCmdlineFlag() {
 	}
 }
 
+// readPersistedDisableFileLoggingEarly performs a minimal, standalone read
+// of just the "disableFileLogging" key from settingsFilePath, intended to
+// run BEFORE logWorker starts and before initLogFile() is first reachable.
+//
+// This exists because the generic loadSettings() (which parses every
+// persisted setting, including this one) doesn't run until partway through
+// runApplication() -- by then, logWorker has typically already been
+// started (see main()) and several logf() calls have already happened
+// during package init()/early main() setup, all queued into logChan and
+// drained concurrently by logWorker. Without this early read, those
+// startup messages get judged against disableFileLogging's zero-value
+// default (false) at the moment logWorker actually writes them, so a
+// persisted "disableFileLogging = true" from a prior session wouldn't
+// suppress those first few file-log lines until loadSettings() got around
+// to applying it -- a handful of lines still landing in the file even
+// though the user asked for no file logging.
+//
+// A missing file, an unparsable/missing key, or any read error is
+// perfectly ordinary (first run, or the setting was never toggled from its
+// default) and is silently treated as "leave disableFileLogging at
+// whatever it already is" (false, unless "-nolog"/"--nolog" already set
+// it) -- exactly matching loadSettings()'s own error-tolerance philosophy:
+// a settings-file problem must never make log lines silently vanish that
+// wouldn't otherwise have been dropped.
+//
+// Deliberately does not log anything itself (logging isn't up yet at the
+// point this must run) and defers entirely to the later loadSettings()
+// call for diagnostics and for applying every OTHER persisted setting --
+// this only ever touches disableFileLogging, and loadSettings() re-reads
+// and re-applies the exact same key again shortly after, redundantly but
+// harmlessly.
+func readPersistedDisableFileLoggingEarly() {
+	if disableFileLoggingForcedByCmdline {
+		return // an explicit command-line flag always wins; nothing to read
+	}
+
+	data, err := os.ReadFile(settingsFilePath) //nolint:gosec // G304: settingsFilePath is a fixed, hardcoded constant, never derived from user/network input
+	if err != nil {
+		return // missing file (first run) or unreadable; leave default
+	}
+
+	const wantedKey = "disableFileLogging"
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, val, found := strings.Cut(line, "=")
+		if !found || strings.TrimSpace(key) != wantedKey {
+			continue
+		}
+		if parsed, parseErr := strconv.ParseBool(strings.TrimSpace(val)); parseErr == nil {
+			disableFileLogging.Store(parsed)
+		}
+		return // found the key (whether or not it parsed); nothing more to do
+	}
+}
+
 /* ---------------- Gesture cursors ---------------- */
 
 // Shared system cursor templates, loaded once in initGestureCursors.
@@ -2889,6 +3026,7 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		}
 	}
 
+	insetL, insetT, insetR, insetB := windowVisualEdgeInsets(hwnd)
 	sess := &dragSession{
 		targetWnd:                hwnd,
 		mode:                     ModeMove,
@@ -2897,6 +3035,10 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		wasMaximizedAtStart:      wasMaximized,
 		originalRect:             r,
 		originalPt:               pt,
+		visualInsetLeft:          insetL,
+		visualInsetTop:           insetT,
+		visualInsetRight:         insetR,
+		visualInsetBottom:        insetB,
 	}
 	activeSession.Store(sess)
 	// SetSystemCursor is global (no thread-affinity); apply immediately so
@@ -3179,6 +3321,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 	// (shift+winkey+RMB). Edge/corner zones ignore this field; they use
 	// shift-mirror via postShiftMirrorToggleIfNeeded after we return.
 	centerShrink := shiftDown && zone == ZONE_CENTER && radialCenterResizeEnabled.Load()
+	insetL, insetT, insetR, insetB := windowVisualEdgeInsets(wantTargetWnd)
 	sess := &dragSession{
 		targetWnd: wantTargetWnd,
 		mode:      ModeResize,
@@ -3191,6 +3334,10 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		originalRect:             r,
 		originalPt:               pt,
 		centerShrinkActive:       centerShrink,
+		visualInsetLeft:          insetL,
+		visualInsetTop:           insetT,
+		visualInsetRight:         insetR,
+		visualInsetBottom:        insetB,
 	}
 	activeSession.Store(sess)
 	// SetSystemCursor is global (no thread-affinity); apply immediately so
@@ -4730,7 +4877,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				//XXX: "Calling SetWindowPos from inside a WH_MOUSE_LL or WH_KEYBOARD_LL hook is strongly discouraged for the same reason as SendMessage:" - so I should postMessage here and handle this in my message loop
 				newX := r.Left + dx
 				newY := r.Top + dy
-				newX, newY = applySnapToEdgesForMove(session.targetWnd, newX, newY, r.Right-r.Left, r.Bottom-r.Top)
+				newX, newY = applySnapToEdgesForMove(session, newX, newY, r.Right-r.Left, r.Bottom-r.Top)
 				// procSetWindowPos.Call(
 				// 	uintptr(targetWnd),
 				// 	0,
@@ -8173,6 +8320,13 @@ func main() {
 	// internalLogger's lazy initLogFile() fallback -- see
 	// parseDisableFileLoggingCmdlineFlag's own doc comment.
 	parseDisableFileLoggingCmdlineFlag()
+
+	// Must also run before 'go logWorker()' below: see
+	// readPersistedDisableFileLoggingEarly's own doc comment for why this
+	// standalone, minimal settings-file read has to happen this early
+	// rather than waiting for the generic loadSettings() call later in
+	// runApplication().
+	readPersistedDisableFileLoggingEarly()
 	/*
 	   	When you call go func() { ... }(), you are telling the Go Scheduler to create a new goroutine.
 	   	Unless you explicitly call runtime.LockOSThread() inside that new goroutine,

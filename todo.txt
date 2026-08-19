@@ -1,6 +1,6 @@
 todos for winbollocks:
 
-* if i move or resize my own systray menu the mouse icon remains the last used (move or resize arrows) when LMB/RMB is released; this doesn't happen for normal windows though, unclear why but need to fix it.
+* if i move or resize my own systray menu the mouse icon remains the last used (move or resize arrows) when LMB/RMB is released; this doesn't happen for normal windows though, unclear why but need to fix it. (Claude fixed this once by not allowing gestures on own window, but that's not good enough; code for that fix is here https://claude.ai/chat/396257d0-9264-4b25-87c7-694db2201ada )
 
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
@@ -102,3 +102,8 @@ done:
 //* maybe remember systray settings, keep them in registry?! or in-file would be better, ideal, because can be moved easily.
 
 //Fix injectMouseButtonUp — while wiring the marker through here I found it silently ignores its flag argument and always injects an LMB-up, even when called via injectRMBUp() (used for RMB missed-gesture-recovery during a resize). The log line claims "Injecting synthetic RMB-up" but a bare LMB-up was actually being sent:
+
+//* snapping to edges is off by a few except on the top edge which seems correct; for cmd.exe window ran as user. And for notepad++ window. Unless maybe windows sees the windows bigger than they look? for shadow-adding purposes? doubtful (at least not in all 3 sides, but only 2, if it were so)
+
+//* when set to not log to file, the setting is applied late and some log lines thus make it into the file! it varies, can be 1 or 3 log lines for example, due to the queued/async way of logging and checking that flag at log time. Maybe we can fix this somehow? but not in a way that makes log lines get lost if say it failed to read the settings. Using the existing --nolog arg would definitely avoid this issue, judging by the existing code.
+
