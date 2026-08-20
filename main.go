@@ -236,10 +236,11 @@ const (
 	// before the initiating click reaches the target application, preventing
 	// a late parent-window promotion from burying a dialog created by that
 	// click.
-	WM_BRING_TO_FRONT     = wincoe.WM_USER + 206
-	WM_DO_RELEASE_CAPTURE = wincoe.WM_USER + 215
-	WM_CANCEL_GESTURE     = wincoe.WM_USER + 220
-	WM_APPLY_SHIFT_MIRROR = wincoe.WM_USER + 225
+	WM_BRING_TO_FRONT       = wincoe.WM_USER + 206
+	WM_DO_RELEASE_CAPTURE   = wincoe.WM_USER + 215
+	WM_CANCEL_GESTURE       = wincoe.WM_USER + 220
+	WM_APPLY_SHIFT_MIRROR   = wincoe.WM_USER + 225
+	WM_APPLY_GESTURE_CURSOR = wincoe.WM_USER + 230
 
 	// gestureCursorTimerID is the SetTimer nIDEvent used to reassert SetCursor
 	// while a move/resize is active (fights apps that force a private cursor
@@ -2874,6 +2875,14 @@ var ocrIDsToReplace = [...]uint32{
 //     for that frame; a 16ms timer keeps us competitive without relying only
 //     on move-drain frequency.
 //
+// Every call in this function is a UI-mutating Win32 call (SetSystemCursor,
+// CopyIcon, SetCursor, SetTimer) and must only ever run on the main thread,
+// per this codebase's "Thread-affinity is inviolable" invariant. Callers on
+// the hook thread (gesture start, in startManualDrag/tryBeginResizeGestureAt)
+// must go through postApplyGestureCursorStart instead of calling this
+// directly -- see that function's doc comment for what calling this
+// directly from the hook thread used to break.
+//
 // Pair every successful install with clearGestureCursor / SPI_SETCURSORS or
 // the system cursors stay wrong until logoff.
 func applyGestureCursor(s *dragSession) {
@@ -2910,6 +2919,51 @@ func applyGestureCursor(s *dragSession) {
 
 	reassertGestureCursorSetCursor(h)
 	startGestureCursorTimer()
+}
+
+// postApplyGestureCursorStart posts WM_APPLY_GESTURE_CURSOR so
+// applyGestureCursor's Win32 calls (SetSystemCursor/CopyIcon/SetCursor/
+// SetTimer -- all UI-mutating and thus main-thread-only, per this
+// codebase's "Thread-affinity is inviolable" invariant) run on the main
+// thread instead of directly on whichever thread calls this. Used by
+// startManualDrag/tryBeginResizeGestureAt, both of which run on the hook
+// thread (called from mouseProc's WM_LBUTTONDOWN/WM_RBUTTONDOWN cases).
+//
+// Calling applyGestureCursor directly from the hook thread (as this
+// codebase used to do) was a genuine violation of the thread-affinity
+// invariant: besides adding SetSystemCursor's ~13-syscall latency directly
+// onto the hook callback, it occasionally left the replaced OCR_* system
+// cursor slots stuck showing the move/resize shape after release when the
+// gesture's target was one of winbollocks' own windows -- most reachably
+// the systray popup menu, which pumps its own nested modal message loop
+// via TrackPopupMenu on the main thread -- because a cross-thread
+// SetSystemCursor/SPI_SETCURSORS call could race that loop's own
+// cursor/message handling in a way an ordinary target window's ordinary
+// message handling didn't provoke.
+//
+// targetWnd is re-checked against the live activeSession in the
+// WM_APPLY_GESTURE_CURSOR handler rather than passing the session pointer
+// itself through wParam/lParam, matching the same "post an identifier, let
+// the handler reload activeSession fresh" pattern already used by
+// WM_CANCEL_GESTURE/WM_APPLY_SHIFT_MIRROR -- if a newer gesture has already
+// replaced the session by the time this is processed, the stale post
+// becomes a harmless no-op instead of clobbering the newer session's
+// cursor state.
+//
+// A failure here (mainMsgHwnd not yet ready, or PostMessage itself
+// failing) is non-fatal: applyGestureCursor also runs from
+// handleActualMoveOrResize on the first move drain and from wndProc's
+// WM_SETCURSOR/WM_TIMER handlers, so the correct cursor shape still gets
+// applied shortly after, just not instantly on button-down.
+func postApplyGestureCursorStart(targetWnd windows.Handle) {
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		logf("postApplyGestureCursorStart: mainMsgHwnd is 0 for HWND=0x%X; gesture cursor will be applied on the next drain/WM_SETCURSOR/WM_TIMER instead of immediately", targetWnd)
+		return
+	}
+	if res := wincoe.PostMessage(msgHwnd, WM_APPLY_GESTURE_CURSOR, uintptr(targetWnd), 0); res.Failed() {
+		logf("postApplyGestureCursorStart: PostMessage WM_APPLY_GESTURE_CURSOR for HWND=0x%X failed: %v; gesture cursor will be applied on the next drain/WM_SETCURSOR/WM_TIMER instead of immediately", targetWnd, res.Err)
+	}
 }
 
 // reassertGestureCursorSetCursor calls SetCursor with the gesture shape.
@@ -2963,9 +3017,17 @@ func stopGestureCursorTimer() {
 	}
 }
 
-// clearGestureCursor restores all system cursors (SPI_SETCURSORS) and stops the
-// reassert timer. Fully idempotent: safe to call from both softReset and
-// WM_DO_RELEASE_CAPTURE without log spam.
+// clearGestureCursor restores all system cursors (SPI_SETCURSORS) and stops
+// the reassert timer. Fully idempotent: safe to call multiple times without
+// log spam (softReset's direct-fallback path and WM_DO_RELEASE_CAPTURE's
+// handler can both reach this for the same gesture end in some fallback
+// scenarios -- see softReset's own doc comment).
+//
+// SystemParametersInfo/KillTimer are UI-mutating Win32 calls and must only
+// ever be called from the main thread, per this codebase's "Thread-affinity
+// is inviolable" invariant -- see softReset's own doc comment for why
+// calling this from the hook thread used to leave the gesture cursor stuck
+// on our own windows (e.g. the systray popup menu).
 func clearGestureCursor() {
 	stopGestureCursorTimer()
 	if !gestureSystemCursorActive.CompareAndSwap(true, false) {
@@ -3041,9 +3103,10 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 		visualInsetBottom:        insetB,
 	}
 	activeSession.Store(sess)
-	// SetSystemCursor is global (no thread-affinity); apply immediately so
-	// the shape changes on button-down, not only after the first move drain.
-	applyGestureCursor(sess)
+	// Apply the gesture cursor from the main thread, not here: this
+	// function runs on the hook thread (called from mouseProc's
+	// WM_LBUTTONDOWN case). See postApplyGestureCursorStart's doc comment.
+	postApplyGestureCursorStart(sess.targetWnd)
 	return true
 }
 
@@ -3340,9 +3403,9 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		visualInsetBottom:        insetB,
 	}
 	activeSession.Store(sess)
-	// SetSystemCursor is global (no thread-affinity); apply immediately so
-	// the shape changes on button-down, not only after the first move drain.
-	applyGestureCursor(sess)
+	// See the identical comment (and full rationale) in startManualDrag's
+	// own analogous call site.
+	postApplyGestureCursorStart(sess.targetWnd)
 	// session := activeSession.Load() //weird way to do this Claude Sonnet 5 Extra Thinking (yes Extra this time), because who needs DRY!?!
 	// if session == nil {
 	// 	panic("bad coding: nil session after storing new resize session")
@@ -3605,7 +3668,6 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 	//do this first
 	activeSession.Store(nil) //XXX: don't set the innards to nil like state and targetWnd ! because old pointer's contents may still be used by other threads; this is Lock-Free Snapshot or Read-Copy-Update (RCU) pattern.
 	captureHeldForSession.Store(nil)
-	clearGestureCursor() // stop forcing the move/resize shape so normal WM_SETCURSOR behavior resumes
 	msgHwnd := loadMainMsgHwnd()
 	/*
 		The Problem: If you call it in the hook, you are releasing capture on the Hook Thread. But window capture is thread-specific.
@@ -3623,11 +3685,12 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 		// activeSession/captureHeldForSession above would already read as
 		// "released" while the real Win32 mouse capture stays held
 		// indefinitely, with no other code path left to correct it.
-		// Calling wincoe.ReleaseCapture() directly here is the same narrow,
-		// deliberate hook-thread exception this function already made for
-		// the mainMsgHwnd==0 case; broadening it to a failed post keeps
-		// that exception self-consistent instead of only catching one of
-		// its two possible causes.
+		// Calling wincoe.ReleaseCapture() (and, below, clearGestureCursor())
+		// directly here is the same narrow, deliberate hook-thread
+		// exception this function already made for the mainMsgHwnd==0 case;
+		// broadening it to a failed post keeps that exception
+		// self-consistent instead of only catching one of its two possible
+		// causes.
 		needsDirectFallback := false
 		if msgHwnd != 0 {
 			if res := wincoe.PostMessage(msgHwnd, WM_DO_RELEASE_CAPTURE, 0, 0); res.Failed() {
@@ -3640,10 +3703,41 @@ func softReset(releaseCapture bool) { //nevermindTODO: use hardReset instead(wel
 			needsDirectFallback = true
 		}
 		if needsDirectFallback {
+			// This is the one deliberate exception where clearGestureCursor
+			// (SPI_SETCURSORS/KillTimer -- UI-mutating Win32 calls) runs
+			// directly on whatever thread called softReset, rather than via
+			// the WM_DO_RELEASE_CAPTURE handler on the main thread: since
+			// the post itself couldn't be delivered, there's no main-thread
+			// handler left to do it instead, and leaving the gesture cursor
+			// stuck indefinitely would be worse than this narrow violation.
+			clearGestureCursor()
 			if res := wincoe.ReleaseCapture(); res.Failed() {
 				logf("softReset: fallback ReleaseCapture failed: %v", res.Err)
 			}
 		}
+		// Otherwise (the ordinary case): WM_DO_RELEASE_CAPTURE's own handler
+		// in wndProc calls clearGestureCursor() on the main thread once it's
+		// processed. Deliberately NOT also called directly here: softReset
+		// is reached from the hook thread far more often than not (e.g.
+		// mouseProc's WM_LBUTTONUP/WM_RBUTTONUP handlers call it directly),
+		// and clearGestureCursor's SystemParametersInfo/KillTimer calls are
+		// exactly the kind of UI-mutating Win32 call this codebase's
+		// "Thread-affinity is inviolable" invariant says must only ever run
+		// on the main thread -- calling them from the hook thread used to
+		// leave the gesture cursor (the OCR_* slots SetSystemCursor
+		// replaced) stuck on the move/resize shape after release,
+		// specifically when the gesture's target was one of winbollocks'
+		// own windows (most reachably the systray popup menu, which pumps
+		// its own nested modal message loop via TrackPopupMenu on the main
+		// thread): a cross-thread SPI_SETCURSORS call raced that loop's own
+		// cursor/message handling.
+	} else {
+		// releaseCapture == false is only ever passed by deinit(), which by
+		// its own documented invariant only ever runs on the main thread --
+		// so a direct call here is safe, and there's no posted-message path
+		// to rely on instead (deinit() is tearing everything down; nothing
+		// is left pumping messages to process a post afterward anyway).
+		clearGestureCursor()
 	}
 
 	// Instead of calling hideOverlay() synchronously on the hook thread,
@@ -6113,6 +6207,17 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			return 0
 		}
 		cancelActiveGesture(session)
+		return 0
+
+	case WM_APPLY_GESTURE_CURSOR:
+		// Posted by postApplyGestureCursorStart -- the actual
+		// SetSystemCursor/CopyIcon/SetCursor/SetTimer work must happen
+		// here, on the main thread, rather than directly on the hook
+		// thread that requested it. See that function's doc comment.
+		expectedTarget := windows.Handle(wParam)
+		if session := activeSession.Load(); session != nil && session.targetWnd == expectedTarget {
+			applyGestureCursor(session)
+		}
 		return 0
 
 	case WM_APPLY_SHIFT_MIRROR:
