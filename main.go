@@ -1528,13 +1528,14 @@ var shiftTapInputs = [...]wincoe.KEYANDMOUSE_INPUT{
 func injectShiftTapOnly() {
 	if foregroundIsHostKeyCaptureRisk() {
 		// See foregroundIsHostKeyCaptureRisk's doc comment: injecting our
-		// RCtrl tap right now would land on a virtualization frontend
-		// (e.g. VirtualBox) that binds RCtrl as its own Host Key combo,
-		// risking an unwanted guest mouse-capture toggle instead of merely
-		// suppressing the Start Menu. Skip it entirely this time -- the
-		// Start Menu may pop up as a result, which is a strictly better
-		// outcome than a captured/pinned host mouse cursor.
-		logf("injectShiftTapOnly: skipping RCtrl-tap Start-menu-suppression injection because the current foreground window belongs to a process that binds RCtrl as its own Host Key combo (e.g. VirtualBox); Start menu may pop up this time as a result")
+		// RCtrl tap right now risks it being swallowed into a captured
+		// guest (e.g. VirtualBox's "Auto capture keyboard") instead of
+		// suppressing the Start Menu -- and, empirically, risks the guest
+		// grabbing the host mouse cursor as a side effect of receiving it.
+		// Skip it entirely this time -- the Start Menu may pop up as a
+		// result, which is a strictly better outcome than a captured/
+		// pinned host mouse cursor.
+		logf("injectShiftTapOnly: skipping RCtrl-tap Start-menu-suppression injection because the current foreground window belongs to a process that may capture all keyboard input while focused (e.g. VirtualBox); Start menu may pop up this time as a result")
 		return
 	}
 	/*
@@ -1643,8 +1644,9 @@ var shitTapThenRWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 
 // lWinKeyUpOnly/rWinKeyUpOnly are injectShiftTapThenWinUp's fallback
 // payloads for when foregroundIsHostKeyCaptureRisk() reports the current
-// foreground window would misinterpret the RCtrl tap (see that function's
-// doc comment) -- just the bare winkey-up, with no RCtrl tap at all. The
+// foreground window may swallow the RCtrl tap into a captured guest (see
+// that function's doc comment) -- just the bare winkey-up, with no RCtrl
+// tap at all. The
 // real winkey-up was already swallowed by keyboardProc (see its
 // WM_KEYUP/WM_SYSKEYUP handling for VK_LWIN/VK_RWIN) before
 // injectShiftTapThenWinUp is ever called, so SOME winkey-up must always be
@@ -1690,7 +1692,7 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 	// this.
 	skipShiftTap := foregroundIsHostKeyCaptureRisk()
 	if skipShiftTap {
-		logf("injectShiftTapThenWinUp: skipping RCtrl-tap Start-menu-suppression injection (winkey-up alone will still be injected, so winkey isn't left looking stuck down) because the current foreground window belongs to a process that binds RCtrl as its own Host Key combo (e.g. VirtualBox); Start menu may pop up this time as a result")
+		logf("injectShiftTapThenWinUp: skipping RCtrl-tap Start-menu-suppression injection (winkey-up alone will still be injected, so winkey isn't left looking stuck down) because the current foreground window belongs to a process that may capture all keyboard input while focused (e.g. VirtualBox); Start menu may pop up this time as a result")
 	}
 
 	// Slicing a global array (inputs[:]) is a zero-heap-alloc operation --
@@ -2184,20 +2186,30 @@ func matchVMSignature(s string) string {
 }
 
 // hostKeyCaptureRiskProcessSubstrings lists (lowercased) executable-name
-// substrings for host-side virtualization frontend processes that bind
-// their own global "Host Key" combo -- VirtualBox's default is Right Ctrl,
-// the exact same physical key injectShiftTapOnly/injectShiftTapThenWinUp
-// inject a tap of, purely to suppress the Start Menu (see their own doc
-// comments; scanCode 0x1D | KEYEVENTF_EXTENDED). If such a process happens
-// to be the CURRENT foreground window at the moment that tap is injected,
-// it can interpret the injected RCtrl press/release as a request to toggle
-// its guest's mouse capture -- with no relation whatsoever to whichever
-// window winbollocks actually dragged/resized. Observed concretely with
-// VirtualBox: winkey+LMB-dragging a VirtualBox VM window, then releasing
-// LMB and winkey while that VM window is still foreground, causes
-// VirtualBox to grab (capture) the host mouse cursor in-place as a side
-// effect of the injected RCtrl tap, even though the cursor may be
-// physically outside the VM window by then.
+// substrings for host-side virtualization frontend processes whose
+// "capture all keyboard input while focused" feature (VirtualBox calls
+// this "Auto capture keyboard") can swallow an injected keystroke entirely
+// -- routing it into the guest instead of letting the host (Explorer/
+// shell) ever see it -- regardless of what specific key combo is
+// separately configured as that VM's own "Host Key" (the two are
+// different settings; confirmed empirically that this can happen even
+// when RCtrl, the key injectShiftTapOnly/injectShiftTapThenWinUp tap to
+// suppress the Start Menu, is NOT the configured Host Key).
+//
+// This explains two observed symptoms together: (1) the Start Menu still
+// popping up despite our RCtrl-tap suppression attempt, because the tap
+// never reached the host's own input-state tracking; and (2), more
+// seriously, VirtualBox grabbing (capturing) the host mouse cursor as an
+// apparent side effect of receiving that injected keystroke while its
+// window had focus -- observed concretely via winkey+LMB-dragging a
+// VirtualBox VM window, then releasing LMB and winkey while it's still
+// foreground.
+//
+// Skipping the tap injection entirely whenever the foreground window
+// belongs to one of these processes (see foregroundIsHostKeyCaptureRisk)
+// is therefore the safer default even though the exact internal mechanism
+// isn't fully pinned down -- Start Menu may pop up as a result in that
+// case, a strictly better outcome than a captured/pinned host cursor.
 //
 // This is deliberately unrelated to isVirtualized/detectVirtualization
 // (which detect whether winbollocks itself is running INSIDE a guest, via
@@ -2226,8 +2238,8 @@ func isHostKeyCaptureRiskProcessName(exeName string) bool {
 
 // foregroundIsHostKeyCaptureRisk reports whether the CURRENT foreground
 // window (checked fresh, right before injecting) belongs to a process
-// known to interpret an injected RCtrl tap as its own global Host Key
-// combo rather than an ordinary keystroke -- see
+// known to potentially swallow an injected keystroke into a captured guest
+// rather than let it reach the host's own input-state tracking -- see
 // hostKeyCaptureRiskProcessSubstrings' doc comment for why this must be
 // the foreground window at the moment of injection, not e.g. whichever
 // window a gesture happened to target: the injected keystroke is delivered
@@ -3021,6 +3033,29 @@ var ocrIDsToReplace = [...]uint32{
 // Pair every successful install with clearGestureCursor / SPI_SETCURSORS or
 // the system cursors stay wrong until logoff.
 func applyGestureCursor(s *dragSession) {
+	if s != nil && isOwnWindow(s.targetWnd) {
+		// Skip forcing a system-wide gesture cursor for gestures targeting
+		// one of winbollocks' OWN windows -- most reachably the systray
+		// right-click popup menu, which is itself perfectly draggable/
+		// resizable via winkey+LMB/RMB like any other window (useful when
+		// it appears partially under the taskbar and its own Exit item
+		// isn't otherwise reachable). While that menu is open it pumps its
+		// own nested modal message loop and re-asserts its own mouse
+		// capture via TrackPopupMenu on the main thread, which fights our
+		// SetSystemCursor-replaced OCR_* slots in ways ordinary target
+		// windows never provoke -- see WM_DO_RELEASE_CAPTURE's occasional
+		// "ReleaseCapture failed"/capture-still-held-by-another-HWND log
+		// lines for direct evidence of that fight, which persisted even
+		// after routing applyGestureCursor/clearGestureCursor onto the
+		// main thread (see that fix's own history). Movement/resizing
+		// itself is entirely unaffected by this early return -- it happens
+		// via SetWindowPos in handleActualMoveOrResize/wndProc, nothing in
+		// this function -- only the forced-cursor-shape feature is
+		// skipped, and only for our own windows, where leaving whatever
+		// cursor was already showing (ordinarily a plain arrow) is a fine,
+		// unsurprising fallback.
+		return
+	}
 	h := cursorForSession(s)
 	if h == 0 {
 		return
@@ -7869,6 +7904,35 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					}
 				} else {
 					logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, mainMsgHwnd was 0")
+				}
+
+				// requireWinDownHeldDuringGesture's own WM_MOUSEMOVE check
+				// (mouseProc's ModeMove/ModeResize cases) normally detects
+				// "winkey was released mid-gesture" REACTIVELY, by polling
+				// keyDown(VK_LWIN)/keyDown(VK_RWIN) -- i.e. GetAsyncKeyState
+				// -- on the next mouse move. That polled state can be left
+				// permanently wrong by a THIRD-PARTY application's own
+				// keyboard-capture layer -- observed concretely with
+				// VirtualBox's "Auto capture keyboard" setting, which can
+				// swallow keyboard events (including our own synthetic
+				// winkey-up compensation injected just above via
+				// WM_INJECT_SEQUENCE -> injectShiftTapThenWinUp) into the
+				// guest while its window has focus, leaving
+				// GetAsyncKeyState(VK_LWIN/VK_RWIN) stuck reporting "down"
+				// indefinitely even though the user's REAL, physical
+				// winkey-up -- the one THIS handler is processing right
+				// now -- has already genuinely happened. Since we ourselves
+				// unambiguously just observed that real transition
+				// (regardless of what any other application's hook does
+				// with our synthetic re-injection afterward), stop any
+				// currently active gesture immediately and directly here,
+				// rather than depending on that polling to ever correctly
+				// notice.
+				if requireWinDownHeldDuringGesture.Load() {
+					if session := activeSession.Load(); session != nil {
+						logf("keyboardProc: real winkey-up observed while a %v gesture on HWND=0x%X is still active; stopping it immediately rather than relying on a later GetAsyncKeyState poll (which a third-party keyboard-capture layer, e.g. VirtualBox's Auto capture keyboard, can leave permanently stale)", session.mode, session.targetWnd)
+						hardReset(true)
+					}
 				}
 
 				return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
