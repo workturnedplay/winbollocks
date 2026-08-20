@@ -1526,6 +1526,17 @@ var shiftTapInputs = [...]wincoe.KEYANDMOUSE_INPUT{
 //
 // bad: fixed now: using "Unassigned virtual key (vkE8)"(instead of RShift) as per Gemini 3.1 Pro 's suggestion did fix the above case ^!
 func injectShiftTapOnly() {
+	if foregroundIsHostKeyCaptureRisk() {
+		// See foregroundIsHostKeyCaptureRisk's doc comment: injecting our
+		// RCtrl tap right now would land on a virtualization frontend
+		// (e.g. VirtualBox) that binds RCtrl as its own Host Key combo,
+		// risking an unwanted guest mouse-capture toggle instead of merely
+		// suppressing the Start Menu. Skip it entirely this time -- the
+		// Start Menu may pop up as a result, which is a strictly better
+		// outcome than a captured/pinned host mouse cursor.
+		logf("injectShiftTapOnly: skipping RCtrl-tap Start-menu-suppression injection because the current foreground window belongs to a process that binds RCtrl as its own Host Key combo (e.g. VirtualBox); Start menu may pop up this time as a result")
+		return
+	}
 	/*
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
@@ -1630,6 +1641,38 @@ var shitTapThenRWinKeyUp = [3]wincoe.KEYANDMOUSE_INPUT{
 	},
 }
 
+// lWinKeyUpOnly/rWinKeyUpOnly are injectShiftTapThenWinUp's fallback
+// payloads for when foregroundIsHostKeyCaptureRisk() reports the current
+// foreground window would misinterpret the RCtrl tap (see that function's
+// doc comment) -- just the bare winkey-up, with no RCtrl tap at all. The
+// real winkey-up was already swallowed by keyboardProc (see its
+// WM_KEYUP/WM_SYSKEYUP handling for VK_LWIN/VK_RWIN) before
+// injectShiftTapThenWinUp is ever called, so SOME winkey-up must always be
+// injected regardless -- skipping it entirely would leave winkey looking
+// permanently held down from the OS's perspective. Only the RCtrl tap
+// portion is conditionally skipped.
+var lWinKeyUpOnly = [1]wincoe.KEYANDMOUSE_INPUT{
+	{
+		Type: wincoe.INPUT_KEYBOARD,
+		Ki: wincoe.KEYBDINPUT{
+			WVk:         wincoe.VK_LWIN,
+			DwFlags:     wincoe.KEYEVENTF_KEYUP,
+			DwExtraInfo: ourInputExtraInfoMarker,
+		},
+	},
+}
+
+var rWinKeyUpOnly = [1]wincoe.KEYANDMOUSE_INPUT{
+	{
+		Type: wincoe.INPUT_KEYBOARD,
+		Ki: wincoe.KEYBDINPUT{
+			WVk:         wincoe.VK_RWIN,
+			DwFlags:     wincoe.KEYEVENTF_KEYUP,
+			DwExtraInfo: ourInputExtraInfoMarker,
+		},
+	},
+}
+
 // injectShiftTapThenWinUp injects RCtrl tap(ie. down then up) [instead of the vkE8(Unassigned virtual key (vkE8)) dummy tap
 // (ie. down then up) which had an edge case(it would scroll back to bottom if you were scrolled up in cmd.exe)
 // [instead of RShift which had an edge case!]]
@@ -1640,12 +1683,34 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 		You are correctly not setting WVk when using KEYEVENTF_SCANCODE. Windows explicitly documents that when SCANCODE is set, WVk is ignored. Mixing them leads to inconsistent behavior on some builds.
 	*/
 
-	var inputs *[3]wincoe.KEYANDMOUSE_INPUT
+	// See foregroundIsHostKeyCaptureRisk's doc comment and
+	// lWinKeyUpOnly/rWinKeyUpOnly's doc comment: only the RCtrl-tap portion
+	// is conditionally skipped -- the winkey-up itself is always injected,
+	// since keyboardProc already swallowed the real one before calling
+	// this.
+	skipShiftTap := foregroundIsHostKeyCaptureRisk()
+	if skipShiftTap {
+		logf("injectShiftTapThenWinUp: skipping RCtrl-tap Start-menu-suppression injection (winkey-up alone will still be injected, so winkey isn't left looking stuck down) because the current foreground window belongs to a process that binds RCtrl as its own Host Key combo (e.g. VirtualBox); Start menu may pop up this time as a result")
+	}
+
+	// Slicing a global array (inputs[:]) is a zero-heap-alloc operation --
+	// see the detailed explanation retained below, which applies equally
+	// whether the chosen array has 3 elements (RCtrl tap + winkey-up) or 1
+	// (winkey-up alone).
+	var inputs []wincoe.KEYANDMOUSE_INPUT
 	switch whichWinUp {
 	case wincoe.VK_LWIN:
-		inputs = &shitTapThenLWinKeyUp
+		if skipShiftTap {
+			inputs = lWinKeyUpOnly[:]
+		} else {
+			inputs = shitTapThenLWinKeyUp[:]
+		}
 	case wincoe.VK_RWIN:
-		inputs = &shitTapThenRWinKeyUp
+		if skipShiftTap {
+			inputs = rWinKeyUpOnly[:]
+		} else {
+			inputs = shitTapThenRWinKeyUp[:]
+		}
 	default:
 		panic2(fmt.Sprintf("BUG: unexpected non-winkey(left or right) arg passed to injectShiftTapThenWinUp(), passed: %d", whichWinUp))
 	}
@@ -1670,8 +1735,10 @@ func injectShiftTapThenWinUp(whichWinUp uint16) {
 	//The slice header construction: 0 heap allocs (just stack values).
 	//The target memory address: 0 heap allocs (already in global memory).
 	//That’s why the entire operation achieves 0 allocations per call!
-	if res := wincoe.SendInput(inputs[:]); res.Failed() {
-		//Note: that inputs[:] creates a slice header pointing directly to your stack-allocated array without incurring any extra heap allocations.
+	if res := wincoe.SendInput(inputs); res.Failed() {
+		//Note: inputs already IS a slice header pointing directly to a
+		//stack-allocated (well, global-array-backed) source, incurring no
+		//extra heap allocations.
 		logf("SendInput for injectShiftTapThenWinUp failed: %v", res.Err)
 	}
 }
@@ -2114,6 +2181,74 @@ func matchVMSignature(s string) string {
 		}
 	}
 	return ""
+}
+
+// hostKeyCaptureRiskProcessSubstrings lists (lowercased) executable-name
+// substrings for host-side virtualization frontend processes that bind
+// their own global "Host Key" combo -- VirtualBox's default is Right Ctrl,
+// the exact same physical key injectShiftTapOnly/injectShiftTapThenWinUp
+// inject a tap of, purely to suppress the Start Menu (see their own doc
+// comments; scanCode 0x1D | KEYEVENTF_EXTENDED). If such a process happens
+// to be the CURRENT foreground window at the moment that tap is injected,
+// it can interpret the injected RCtrl press/release as a request to toggle
+// its guest's mouse capture -- with no relation whatsoever to whichever
+// window winbollocks actually dragged/resized. Observed concretely with
+// VirtualBox: winkey+LMB-dragging a VirtualBox VM window, then releasing
+// LMB and winkey while that VM window is still foreground, causes
+// VirtualBox to grab (capture) the host mouse cursor in-place as a side
+// effect of the injected RCtrl tap, even though the cursor may be
+// physically outside the VM window by then.
+//
+// This is deliberately unrelated to isVirtualized/detectVirtualization
+// (which detect whether winbollocks itself is running INSIDE a guest, via
+// BIOS/firmware registry fingerprints) -- this instead detects whether a
+// window BELONGING TO a virtualization frontend happens to be focused on
+// the HOST, regardless of whether winbollocks itself is virtualized.
+var hostKeyCaptureRiskProcessSubstrings = []string{
+	"virtualbox",
+	"vboxheadless",
+	"vboxsdl",
+}
+
+// isHostKeyCaptureRiskProcessName reports whether exeName (as returned by
+// getProcessNameFast, e.g. "VirtualBoxVM.exe") matches a known Host-Key-
+// binding virtualization frontend -- see
+// hostKeyCaptureRiskProcessSubstrings' doc comment.
+func isHostKeyCaptureRiskProcessName(exeName string) bool {
+	lower := strings.ToLower(exeName)
+	for _, sig := range hostKeyCaptureRiskProcessSubstrings {
+		if strings.Contains(lower, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// foregroundIsHostKeyCaptureRisk reports whether the CURRENT foreground
+// window (checked fresh, right before injecting) belongs to a process
+// known to interpret an injected RCtrl tap as its own global Host Key
+// combo rather than an ordinary keystroke -- see
+// hostKeyCaptureRiskProcessSubstrings' doc comment for why this must be
+// the foreground window at the moment of injection, not e.g. whichever
+// window a gesture happened to target: the injected keystroke is delivered
+// globally, and it's whatever currently has focus that receives it.
+//
+// A failure to resolve the foreground window's PID/process name is treated
+// as "not a risk" (fails open to the pre-existing behavior) rather than
+// skipping the Start-menu-suppression injection defensively -- an
+// unresolvable foreground window is the ordinary, far more common case
+// (e.g. no window is currently foreground at all) and must not silently
+// degrade the Start-menu-suppression feature for everyone.
+func foregroundIsHostKeyCaptureRisk() bool {
+	fg := getForegroundWindow()
+	if fg == 0 {
+		return false
+	}
+	pid := getWindowPID(fg)
+	if pid == 0 {
+		return false
+	}
+	return isHostKeyCaptureRiskProcessName(getProcessNameFast(pid))
 }
 
 // detectVirtualization reports whether winbollocks appears to be running
