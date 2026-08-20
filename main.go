@@ -7861,9 +7861,65 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			//return 0 // pass thru the winkeyUP
 			//XXX: let it fall thru(aka pass thru the winkeyUP), so that procCallNextHookEx is called!
 			//} else
+
+			// A currently-active gesture must stop the instant we observe
+			// this real, physical winkey-up -- independent of whatever
+			// swallow-vs-not decision follows below for Start-menu
+			// suppression purposes. requireWinDownHeldDuringGesture's own
+			// check (mouseProc's WM_MOUSEMOVE handling) is otherwise purely
+			// reactive, polling keyDown(VK_LWIN)/keyDown(VK_RWIN) on the
+			// next mouse move; acting here, synchronously, on the one event
+			// that unambiguously IS this transition, is strictly more
+			// immediate and doesn't depend on a subsequent poll at all.
+			if requireWinDownHeldDuringGesture.Load() {
+				if session := activeSession.Load(); session != nil {
+					logf("keyboardProc: real winkey-up observed while a %v gesture on HWND=0x%X is still active; stopping it immediately", session.mode, session.targetWnd)
+					hardReset(true)
+				}
+			}
+
 			if winGestureUsed.Load() {
-				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
 				winGestureUsed.Store(false) // gesture ends with winkey_UP
+				if foregroundIsHostKeyCaptureRisk() {
+					// Do NOT swallow this real winkey-up at all -- let it
+					// fall through untouched to CallNextHookEx below.
+					//
+					// The normal path swallows the real event (return 1)
+					// and compensates by injecting a synthetic winkey-up
+					// afterward (injectShiftTapThenWinUp, via
+					// WM_INJECT_SEQUENCE) so GetAsyncKeyState still ends up
+					// correctly reporting "up". But per this project's own
+					// documented finding, swallowing a key transition here
+					// prevents GetAsyncKeyState from ever recording it in
+					// the first place -- the ENTIRE reason winkey relies on
+					// that synthetic re-injection to compensate. When the
+					// foreground window may capture all keyboard input
+					// while focused (see foregroundIsHostKeyCaptureRisk's
+					// doc comment), that synthetic re-injection is exactly
+					// as vulnerable to being silently swallowed as the
+					// suppression tap already is -- confirmed empirically:
+					// even with the RCtrl-tap portion already skipped (see
+					// injectShiftTapThenWinUp), the bare injected winkey-up
+					// alone still failed to clear GetAsyncKeyState's stuck
+					// "down" state while VirtualBox held focus, permanently
+					// desyncing it until an unrelated later winkey tap
+					// happened to land on a non-capturing window.
+					//
+					// Letting the REAL event through instead sidesteps the
+					// problem at its root: the genuine physical winkey-up
+					// updates GetAsyncKeyState via the OS's own input
+					// pipeline regardless of what any focused app
+					// subsequently does with the message, so there's
+					// nothing left here that depends on an injection
+					// reaching (or being correctly processed by) anything.
+					// The one accepted cost is that Start Menu may pop up
+					// this time, same tradeoff already accepted by
+					// injectShiftTapOnly/injectShiftTapThenWinUp elsewhere.
+					//winGestureUsed.Store(false)
+					logf("keyboardProc: NOT swallowing real winkey-up because the current foreground window belongs to a process that may capture all keyboard input while focused (e.g. VirtualBox) -- our own synthetic re-injected compensation winkey-up would be equally vulnerable to being silently swallowed by it, permanently desyncing GetAsyncKeyState; letting the real event through instead so its state stays accurate. Start menu may pop up this time as a result.")
+					break // fall through to CallNextHookEx below, unswallowed
+				}
+				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
 
 				// • Injecting input from inside a WH_KEYBOARD_LL hook is documented as undefined.
 				// great, it was correct and other do it before, but now it's bad!
