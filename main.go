@@ -7916,7 +7916,7 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					// this time, same tradeoff already accepted by
 					// injectShiftTapOnly/injectShiftTapThenWinUp elsewhere.
 					//winGestureUsed.Store(false)
-					logf("keyboardProc: NOT swallowing real winkey-up because the current foreground window belongs to a process that may capture all keyboard input while focused (e.g. VirtualBox) -- our own synthetic re-injected compensation winkey-up would be equally vulnerable to being silently swallowed by it, permanently desyncing GetAsyncKeyState; letting the real event through instead so its state stays accurate. Start menu may pop up this time as a result.")
+					logf("keyboardProc: NOT swallowing real winkey-up because the current foreground window belongs to a process that may capture all keyboard input while focused (e.g. VirtualBox) -- our own synthetic re-injected compensation winkey-up would be equally vulnerable to being silently swallowed by it, permanently desyncing GetAsyncKeyState; letting the real event through instead so its state stays accurate. Start menu WILL pop up this time as a result.")
 					break // fall through to CallNextHookEx below, unswallowed
 				}
 				//next ok, we gotta suppress winkeyUP, else Start menu will pop open which is annoying because we just used winkey+LMB drag for example, not pressed winkey then released it
