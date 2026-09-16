@@ -376,6 +376,12 @@ var (
 	// (viaMissedGestureRecovery): those exist specifically because our hook
 	// never SAW the real down (a higher-integrity window had focus at the
 	// time), so the real up must reach the target normally, same as today.
+	//
+	// These flags now also double as the "is a further down for this
+	// button, right now, definitely spurious" signal used by mouseProc's
+	// isSpuriousDuplicateButtonDown guard (see its own doc comment) -- true
+	// here means real hardware could not possibly be delivering a genuine
+	// new press for that button yet.
 	lmbDownSwallowed atomic.Bool
 	rmbDownSwallowed atomic.Bool
 	mmbDownSwallowed atomic.Bool
@@ -423,6 +429,72 @@ func resetStaleGestureFlags() {
 	lmbDownSwallowed.Store(false)
 	rmbDownSwallowed.Store(false)
 	mmbDownSwallowed.Store(false)
+}
+
+// isSpuriousDuplicateButtonDown reports whether a WM_LBUTTONDOWN/
+// WM_RBUTTONDOWN/WM_MBUTTONDOWN event at pt should be treated as a spurious
+// re-fire of a down we've already swallowed for this exact button, rather
+// than a genuine new press -- and, if so, logs it (with pt, for diagnosis)
+// so the occurrence is visible. The caller must still `return 1` to
+// re-swallow it.
+//
+// swallowedFlag must be the button's own lmbDownSwallowed/rmbDownSwallowed/
+// mmbDownSwallowed: true there means we already ate a down for this button
+// and haven't yet seen its matching up (WM_LBUTTONUP/WM_RBUTTONUP/
+// WM_MBUTTONUP clears it via CompareAndSwap). Real hardware cannot deliver
+// a second down for the same physical button before an intervening up, so
+// any button-down event arriving while the flag is still true did not
+// originate as an ordinary new user click on that button -- it's either a
+// duplicate/replayed event for the SAME still-held press, or synthetic
+// input from something else (input we injected ourselves is already
+// filtered out earlier via mouseProc's ourInputExtraInfoMarker check and
+// never reaches here).
+//
+// Concretely observed with winkey+LMB move while the Windows Start Menu is
+// already open at gesture start: forceForeground/SetForegroundWindow
+// reliably fails to steal focus away from an open Start Menu (see
+// forceForeground's own doc comment), and in that state a second
+// WM_LBUTTONDOWN for the same physical click can arrive mid-drag (most
+// likely the shell's own click-outside-to-dismiss handling replaying or
+// re-delivering the click -- every low-level mouse hook in the chain is
+// invoked regardless of an earlier hook's swallow, see keyboardProc's own
+// "hooks are called sequentially regardless of return value" doc comment).
+// Before this guard existed, that duplicate down reached
+// tryBeginMoveGestureAt/tryBeginResizeGestureAt's existing "always tear
+// down and restart on any down" logic (see their own doc comments), which:
+//   - rebaselines session.state.startRect via a fresh GetWindowRect that
+//     can be visually STALE relative to a SetWindowPos this exact drag
+//     already queued into moveDataChan but which the main thread hasn't
+//     drained/applied yet (see handleActualMoveOrResize) -- producing a
+//     window that visibly lags behind the cursor and then "snaps"; and
+//   - re-resolves the target window via WindowFromPoint at whatever
+//     coordinates this (spurious) event carries, silently retargeting the
+//     drag onto a different window if the cursor had already moved over
+//     one since the gesture began.
+//
+// Ignoring the duplicate outright -- leaving the active session completely
+// untouched -- avoids both symptoms regardless of the duplicate's ultimate
+// OS-level origin.
+//
+// Deliberately does NOT clear swallowedFlag itself, nor bound how long it's
+// allowed to stay true: if it's ever genuinely stuck (its real matching up
+// permanently missed, e.g. one of the UIPI/secure-desktop scenarios
+// resetStaleGestureFlags exists for), the very next physical release of
+// that button still reaches the unmodified WM_*BUTTONUP handling and
+// clears it via CompareAndSwap same as always -- this guard only ever
+// costs that one click's worth of down/up, never more, regardless of how
+// long the flag was stuck first.
+//
+// Must be checked before any other per-down processing (modifier-key
+// sampling, tryBeginMoveGestureAt/tryBeginResizeGestureAt/
+// tryPerformMMBGestureAt, markGestureUsedOnce, etc.) so a spurious re-fire
+// has zero effect beyond re-swallowing the event.
+func isSpuriousDuplicateButtonDown(swallowedFlag *atomic.Bool, buttonName string, pt wincoe.POINT) bool {
+	if !swallowedFlag.Load() {
+		return false
+	}
+	logf("mouseProc: ignoring spurious duplicate %s-down at (%d,%d) (a %s-down is already swallowed with no matching up seen yet, likely shell/Start-Menu interference); re-swallowing without disturbing the active gesture", buttonName, pt.X, pt.Y, buttonName)
+	return true
 }
 
 var (
@@ -3357,14 +3429,24 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe
 //
 // If a ModeMove session is already active, it is ALWAYS torn down and a
 // fresh one started at pt/GetWindowRect-now, whether or not it targets the
-// same window. This covers:
-//   - a genuine duplicate/doubled LMB-down for the SAME in-progress drag
-//     (ie. for wtw reasons!) — harmless, since pt/rect haven't meaningfully
-//     changed, so the restart is imperceptible.
+// same window. An ordinary duplicate/doubled LMB-down for the SAME
+// in-progress drag no longer reaches this function at all -- see
+// mouseProc's isSpuriousDuplicateButtonDown, added after discovering that
+// restarting a live session against such a duplicate is NOT actually
+// harmless in general: GetWindowRect at that moment can be visually stale
+// relative to a SetWindowPos this same drag already queued but the main
+// thread hasn't drained/applied yet (see moveDataChan/
+// handleActualMoveOrResize), producing a visible lag-then-snap, and if the
+// cursor has since drifted over a different window, an unintended
+// retarget. What legitimately still reaches this path with a session
+// already active is:
 //   - a stale session surviving a winkey+L lock/unlock cycle — previously
 //     this branch returned early without restarting, silently freezing the
 //     drag until LMB was released and re-pressed. Now fixed to match the
 //     ModeResize/RMB path, which already did this correctly.
+//   - a genuinely new LMB-down targeting this or another window while an
+//     old session is somehow still alive (e.g. its own matching up was
+//     missed).
 //
 // If a ModeResize session is active instead, this is a no-op (finish the
 // resize first), matching prior behavior.
@@ -4933,6 +5015,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 	switch wParam {
 	case wincoe.WM_LBUTTONDOWN: //LMB pressed aka LMBDown or LMB DOWN
+		if isSpuriousDuplicateButtonDown(&lmbDownSwallowed, "LMB", info.Pt) {
+			return 1 // re-swallow; the active gesture (if any) is left completely untouched
+		}
 		// we don't want to trigger our drag gesture if shift/alt/ctrl was held before winkey, because it might have different meaning to other apps.
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
@@ -5399,6 +5484,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		return 1 // Swallow
 
 	case wincoe.WM_RBUTTONDOWN: //RMB pressed aka RMBDown aka RMBdrag
+		if isSpuriousDuplicateButtonDown(&rmbDownSwallowed, "RMB", info.Pt) {
+			return 1 // re-swallow; the active gesture (if any) is left completely untouched
+		}
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 		// var winDown bool = keyDown(VK_LWIN) || keyDown(VK_RWIN)
 		// var shiftDown bool = keyDown(VK_SHIFT)
@@ -5445,6 +5533,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		} // the 'if' in RMB
 
 	case wincoe.WM_MBUTTONDOWN: //MMB pressed
+		if isSpuriousDuplicateButtonDown(&mmbDownSwallowed, "MMB", info.Pt) {
+			return 1 // re-swallow; MMB has no persistent session, but this avoids double-firing its one-shot Z-order action
+		}
 		winDown, shiftDown, ctrlDown, altDown := modifierKeyState()
 
 		if winDown && !ctrlDown && !altDown {
