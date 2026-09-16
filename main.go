@@ -1877,7 +1877,73 @@ var rmbUpInputs = func() [1]wincoe.KEYANDMOUSE_INPUT {
 // 	}
 // }
 
+// isAnyGestureActive reports whether a Move or Resize gesture is currently
+// in progress, regardless of which window it targets. MMB actions have no
+// persistent activeSession (they're a single immediate Z-order change --
+// see dragSession's own doc comments), so this is naturally scoped to
+// ModeMove/ModeResize only, which is exactly what callers here care about.
+func isAnyGestureActive() bool {
+	return activeSession.Load() != nil
+}
+
+// injectLMBClickAtCoords is the last-resort fallback used when
+// forceForeground fails to focus the target window (see
+// WM_FOCUS_TARGET_WINDOW_SOMEHOW's handling in wndProc, its only caller):
+// it synthesizes a real LMB down+up at (x,y) via SendInput so the target
+// window gets a genuine click to focus/raise it, since ordinary
+// SetForegroundWindow is blocked in some situations (most notably: the
+// Windows Start Menu is already open -- see forceForeground's own doc
+// comment).
+//
+// Refuses to inject anything while ANY drag/resize gesture is currently
+// active (isAnyGestureActive), regardless of which window the active
+// gesture targets or which window this click's coordinates are meant for.
+// Added after root-causing a bug where winkey+LMB-dragging a window while
+// the Start Menu was already open would move normally for at most a
+// handful of mouse-move events and then abruptly stop, even while LMB and
+// winkey were both still physically held: with the Start Menu open,
+// forceForeground reliably fails, so this fallback fired and injected a
+// real LMB click at the drag's start coordinates. The Start Menu's own
+// click-outside-to-dismiss handling intercepted that injected click,
+// dismissed itself, and -- following the ordinary "a dismissing click
+// also passes through to whatever's beneath it" Windows popup UX
+// convention -- redelivered a FRESH, unmarked WM_LBUTTONDOWN+WM_LBUTTONUP
+// pair at that same location. Because that replay isn't tagged with
+// ourInputExtraInfoMarker (it originates from the shell, not from us),
+// mouseProc processes it exactly like ordinary physical input (see
+// ourInputExtraInfoMarker's own doc comment on that distinction): the
+// replayed WM_LBUTTONDOWN was already being safely re-swallowed as a
+// spurious duplicate (see isSpuriousDuplicateButtonDown) even before this
+// guard existed, but the replayed WM_LBUTTONUP right after it was not --
+// mouseProc's own WM_LBUTTONUP handling unconditionally ends an active
+// ModeMove session the instant it sees ANY up for that button (by design,
+// so a genuinely missed matching down never leaves a session stuck
+// forever) -- so that one injected click was silently ending the user's
+// still-physically-active drag out from under them. Only ModeMove
+// (LMB-tracked) was ever affected in practice: this fallback only ever
+// injects an LMB click regardless of which button actually started the
+// gesture, so a ModeResize session (RMB-tracked) simply never matched
+// WM_LBUTTONUP's own mode==ModeMove check and was left alone -- matching
+// the observed "resize is not affected" symptom exactly.
+//
+// The accepted trade-off is that this fallback effectively never fires
+// for its one real-world use case anymore: WM_FOCUS_TARGET_WINDOW_SOMEHOW
+// is only ever posted right as a gesture starts (see
+// applyFocusAndBringToFrontOnGestureStart), so a gesture is normally still
+// active by the time this handler actually runs. That means the target
+// window simply won't get force-focused via this specific workaround
+// while the Start Menu happens to already be open. That's an acceptable
+// cost: the alternative is a real, injected click landing on a window
+// while the user is actively dragging/resizing it, which is unsafe
+// regardless of the Start-Menu-replay mechanism above -- it can just as
+// easily land on unrelated UI (e.g. an exit button, per this function's
+// own historical caveat below).
 func injectLMBClickAtCoords(x, y int32) {
+	if isAnyGestureActive() {
+		logf("injectLMBClickAtCoords: refusing to inject LMB click at (%d,%d) because a drag/resize gesture is currently active; see this function's own doc comment for why", x, y)
+		return
+	}
+
 	// SendInput absolute mouse coordinates use the entire virtual desktop,
 	// not the primary monitor.
 	//
@@ -6629,9 +6695,16 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			// 3. If fallback click is needed, use absolute coordinates:
 
 			var extra string
-			if doLMBClick2FocusAsFallback.Load() {
+			switch {
+			case doLMBClick2FocusAsFallback.Load() && isAnyGestureActive():
+				// injectLMBClickAtCoords itself will refuse to inject below
+				// (see its own doc comment) -- this branch exists purely so
+				// this log line doesn't claim a fallback click is about to
+				// happen when it actually won't.
+				extra = "; NOT falling back to injected LMB click this time because a drag/resize gesture is currently active (see injectLMBClickAtCoords's doc comment for why injecting one now would be unsafe)"
+			case doLMBClick2FocusAsFallback.Load():
 				extra = "; next, falling back to injected LMB click which, unfortunately, means here that it will click at the point in the window where u tried to move it which eg. in total commander might be on the exit button and it will exit!"
-			} else {
+			default:
 				extra = "."
 			}
 			logf("Failed to force foreground(ie. to activate/focus window) this happens consistently when Start menu was already open(ie. press and release winkey once)%s", extra)
@@ -6643,6 +6716,13 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				// injecting a LMB_down then LMB_up so that the target window gets a click to focus and bring it to front
 				// this is a good workaround for focusing it which windows wouldn't allow via procSetForegroundWindow (unless attaching to target window's thread!)
 				//XXX: we LMB click at the point when gesture started because 150ms later(see HungWindowTimeout) when we realize the target window was not responding we're here and mouse woulda moved (ie. winkey+LMB drag was in progress since!) so LMB-ing where we currently are now is likely gonna LMB a background window thus focusing it instead of our target/initial window where gesture started upon.
+				// Safe to call unconditionally: injectLMBClickAtCoords
+				// itself refuses to inject anything while any gesture is
+				// active -- see its own doc comment for the concretely
+				// observed bug this guards against (an injected click here
+				// being replayed by an open Start Menu's dismiss handling,
+				// which used to prematurely end an in-progress ModeMove
+				// drag via a spurious, unmarked WM_LBUTTONUP).
 				injectLMBClickAtCoords(x, y)
 
 				//XXX: this is bad, it will sometimes move the window to these coords! sometimes it will fail completely because apparently window moved by some pixels down-right and thus it missed clicking it?!
