@@ -1,7 +1,38 @@
 @echo off
 rem 1. Prevent the current working directory from taking precedence over PATH, doesn't work with eg. "start go.exe"
 set "NoDefaultCurrentDirectoryInExePath=1"
-cd /d "%~dp0"
+
+::if running as admin must get back to current dir, or(can not be implemented) as non-admin must get into the same dir as this .bat is in!
+
+:: 2. Safely change to the script's directory. 
+rem setlocal disableDelayedExpansion
+rem echo on
+rem set "foo=%~dp0"
+rem endlocal & (
+rem echo cd /d "%foo%"
+rem echo cd /d "!foo!"
+rem cd /d "%foo%"
+rem cd /d "!foo!"
+rem echo off
+rem )
+:: this endlocal restores the cwd, that's the problem.
+
+:: Check if current working directory matches readcfg.bat's location
+setlocal disabledelayedexpansion
+set "TMP_readcfg_dir=%~dp0"
+if "%TMP_readcfg_dir:~-1%"=="\" set "TMP_readcfg_dir=%TMP_readcfg_dir:~0,-1%"
+
+if /i "%CD%" NEQ "%TMP_readcfg_dir%" (
+    echo WARNING: Current working directory does NOT match readcfg.bat directory! This isn not supported yet, you have to put readcfg.* into same dir, that is, in: %CD%
+    echo Press Ctrl+C to exit now or see lots of failures following due to this.
+    echo Current CWD    : "%CD%"
+    echo readcfg.bat DIR: "%TMP_readcfg_dir%"
+    pause
+)
+endlocal
+
+:: 2. Enable delayed expansion for script logic
+rem setlocal enabledelayedexpansion XXX: can't use setlocal or the read vars won't be seen by caller!
 
 ::you must have EnableDelayedExpansion in caller, else this will err then pause then exit!
 :: you must pass any args to can run this, like: call readcfg.bat anything
@@ -22,7 +53,7 @@ rem can't use setlocal at all, so we count on the caller to have it
 set "TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKDL=alpha"
 set "TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKDL=beta"
 if not "%TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKDL%"=="!TMPSCRIPT_dx_E4ZXH9LAH07QF1RNOKDL!" (
-    echo ERROR: delayed expansion is not enabled but it's needed.
+    echo ERROR: delayed expansion is not enabled but it's needed. Should be enabled in parent/caller .bat file
     pause
     exit /b 1
 )
@@ -33,15 +64,16 @@ set "TMPSCRIPT_WHITELIST_E4ZXH9LAH07QF1RNOKDL=exe_name log_file winbollocks_log_
 
 ::TODO: use TMPSCRIPT_*_E4ZXH9LAH07QF1RNOKDL
 set "TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL=readcfg.env"
-set "TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL=%~dp0%TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL%"
+:: !CD! safely evaluates paths with '!' intact under Delayed Expansion
+set "TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL=!CD!\!TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL!"
 
-if not exist "%TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL%" (
-    echo Config file "%TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL%" missing from "%TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL%"
+if not exist "!TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL!" (
+    echo Config file "!TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL!" missing from "!TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL!"
     pause
     exit /b 1
 )
 
-for /f "usebackq tokens=1,* delims==" %%A in ("%TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL%") do (
+for /f "usebackq tokens=1,* delims==" %%A in ("!TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL!") do (
     call :trim "%%A" TMP_key_N8RG305DWBRF52TCWV41
     call :trim "%%B" TMP_val_N8RG305DWBRF52TCWV41
     
@@ -63,12 +95,12 @@ for /f "usebackq tokens=1,* delims==" %%A in ("%TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOK
 
 ::specialized check(s) for some args
 if not defined TMP_exe_name_N8RG305DWBRF52TCWV41 (
-    echo Missing 'exe_name' entry in config file "%TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL%" at location "%TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL%"
+    echo Missing 'exe_name' entry in config file "!TMPSCRIPT_cfgfname_E4ZXH9LAH07QF1RNOKDL!" at location "!TMPSCRIPT_cfg_E4ZXH9LAH07QF1RNOKDL!"
     pause
     exit /b 1
 )
-if /i not "%TMP_exe_name_N8RG305DWBRF52TCWV41:~-4%"==".exe" (
-    echo Config error: "%TMP_exe_name_N8RG305DWBRF52TCWV41%" is not an .exe
+if /i not "!TMP_exe_name_N8RG305DWBRF52TCWV41:~-4!"==".exe" (
+    echo Config error: "!TMP_exe_name_N8RG305DWBRF52TCWV41!" is not an .exe
     pause
     exit /b 1
 )
@@ -90,7 +122,7 @@ for /f "tokens=1 delims==" %%V in ('set 2^>nul ^| findstr /r /b /i /c:"TMP_.*_N8
 
 rem don't endlocal or we lose everything we read/set! But here’s the critical point: when the batch file exits, CMD automatically discards all active setlocal environments, regardless of whether you explicitly ran endlocal or not.
 
-if "%READCFG_PRIME%" == "DEBUG" (
+if "!READCFG_PRIME!" == "DEBUG" (
   rem set | find "TMP"
   set
   echo DEBUG is all done.
