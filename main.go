@@ -2737,7 +2737,7 @@ func updateTrayTooltipInputStateIfChanged() {
 
 	tipUpdate := trayIcon
 	tipUpdate.UFlags = wincoe.NIF_TIP
-	copyUTF16Truncated(tipUpdate.SzTip[:], selfName+" "+GetVersion()+" | Held: "+stateText)
+	copyUTF16Truncated(tipUpdate.SzTip[:], selfName+" "+GetVersion()+"\nHeld: "+stateText)
 
 	//if res := procShellNotifyIcon.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&tipUpdate))); res.Failed() {
 	if res := wincoe.ShellNotifyIcon(wincoe.NIM_MODIFY, &tipUpdate); res.Failed() {
