@@ -3766,7 +3766,10 @@ func tryPerformMMBGestureAt(
 			return false, true // foreground is fullscreen; let event through
 		}
 
+		diagLogMMBTargetResolution(pt, hwnd)
+
 		if ShouldThrottle() { //every 10ms or more, else drop it
+			logf("tryPerformMMBGestureAt: dropping Win+MMB send-to-back for HWND=0x%X because ShouldThrottle() is true (another move/resize/z-order action was processed <%dms ago)", hwnd, forceMoveOrResizeActionsToBeThisManyMSApart)
 			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
 			return true, false
 		}
@@ -4815,6 +4818,49 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 	return
 }
 
+// getAncestorChecked wraps wincoe.GetAncestor. A (0, nil) result means "no such
+// ancestor" (e.g. GA_PARENT of the desktop); an error means the call failed.
+func getAncestorChecked(hwnd windows.Handle, flags uint32) (windows.Handle, error) {
+	h, res := wincoe.GetAncestor(hwnd, flags)
+	if res.Failed() {
+		return 0, fmt.Errorf("GetAncestor(HWND=0x%X, flags=%d) failed: %w", hwnd, flags, res.Err)
+	}
+	return h, nil
+}
+
+// rootOwnerOf returns hwnd's GA_ROOTOWNER: the top of its parent/owner chain.
+// Windows keeps an owner and all its owned windows together in the z-order
+// (an owned window can never sit below its owner), so this identifies the
+// "z-order group" hwnd belongs to.
+func rootOwnerOf(hwnd windows.Handle) (windows.Handle, error) {
+	root, err := getAncestorChecked(hwnd, wincoe.GA_ROOTOWNER)
+	if err != nil {
+		return 0, fmt.Errorf("rootOwnerOf: %w", err)
+	}
+	if root == 0 {
+		return 0, fmt.Errorf("rootOwnerOf: GetAncestor(HWND=0x%X, GA_ROOTOWNER) returned NULL without an error", hwnd)
+	}
+	return root, nil
+}
+
+// isInZOrderGroup reports whether hwnd is groupRoot itself or an owned window
+// whose GA_ROOTOWNER is groupRoot. A failed lookup is logged and treated as
+// "not in the group" (we can't prove membership).
+func isInZOrderGroup(hwnd, groupRoot windows.Handle) bool {
+	if hwnd == 0 || groupRoot == 0 {
+		return false
+	}
+	if hwnd == groupRoot {
+		return true
+	}
+	root, err := rootOwnerOf(hwnd)
+	if err != nil {
+		logf("isInZOrderGroup: couldn't determine the owner group of HWND=0x%X, assuming it's not in group 0x%X: %v", hwnd, groupRoot, err)
+		return false
+	}
+	return root == groupRoot
+}
+
 // findNewForegroundCandidateAfterSendToBack walks the Z-order from the very
 // top (GetTopWindow(0)) downward via GW_HWNDNEXT, looking for the first
 // window that's a legitimate refocus target: visible, not one of our own
@@ -4829,6 +4875,15 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 // if GetTopWindow itself returns nothing (empty desktop Z-order).
 func findNewForegroundCandidateAfterSendToBack(excludeHwnd windows.Handle) windows.Handle {
 	const maxWalkSteps = 500 // defensive bound; a real Z-order is never remotely this deep
+
+	// Never refocus an owner/owned sibling of the window we just sent to the
+	// back: activating a window raises its whole owner group, which would
+	// drag the window we just backgrounded straight back to the top.
+	excludeRoot, excludeRootErr := rootOwnerOf(excludeHwnd)
+	if excludeRootErr != nil {
+		logf("findNewForegroundCandidateAfterSendToBack: couldn't get the owner group of HWND=0x%X, only excluding that exact window: %v", excludeHwnd, excludeRootErr)
+		excludeRoot = excludeHwnd
+	}
 
 	//res1 := procGetTopWindow.Call(0)
 	hwnd, res1 := wincoe.GetTopWindow(0)
@@ -4845,7 +4900,10 @@ func findNewForegroundCandidateAfterSendToBack(excludeHwnd windows.Handle) windo
 			// via a synchronous SetWindowPos that already returned -- but
 			// stay defensive against any OS-level timing surprise.
 		case isOwnWindow(hwnd):
-			// Never refocus one of our own (hidden/overlay) windows.
+		// Never refocus one of our own (hidden/overlay) windows.
+		case isInZOrderGroup(hwnd, excludeRoot):
+			// Same owner group as the window we just sent back (its owner or
+			// something it owns): refocusing it would raise the whole group.
 		default:
 			// if resVis := procIsWindowVisible.Call(uintptr(hwnd)); resVis.R1 != 0 {
 			if wincoe.IsWindowVisible(hwnd) {
@@ -6271,6 +6329,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		// 	uintptr(data.Flags),
 		// )
 		//if ret == 0 { //failed
+		diagZOrderBefore(data)
 		res4 := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H, data.Flags)
 		if res4.Failed() {
 			//errCode, _, _ := procGetLastError.Call()
@@ -6282,6 +6341,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			abandonPendingZOrderAction(data)
 			return
 		}
+		diagZOrderAfterSetWindowPos(data)
 		switch data.ZOrderAction {
 		case zOrderActionNone:
 			// Ordinary move or asynchronous resize.
@@ -6309,6 +6369,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 
 				if newTop :=
 					findNewForegroundCandidateAfterSendToBack(target); newTop != 0 {
+					diagLogRefocusCandidate(target, newTop)
 					if !forceForeground(newTop) {
 						logf(
 							"handleActualMoveOrResize: failed to shift focus to new top-of-Z-order HWND=0x%X after sending HWND=0x%X to back",
@@ -6358,6 +6419,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 				data.ZOrderAction,
 			))
 		} //switch
+		diagZOrderSettled(data)
 	} //else
 } //func
 
