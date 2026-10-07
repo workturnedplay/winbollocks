@@ -87,6 +87,7 @@ func firstVisibleForeignWindowBelow(hwnd windows.Handle) (windows.Handle, error)
 			return 0, fmt.Errorf("firstVisibleForeignWindowBelow: walking below HWND=0x%X: %w", hwnd, nextErr)
 		}
 		if next == 0 {
+			//nolint:nilnil // return both a `nil` error and an invalid value: use a sentinel error instead (nilnil)
 			return 0, nil // reached the bottom of the z-order
 		}
 		cur = next
