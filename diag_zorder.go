@@ -108,16 +108,6 @@ func fmtHandleOrErr(h windows.Handle, err error) string {
 	return fmt.Sprintf("0x%X", h)
 }
 
-// getRelatedWindowChecked wraps wincoe.GetWindow. A (0, nil) result means "no
-// such related window" (e.g. no owner); an error means the call really failed.
-func getRelatedWindowChecked(hwnd windows.Handle, uCmd uint32) (windows.Handle, error) {
-	res := wincoe.GetWindow(hwnd, uCmd)
-	if res.Failed() {
-		return 0, fmt.Errorf("GetWindow(HWND=0x%X, uCmd=%d) failed: %w", hwnd, uCmd, res.Err)
-	}
-	return windows.Handle(res.R1), nil
-}
-
 // readStyleAndExStyle reads GWL_STYLE and GWL_EXSTYLE as 32-bit masks.
 func readStyleAndExStyle(hwnd windows.Handle) (style, exStyle uint32, err error) {
 	s, err1 := getWindowLongPtr(hwnd, wincoe.GWL_STYLE)

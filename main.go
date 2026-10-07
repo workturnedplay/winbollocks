@@ -6342,6 +6342,11 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			return
 		}
 		diagZOrderAfterSetWindowPos(data)
+		if data.ZOrderAction == zOrderActionSendToBack {
+			// SetWindowPos reporting success doesn't prove the window moved
+			// (see ensureSentToBack's doc comment).
+			_ = ensureSentToBack(target, true, "right after the first SetWindowPos")
+		}
 		switch data.ZOrderAction {
 		case zOrderActionNone:
 			// Ordinary move or asynchronous resize.
@@ -6419,6 +6424,9 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 				data.ZOrderAction,
 			))
 		} //switch
+		if data.ZOrderAction == zOrderActionSendToBack {
+			_ = ensureSentToBack(target, false, "after the refocus logic")
+		}
 		diagZOrderSettled(data)
 	} //else
 } //func
@@ -10071,8 +10079,12 @@ func getWindowTextFast(hwnd windows.Handle) string {
 	length := res1.R1 // it's CheckNone and returns length!
 	if length == 0 {
 		//if lastErr := windows.GetLastError(); lastErr != nil {// this is always 0/nil because each syscall(which this windows.GetLastError() is) from Go will setlasterr(0) first, as per https://github.com/golang/go/issues/41220
-		if lastErr := res1.CallStatus; lastErr != nil {
-			logf("getWindowTextFast: InternalGetWindowText failed for HWND=0x%X, err: %v", hwnd, lastErr)
+		// NOTE: res1.CallStatus is a syscall.Errno, which is a NON-nil error
+		// interface even when its value is 0 (ERROR_SUCCESS, "The operation
+		// completed successfully."), so a plain `!= nil` check misreports every
+		// genuinely empty title as a failure. CallStatusFailed() handles that.
+		if res1.CallStatusFailed() {
+			logf("getWindowTextFast: InternalGetWindowText failed for HWND=0x%X, err: %v", hwnd, res1.CallStatus)
 			return "<failed>"
 		}
 		return "" // genuinely empty title, not a failure
