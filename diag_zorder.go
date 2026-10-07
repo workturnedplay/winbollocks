@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -29,19 +30,23 @@ import (
 // shouldLogZOrderDiagnostics gates all "[zdiag]" logging (Win+MMB / Win+Shift+MMB
 // z-order investigation). Flip to false once the investigation is done; every
 // entry point below returns immediately when it is false.
-//
-// Log volume is roughly 50-70 lines per z-order gesture, so don't leave it on
-// permanently.
 var shouldLogZOrderDiagnostics = true
 
 const (
-	// zdiagMaxWalkSteps bounds the top-level z-order walk (hidden windows are
-	// included in the walk, so real-world counts of a few hundred are normal).
-	zdiagMaxWalkSteps = 1000
 	// zdiagMaxOwnedListed caps how many directly-owned windows get listed.
 	zdiagMaxOwnedListed = 16
 	// zdiagTitleMaxRunes keeps one-line window descriptions readable.
 	zdiagTitleMaxRunes = 48
+	// zdiagNeighbors is how many z-order neighbours above AND below the target
+	// get listed.
+	zdiagNeighbors = 4
+	// zdiagBottomCount is how many of the bottom-most windows get listed.
+	zdiagBottomCount = 3
+
+	// zdiagEventWindow is how long after a z-order command WinEvents get logged.
+	zdiagEventWindow = 2 * time.Second
+	// zdiagEventMaxLogged caps how many WinEvents get logged per armed window.
+	zdiagEventMaxLogged int32 = 200
 
 	// gaParent is GetAncestor's GA_PARENT (not defined in wincoe).
 	gaParent uint32 = 1
@@ -56,7 +61,6 @@ const (
 // re-raised by a refocus) shortly after we sent it to the back.
 var zdiagRecheckDelays = [...]time.Duration{
 	30 * time.Millisecond,
-	120 * time.Millisecond,
 	400 * time.Millisecond,
 	1500 * time.Millisecond,
 }
@@ -210,18 +214,18 @@ func describeWindow(hwnd windows.Handle, verbose bool) string {
 // zOrderWalk is the result of one top-to-bottom walk of the top-level z-order
 // (hidden windows included).
 type zOrderWalk struct {
-	index               int // target's 0-based index (0 = topmost), -1 if not found
-	total               int // how many top-level windows were walked
-	above, below        windows.Handle
-	top                 []windows.Handle
+	all                 []windows.Handle // every walked window, index == z-index (0 = topmost)
+	index               int              // target's z-index, -1 if not found
+	topmostBandSize     int              // how many leading windows are WS_EX_TOPMOST
 	owned               []windows.Handle // windows whose GW_OWNER == target (capped)
+	ownedIdx            []int            // z-index of each entry in owned
 	ownedTotal          int
 	ownerLookupFailures int
 	truncated           bool
 	err                 error
 }
 
-func walkZOrderForDiag(target windows.Handle, topCount int) zOrderWalk {
+func walkZOrderForDiag(target windows.Handle) zOrderWalk {
 	w := zOrderWalk{index: -1}
 
 	hwnd, res := wincoe.GetTopWindow(0)
@@ -230,21 +234,27 @@ func walkZOrderForDiag(target windows.Handle, topCount int) zOrderWalk {
 		return w
 	}
 
-	var prev windows.Handle
+	inTopmostBand := true
 	for steps := 0; hwnd != 0; steps++ {
-		if steps >= zdiagMaxWalkSteps {
+		if steps >= maxZOrderWalkSteps {
 			w.truncated = true
 			break
 		}
-		if len(w.top) < topCount {
-			w.top = append(w.top, hwnd)
+		idx := len(w.all)
+		w.all = append(w.all, hwnd)
+
+		if inTopmostBand {
+			ex, exErr := getWindowLongPtr(hwnd, wincoe.GWL_EXSTYLE)
+			// #nosec G115 -- safe: Win32 extended window styles are 32-bit bitmasks
+			if exErr == nil && uint32(ex)&wincoe.WS_EX_TOPMOST != 0 {
+				w.topmostBandSize++
+			} else {
+				inTopmostBand = false
+			}
 		}
-		if target != 0 && prev == target && w.below == 0 {
-			w.below = hwnd
-		}
+
 		if hwnd == target {
-			w.index = w.total
-			w.above = prev
+			w.index = idx
 		} else {
 			o, oErr := getRelatedWindowChecked(hwnd, wincoe.GW_OWNER)
 			switch {
@@ -254,31 +264,32 @@ func walkZOrderForDiag(target windows.Handle, topCount int) zOrderWalk {
 				w.ownedTotal++
 				if len(w.owned) < zdiagMaxOwnedListed {
 					w.owned = append(w.owned, hwnd)
+					w.ownedIdx = append(w.ownedIdx, idx)
 				}
 			}
 		}
-		w.total++
-		prev = hwnd
 
-		next := wincoe.GetWindow(hwnd, wincoe.GW_HWNDNEXT)
-		if next.Failed() {
-			w.err = fmt.Errorf("GetWindow(HWND=0x%X, GW_HWNDNEXT) failed mid-walk after %d windows: %w", hwnd, w.total, next.Err)
+		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
+		if nextErr != nil {
+			w.err = fmt.Errorf("z-order walk cut short after %d windows: %w", len(w.all), nextErr)
 			break
 		}
-		hwnd = windows.Handle(next.R1)
+		hwnd = next
 	}
 	return w
 }
 
-// logZOrderSnapshot logs where target currently sits in the top-level z-order,
-// its neighbours, its directly-owned windows, the foreground window and the
-// topCount topmost windows.
-func logZOrderSnapshot(label string, target windows.Handle, topCount int, verboseTarget bool) {
+// logZOrderSnapshot logs where target currently sits in the top-level z-order:
+// its z-index, the size of the topmost band, its neighbours, its directly-owned
+// windows (with their own z-indices), the bottom-most windows and the
+// foreground window.
+func logZOrderSnapshot(label string, target windows.Handle, verboseTarget bool) {
 	if !shouldLogZOrderDiagnostics {
 		return
 	}
-	w := walkZOrderForDiag(target, topCount)
+	w := walkZOrderForDiag(target)
 	fg := wincoe.GetForegroundWindow()
+	total := len(w.all)
 
 	logf("[zdiag] %s: target=%s", label, describeWindow(target, verboseTarget))
 	logf("[zdiag] %s: foreground=%s", label, describeWindow(fg, false))
@@ -286,38 +297,45 @@ func logZOrderSnapshot(label string, target windows.Handle, topCount int, verbos
 		logf("[zdiag] %s: z-order walk incomplete: %v", label, w.err)
 	}
 	if w.truncated {
-		logf("[zdiag] %s: z-order walk truncated at %d windows", label, zdiagMaxWalkSteps)
+		logf("[zdiag] %s: z-order walk truncated at %d windows", label, maxZOrderWalkSteps)
+	}
+	logf("[zdiag] %s: %d top-level windows walked; the first %d are WS_EX_TOPMOST, so the non-topmost band starts at z-index %d",
+		label, total, w.topmostBandSize, w.topmostBandSize)
+
+	mark := func(h windows.Handle) string {
+		s := ""
+		if h == target {
+			s += " <== TARGET"
+		}
+		if h == fg {
+			s += " [FOREGROUND]"
+		}
+		return s
 	}
 
 	if w.index < 0 {
-		logf("[zdiag] %s: target NOT found among the %d top-level windows walked", label, w.total)
+		logf("[zdiag] %s: target NOT found among the %d top-level windows walked", label, total)
 	} else {
 		bottomNote := ""
-		if w.index == w.total-1 && !w.truncated && w.err == nil {
+		if w.index == total-1 && !w.truncated && w.err == nil {
 			bottomNote = " -> target IS bottom-most"
 		}
-		logf("[zdiag] %s: target z-index=%d of %d (0=topmost)%s", label, w.index, w.total, bottomNote)
-		logf("[zdiag] %s:   directly ABOVE target: %s", label, describeWindow(w.above, false))
-		logf("[zdiag] %s:   directly BELOW target: %s", label, describeWindow(w.below, false))
+		logf("[zdiag] %s: target z-index=%d of %d (0=topmost)%s", label, w.index, total, bottomNote)
+		for i := max(0, w.index-zdiagNeighbors); i <= min(total-1, w.index+zdiagNeighbors); i++ {
+			logf("[zdiag] %s:   near z[%d] %s%s", label, i, describeWindow(w.all[i], false), mark(w.all[i]))
+		}
 	}
 
 	logf("[zdiag] %s: windows directly owned by target (GW_OWNER==target): %d", label, w.ownedTotal)
-	for _, h := range w.owned {
-		logf("[zdiag] %s:   owned: %s", label, describeWindow(h, false))
+	for i, h := range w.owned {
+		logf("[zdiag] %s:   owned z[%d] %s", label, w.ownedIdx[i], describeWindow(h, false))
 	}
 	if w.ownerLookupFailures > 0 {
 		logf("[zdiag] %s: GW_OWNER lookup failed for %d window(s) during the walk (probably destroyed mid-walk)", label, w.ownerLookupFailures)
 	}
 
-	for i, h := range w.top {
-		marks := ""
-		if h == target {
-			marks += " <== TARGET"
-		}
-		if h == fg {
-			marks += " [FOREGROUND]"
-		}
-		logf("[zdiag] %s:   z[%d] %s%s", label, i, describeWindow(h, false), marks)
+	for i := max(0, total-zdiagBottomCount); i < total; i++ {
+		logf("[zdiag] %s:   bottom z[%d] %s%s", label, i, describeWindow(w.all[i], false), mark(w.all[i]))
 	}
 }
 
@@ -328,11 +346,104 @@ func scheduleZOrderRechecks(label string, target windows.Handle) {
 	for _, delay := range zdiagRecheckDelays {
 		time.AfterFunc(delay, func() {
 			runDiagSafely("scheduleZOrderRechecks", func() {
-				logZOrderSnapshot(fmt.Sprintf("%s +%dms", label, delay.Milliseconds()), target, 5, false)
+				logZOrderSnapshot(fmt.Sprintf("%s +%dms", label, delay.Milliseconds()), target, false)
 			})
 		})
 	}
 }
+
+// ---- WinEvent logging around a z-order command -----------------------------
+
+var (
+	// zdiagEventArmedUntilUnixNano is 0 when WinEvent logging is off.
+	zdiagEventArmedUntilUnixNano atomic.Int64
+	zdiagEventBudget             atomic.Int32
+	zdiagEventTargetPID          atomic.Uint32
+	zdiagEventTargetTID          atomic.Uint32
+)
+
+// armZOrderEventLogging makes winEventProc log relevant WinEvents for
+// zdiagEventWindow: REORDER and FOREGROUND from anyone, plus SHOW/HIDE/CREATE/
+// DESTROY/FOCUS from the target's process. Our own process's events are never
+// delivered (the hook uses WINEVENT_SKIPOWNPROCESS), so anything logged here
+// was caused by someone else -- most interestingly, by the target itself.
+func armZOrderEventLogging(target windows.Handle) {
+	var pid uint32
+	tid, res := wincoe.GetWindowThreadProcessId(target, &pid)
+	if res.Failed() {
+		logf("[zdiag] armZOrderEventLogging: GetWindowThreadProcessId(HWND=0x%X) failed, only PID-independent events will be logged: %v", target, res.Err)
+		pid, tid = 0, 0
+	}
+	zdiagEventTargetPID.Store(pid)
+	zdiagEventTargetTID.Store(tid)
+	zdiagEventBudget.Store(zdiagEventMaxLogged)
+	zdiagEventArmedUntilUnixNano.Store(time.Now().Add(zdiagEventWindow).UnixNano())
+}
+
+func winEventName(event uint32) string {
+	switch event {
+	case wincoe.EVENT_SYSTEM_FOREGROUND:
+		return "SYSTEM_FOREGROUND"
+	case wincoe.EVENT_OBJECT_CREATE:
+		return "OBJECT_CREATE"
+	case wincoe.EVENT_OBJECT_DESTROY:
+		return "OBJECT_DESTROY"
+	case wincoe.EVENT_OBJECT_SHOW:
+		return "OBJECT_SHOW"
+	case wincoe.EVENT_OBJECT_HIDE:
+		return "OBJECT_HIDE"
+	case wincoe.EVENT_OBJECT_REORDER:
+		return "OBJECT_REORDER"
+	case wincoe.EVENT_OBJECT_FOCUS:
+		return "OBJECT_FOCUS"
+	default:
+		return fmt.Sprintf("0x%X", event)
+	}
+}
+
+// diagLogWinEvent is called from the very top of winEventProc (main thread).
+// It is one atomic load when not armed.
+func diagLogWinEvent(event uint32, hwnd windows.Handle, idObject, idChild int32, eventThread, eventTime uint32) {
+	if !shouldLogZOrderDiagnostics {
+		return
+	}
+	until := zdiagEventArmedUntilUnixNano.Load()
+	if until == 0 || time.Now().UnixNano() > until {
+		return
+	}
+
+	switch event {
+	case wincoe.EVENT_OBJECT_REORDER, wincoe.EVENT_SYSTEM_FOREGROUND:
+		// always relevant
+	case wincoe.EVENT_OBJECT_SHOW, wincoe.EVENT_OBJECT_HIDE, wincoe.EVENT_OBJECT_CREATE,
+		wincoe.EVENT_OBJECT_DESTROY, wincoe.EVENT_OBJECT_FOCUS:
+		targetPID := zdiagEventTargetPID.Load()
+		if hwnd == 0 || targetPID == 0 {
+			return
+		}
+		var pid uint32
+		if _, res := wincoe.GetWindowThreadProcessId(hwnd, &pid); res.Failed() || pid != targetPID {
+			return
+		}
+	default:
+		return
+	}
+
+	if left := zdiagEventBudget.Add(-1); left < 0 {
+		if left == -1 {
+			logf("[zdiag] WINEVENT logging budget (%d) exhausted for this z-order command; suppressing the rest", zdiagEventMaxLogged)
+		}
+		return
+	}
+
+	runDiagSafely("diagLogWinEvent", func() {
+		logf("[zdiag] WINEVENT %s idObject=%d idChild=%d eventTime=%d eventThread=%d (target UI thread=%d, our main thread=%d) hwnd: %s",
+			winEventName(event), idObject, idChild, eventTime, eventThread,
+			zdiagEventTargetTID.Load(), windows.GetCurrentThreadId(), describeWindow(hwnd, false))
+	})
+}
+
+// ---- entry points called from handleActualMoveOrResize / mouseProc ---------
 
 // diagZOrderBefore must be called right before SetWindowPos is issued for a
 // queued z-order command (main thread, handleActualMoveOrResize).
@@ -341,10 +452,11 @@ func diagZOrderBefore(data WindowMoveData) {
 		return
 	}
 	runDiagSafely("diagZOrderBefore", func() {
+		armZOrderEventLogging(data.Hwnd)
 		logf("[zdiag] ===== about to apply %v to HWND=0x%X: InsertAfter=0x%X Flags=0x%X wasForegroundBefore=%v unfocusAfter=%v restoreID=%d =====",
 			data.ZOrderAction, data.Hwnd, data.InsertAfter, data.Flags,
 			data.TargetWasForegroundBeforeSendToBack, data.UnfocusAfterSuccessfulSendToBack, data.SentToBackRestoreID)
-		logZOrderSnapshot("BEFORE", data.Hwnd, 8, true)
+		logZOrderSnapshot("BEFORE", data.Hwnd, true)
 	})
 }
 
@@ -356,7 +468,7 @@ func diagZOrderAfterSetWindowPos(data WindowMoveData) {
 		return
 	}
 	runDiagSafely("diagZOrderAfterSetWindowPos", func() {
-		logZOrderSnapshot("AFTER SetWindowPos (before any refocus)", data.Hwnd, 6, false)
+		logZOrderSnapshot("AFTER SetWindowPos (before any refocus)", data.Hwnd, false)
 	})
 }
 
@@ -367,7 +479,7 @@ func diagZOrderSettled(data WindowMoveData) {
 		return
 	}
 	runDiagSafely("diagZOrderSettled", func() {
-		logZOrderSnapshot("AFTER refocus logic", data.Hwnd, 6, false)
+		logZOrderSnapshot("AFTER refocus logic", data.Hwnd, false)
 		scheduleZOrderRechecks("RECHECK", data.Hwnd)
 	})
 }

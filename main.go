@@ -9779,6 +9779,8 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	_ = dwEventThread //don't warn me it's unused!
 	_ = dwmsEventTime //don't warn me it's unused!
 
+	diagLogWinEvent(event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime)
+
 	// ONLY process if it's the actual window, not a sub-control/caret/item
 	if idObject != wincoe.OBJID_WINDOW { // 0 is OBJID_WINDOW
 		return 0 // WinEvent callbacks return 0 (no chaining)

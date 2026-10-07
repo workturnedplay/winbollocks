@@ -185,7 +185,7 @@ func ensureSentToBack(target windows.Handle, skipPlainStage bool, phase string) 
 	if blocker == 0 {
 		return true
 	}
-	logf("ensureSentToBack(%s): HWND=0x%X is NOT at the back (visible window HWND=0x%X is still below it); trying fallbacks", phase, target, blocker)
+	logf("ensureSentToBack(%s): HWND=0x%X is NOT at the back (visible foreign window still below it: %s); trying fallbacks", phase, target, describeWindow(blocker, false))
 
 	stages := [...]struct {
 		name string
@@ -212,7 +212,7 @@ func ensureSentToBack(target windows.Handle, skipPlainStage bool, phase string) 
 			logf("ensureSentToBack(%s): stage %q was needed and worked for HWND=0x%X", phase, stage.name, target)
 			return true
 		}
-		logf("ensureSentToBack(%s): stage %q ran but HWND=0x%X is still not at the back (HWND=0x%X still below it)", phase, stage.name, target, blocker)
+		logf("ensureSentToBack(%s): stage %q ran but HWND=0x%X is still not at the back (still below it: %s)", phase, stage.name, target, describeWindow(blocker, false))
 	}
 	logf("ensureSentToBack(%s): every fallback stage failed for HWND=0x%X", phase, target)
 	return false
