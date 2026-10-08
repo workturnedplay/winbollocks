@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -43,6 +44,14 @@ const (
 
 	// dwmwaCloaked is DWMWA_CLOAKED for DwmGetWindowAttribute.
 	dwmwaCloaked uint32 = 14
+
+	// maxBlockersLogged caps how many "visible foreign window still below the
+	// target" entries ensureSentToBack lists (and fetches) per verification.
+	maxBlockersLogged = 5
+
+	// explorerExeName is the shell process whose desktop host windows
+	// (Progman/WorkerW) legitimately sit below every normal window.
+	explorerExeName = "explorer.exe"
 )
 
 // procDwmGetWindowAttributeCloaked is DwmGetWindowAttribute bound for the
@@ -83,15 +92,25 @@ func setWindowZOrder(hwnd, insertAfter windows.Handle) error {
 	return nil
 }
 
-// isDesktopHostWindow reports whether hwnd is one of the shell's desktop host
-// windows, which legitimately stay below everything else even after an
-// HWND_BOTTOM. A failed class lookup is treated as "no".
+// isDesktopHostWindow reports whether hwnd is one of explorer's desktop host
+// windows (Progman/WorkerW), which legitimately stay below everything else even
+// after an HWND_BOTTOM. The class name alone is NOT enough: observed,
+// TOTALCMD64.EXE creates a top-level window of class "WorkerW", which made a
+// class-only check stop the "lowest real window" walk in the middle of the
+// z-order. A failed class or process lookup is treated as "no".
 func isDesktopHostWindow(hwnd windows.Handle) bool {
 	class, res := wincoe.GetClassName(hwnd)
 	if res.Failed() {
 		return false
 	}
-	return class == "Progman" || class == "WorkerW"
+	if class != "Progman" && class != "WorkerW" {
+		return false
+	}
+	pid := getWindowPID(hwnd)
+	if pid == 0 {
+		return false
+	}
+	return strings.EqualFold(getProcessNameFast(pid), explorerExeName)
 }
 
 // isWindowCloaked reports whether DWM cloaks hwnd (e.g. UWP windows that are
@@ -175,24 +194,29 @@ func fmtZIndex(index, total int, err error) string {
 	return fmt.Sprintf("%d/%d", index, total)
 }
 
-// firstVisibleForeignWindowBelow walks downward from hwnd and returns the
-// first top-level window below it that is really on screen and is not part of
-// hwnd's own owner group, not one of ours, and not a desktop host window.
-// Returns (0, nil) if there is none, i.e. hwnd is visually at the back.
-func firstVisibleForeignWindowBelow(hwnd windows.Handle) (windows.Handle, error) {
+// visibleForeignWindowsBelow walks downward from hwnd and returns up to limit of
+// the top-level windows below it that are really on screen and are not part of
+// hwnd's own owner group, not one of ours, and not an explorer desktop host
+// window. An empty result with a nil error means hwnd is visually at the back.
+// On a walk error, whatever was found so far is returned together with the error.
+func visibleForeignWindowsBelow(hwnd windows.Handle, limit int) ([]windows.Handle, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("visibleForeignWindowsBelow: limit must be >= 1, got %d", limit)
+	}
 	groupRoot, rootErr := rootOwnerOf(hwnd)
 	if rootErr != nil {
-		return 0, fmt.Errorf("firstVisibleForeignWindowBelow: %w", rootErr)
+		return nil, fmt.Errorf("visibleForeignWindowsBelow: %w", rootErr)
 	}
 
+	var found []windows.Handle
 	cur := hwnd
 	for steps := 0; steps < maxZOrderWalkSteps; steps++ {
 		next, nextErr := getRelatedWindowChecked(cur, wincoe.GW_HWNDNEXT)
 		if nextErr != nil {
-			return 0, fmt.Errorf("firstVisibleForeignWindowBelow: walking below HWND=0x%X: %w", hwnd, nextErr)
+			return found, fmt.Errorf("visibleForeignWindowsBelow: walking below HWND=0x%X: %w", hwnd, nextErr)
 		}
 		if next == 0 {
-			return 0, nil // reached the bottom of the z-order
+			return found, nil // reached the bottom of the z-order
 		}
 		cur = next
 
@@ -203,9 +227,24 @@ func firstVisibleForeignWindowBelow(hwnd windows.Handle) (windows.Handle, error)
 		if isOwnWindow(next) || isDesktopHostWindow(next) || isInZOrderGroup(next, groupRoot) || !isWindowReallyOnScreen(next) {
 			continue
 		}
-		return next, nil
+		found = append(found, next)
+		if len(found) >= limit {
+			return found, nil
+		}
 	}
-	return 0, fmt.Errorf("firstVisibleForeignWindowBelow: walk below HWND=0x%X exceeded %d steps", hwnd, maxZOrderWalkSteps)
+	return found, fmt.Errorf("visibleForeignWindowsBelow: walk below HWND=0x%X exceeded %d steps", hwnd, maxZOrderWalkSteps)
+}
+
+// logBlockingWindows logs the visible foreign windows still below target.
+func logBlockingWindows(phase string, target windows.Handle, blockers []windows.Handle) {
+	capped := ""
+	if len(blockers) >= maxBlockersLogged {
+		capped = " (at least; list capped)"
+	}
+	logf("ensureSentToBack(%s): %d visible foreign window(s) still below HWND=0x%X%s:", phase, len(blockers), target, capped)
+	for _, b := range blockers {
+		logf("ensureSentToBack(%s):   below: %s", phase, describeWindow(b, false))
+	}
 }
 
 // sameProcessWindowsDirectlyBelow returns the run of consecutive windows
@@ -244,8 +283,9 @@ func stagePlainBottom(target windows.Handle) error {
 
 // stageInsertAfterLowestWindow inserts target directly after the lowest
 // non-desktop-host window instead of using HWND_BOTTOM. Windows in target's own
-// owner group are skipped, and the walk stops at the first desktop host so the
-// target can never end up beneath the desktop.
+// owner group are skipped, and the walk stops at the first explorer desktop host
+// so the target can never end up beneath the desktop. Refuses to insert after a
+// topmost window, which would make the target topmost.
 func stageInsertAfterLowestWindow(target windows.Handle) error {
 	groupRoot, rootErr := rootOwnerOf(target)
 	if rootErr != nil {
@@ -275,6 +315,14 @@ func stageInsertAfterLowestWindow(target windows.Handle) error {
 	}
 	if lowest == 0 {
 		return errors.New("stageInsertAfterLowestWindow: no suitable window found to insert after")
+	}
+
+	_, exStyle, styleErr := readStyleAndExStyle(lowest)
+	if styleErr != nil {
+		return fmt.Errorf("stageInsertAfterLowestWindow: can't verify that HWND=0x%X isn't topmost: %w", lowest, styleErr)
+	}
+	if exStyle&wincoe.WS_EX_TOPMOST != 0 {
+		return fmt.Errorf("stageInsertAfterLowestWindow: the lowest window HWND=0x%X is topmost, inserting after it would make the target topmost", lowest)
 	}
 	return setWindowZOrder(target, lowest)
 }
@@ -337,13 +385,13 @@ var sendToBackStages = [...]struct {
 // ensureSentToBack verifies that target (already the subject of an
 // HWND_BOTTOM SetWindowPos, normally followed by a refocus) is really visually
 // at the back, and if not walks sendToBackStages, verifying after each one and
-// logging the target's z-index before/after every stage so the log shows which
-// one (if any) is needed.
+// logging the target's z-index before/after every stage plus which visible
+// foreign windows are still below it.
 //
 // SetWindowPos reporting success proves nothing here: observed with Task
-// Manager OG, where it succeeds but the z-index doesn't change, either because
-// the window is still the foreground window, or because it stops directly above
-// some of its own hidden windows.
+// Manager OG, where HWND_BOTTOM succeeds but leaves the window about 100
+// windows above the real bottom, and does nothing at all while the window is
+// still the foreground window.
 //
 // Owned windows (e.g. modal dialogs) are deliberately left on their legacy
 // behavior: this is only for windows that are their own root owner.
@@ -358,15 +406,16 @@ func ensureSentToBack(target windows.Handle, phase string) bool {
 		return true // owned window: legacy behavior, doesn't apply
 	}
 
-	blocker, verifyErr := firstVisibleForeignWindowBelow(target)
+	blockers, verifyErr := visibleForeignWindowsBelow(target, maxBlockersLogged)
 	if verifyErr != nil {
 		logf("ensureSentToBack(%s): couldn't verify z-order of HWND=0x%X, not attempting fallbacks: %v", phase, target, verifyErr)
 		return false
 	}
-	if blocker == 0 {
+	if len(blockers) == 0 {
 		return true
 	}
-	logf("ensureSentToBack(%s): HWND=0x%X is NOT at the back (visible foreign window still below it: %s); trying fallbacks", phase, target, describeWindow(blocker, false))
+	logf("ensureSentToBack(%s): HWND=0x%X is NOT at the back; trying fallbacks", phase, target)
+	logBlockingWindows(phase, target, blockers)
 
 	for _, stage := range sendToBackStages {
 		idxBefore, totalBefore, idxBeforeErr := zOrderIndexOf(target)
@@ -375,16 +424,17 @@ func ensureSentToBack(target windows.Handle, phase string) bool {
 		logf("ensureSentToBack(%s): stage %q: z-index %s -> %s, stage error: %v", phase, stage.name,
 			fmtZIndex(idxBefore, totalBefore, idxBeforeErr), fmtZIndex(idxAfter, totalAfter, idxAfterErr), runErr)
 
-		blocker, verifyErr = firstVisibleForeignWindowBelow(target)
+		blockers, verifyErr = visibleForeignWindowsBelow(target, maxBlockersLogged)
 		if verifyErr != nil {
 			logf("ensureSentToBack(%s): couldn't verify HWND=0x%X after stage %q: %v", phase, target, stage.name, verifyErr)
 			return false
 		}
-		if blocker == 0 {
+		if len(blockers) == 0 {
 			logf("ensureSentToBack(%s): stage %q was needed and worked for HWND=0x%X", phase, stage.name, target)
 			return true
 		}
-		logf("ensureSentToBack(%s): after stage %q HWND=0x%X is still not at the back (still below it: %s)", phase, stage.name, target, describeWindow(blocker, false))
+		logf("ensureSentToBack(%s): after stage %q HWND=0x%X is still not at the back", phase, stage.name, target)
+		logBlockingWindows(phase, target, blockers)
 	}
 	logf("ensureSentToBack(%s): every stage failed for HWND=0x%X", phase, target)
 	return false

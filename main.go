@@ -4885,56 +4885,45 @@ func findNewForegroundCandidateAfterSendToBack(excludeHwnd windows.Handle) windo
 		excludeRoot = excludeHwnd
 	}
 
-	//res1 := procGetTopWindow.Call(0)
 	hwnd, res1 := wincoe.GetTopWindow(0)
 	if res1.Failed() {
 		logf("findNewForegroundCandidateAfterSendToBack:GetTopWindow failed, res:%v", res1)
-		return 0 //quicker exit than below
+		return 0
 	}
-	// hwnd := windows.Handle(res1.R1)
 
 	for i := 0; hwnd != 0 && i < maxWalkSteps; i++ {
-		switch {
-		case hwnd == excludeHwnd:
-			// Shouldn't normally happen -- we just moved it to the bottom
-			// via a synchronous SetWindowPos that already returned -- but
-			// stay defensive against any OS-level timing surprise.
-		case isOwnWindow(hwnd):
-		// Never refocus one of our own (hidden/overlay) windows.
-		case isInZOrderGroup(hwnd, excludeRoot):
-			// Same owner group as the window we just sent back (its owner or
-			// something it owns): refocusing it would raise the whole group.
-		default:
-			// if resVis := procIsWindowVisible.Call(uintptr(hwnd)); resVis.R1 != 0 {
-			if wincoe.IsWindowVisible(hwnd) {
-				if skip, _ := shouldSkipFocusingIt(hwnd); !skip {
-					return hwnd
-				}
-			}
+		if eligible, _ := refocusCandidateVerdict(hwnd, excludeHwnd, excludeRoot); eligible {
+			return hwnd
 		}
-
-		//res2 := procGetWindow.Call(uintptr(hwnd), GW_HWNDNEXT)
-		res2 := wincoe.GetWindow(hwnd, wincoe.GW_HWNDNEXT)
-		//okFIXME: handle the case of window.ERROR_INVALID_WINDOW_HANDLE here like when hwnd is 0 or hwnd is possibly not alive anymore?!
-		// if res2.R1 == 0 {
-		// 	// Check if it's just the normal end of the Z-order vs. a true error
-		// 	// (e.g. the window we were querying was destroyed mid-walk).
-		// 	// if res2.CallStatus != nil && !errors.Is(res2.CallStatus, windows.ERROR_SUCCESS) {
-		// 	if !res2.CallStatusIs(windows.ERROR_SUCCESS) {
-		// 		// Optional: log that the walk was cut short due to an invalid handle mid-walk
-		// 		logf("DEBUG: findNewForegroundCandidateAfterSendToBack:GetWindow(GW_HWNDNEXT) hit invalid handle mid-walk")
-		// 	}
-		// 	break // if we don't break here then next 'for' loop iteration will due to hwnd!=0 is inside the 'for' decl.!
-		// }
-		if res2.Failed() {
-			logf("DEBUG: findNewForegroundCandidateAfterSendToBack:GetWindow(GW_HWNDNEXT) hit invalid handle mid-walk, res:%v", res2)
+		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
+		if nextErr != nil {
+			logf("DEBUG: findNewForegroundCandidateAfterSendToBack: z-order walk cut short: %v", nextErr)
 			return 0 //can do 'break' too, but what the heck, wanna be sure that adding code after the 'for' won't be executed from this path!
 		}
-		hwnd = windows.Handle(res2.R1)
-		//ohitsintheloopFIXME: am I even handling the case of hwnd == 0 ?! doesn't seem so! should I then try GW_HWNDNEXT ? I guess it's already doing this then!
+		hwnd = next
 	}
-
 	return 0
+}
+
+// refocusCandidateVerdict decides whether hwnd may receive focus after
+// excludeHwnd was sent to the back, and says why not otherwise. Shared by
+// findNewForegroundCandidateAfterSendToBack and the z-order diagnostics so
+// the log explains exactly the decisions the real walk makes.
+func refocusCandidateVerdict(hwnd, excludeHwnd, excludeRoot windows.Handle) (eligible bool, reason string) {
+	switch {
+	case hwnd == excludeHwnd:
+		return false, "it is the window just sent to the back"
+	case !wincoe.IsWindowVisible(hwnd):
+		return false, "not visible"
+	case isOwnWindow(hwnd):
+		return false, "belongs to our own process"
+	case isInZOrderGroup(hwnd, excludeRoot):
+		return false, "same owner group as the window just sent to the back"
+	}
+	if skip, why := shouldSkipFocusingIt(hwnd); skip {
+		return false, "shouldSkipFocusingIt: " + why
+	}
+	return true, "eligible"
 }
 
 // aka focus(activate) the window, works by attaching to target window's thread, so Windows won't do its focus stealing prevention thing!

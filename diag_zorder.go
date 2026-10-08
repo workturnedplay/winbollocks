@@ -487,6 +487,7 @@ func diagLogRefocusCandidate(target, candidate windows.Handle) {
 			target, describeWindow(candidate, false),
 			targetPID != 0 && targetPID == candidatePID, sameGroup,
 			fmtHandleOrErr(targetRoot, targetRootErr), fmtHandleOrErr(candidateRoot, candidateRootErr))
+		diagExplainRefocusChoice(target, candidate)
 	})
 }
 
@@ -502,4 +503,44 @@ func diagLogMMBTargetResolution(pt wincoe.POINT, resolvedRoot windows.Handle) {
 		logf("[zdiag] Win+MMB at (%d,%d): raw WindowFromPoint=%s", pt.X, pt.Y, describeWindow(rawHwnd, false))
 		logf("[zdiag] Win+MMB resolved top-level target (via GA_ROOT): %s", describeWindow(resolvedRoot, true))
 	})
+}
+
+// diagExplainRefocusChoice walks the z-order from the top exactly like
+// findNewForegroundCandidateAfterSendToBack and logs every VISIBLE window it
+// skipped before reaching candidate, with the reason, so "why was that window
+// refocused and not this other one" is answerable from the log.
+func diagExplainRefocusChoice(target, candidate windows.Handle) {
+	excludeRoot, rootErr := rootOwnerOf(target)
+	if rootErr != nil {
+		excludeRoot = target
+	}
+	hwnd, res := wincoe.GetTopWindow(0)
+	if res.Failed() {
+		logf("[zdiag] refocus walk: GetTopWindow(0) failed: %v", res.Err)
+		return
+	}
+
+	hidden := 0
+	for steps := 0; hwnd != 0 && steps < maxZOrderWalkSteps; steps++ {
+		if hwnd == candidate {
+			logf("[zdiag] refocus walk: reached the chosen candidate HWND=0x%X after skipping %d hidden window(s) (visible skipped ones are listed above)", candidate, hidden)
+			return
+		}
+		eligible, reason := refocusCandidateVerdict(hwnd, target, excludeRoot)
+		switch {
+		case eligible:
+			logf("[zdiag] refocus walk: UNEXPECTED: eligible window before the chosen candidate: %s", describeWindow(hwnd, false))
+		case wincoe.IsWindowVisible(hwnd):
+			logf("[zdiag] refocus walk: skipped visible window because %s: %s", reason, describeWindow(hwnd, false))
+		default:
+			hidden++
+		}
+		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
+		if nextErr != nil {
+			logf("[zdiag] refocus walk cut short: %v", nextErr)
+			return
+		}
+		hwnd = next
+	}
+	logf("[zdiag] refocus walk: never reached the chosen candidate HWND=0x%X", candidate)
 }
