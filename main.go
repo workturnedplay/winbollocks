@@ -276,6 +276,7 @@ const (
 	MENU_TOGGLE_VIRTUALIZATION_DETECTION           = 23
 	MENU_TOGGLE_SNAP_TO_EDGES                      = 24
 	MENU_TOGGLE_DISABLE_FILE_LOGGING               = 25
+	MENU_TOGGLE_MINIMIZE_WHEN_CANT_SEND_TO_BACK    = 26
 )
 
 const (
@@ -763,6 +764,13 @@ const maxSentToBackStackDepth = 64
 var bypassGesturesWhenFullscreen atomic.Bool
 
 var useThreadAttachInputForFocus atomic.Bool
+
+// minimizeWhenCantSendToBack, when true, makes winkey+MMB minimize a window
+// that no z-order stage (see sendToBackStages) managed to push visually to the
+// back (observed with Task Manager OG), instead of leaving it covering other
+// windows. See verifySentToBackOrMinimize/minimizeUnsendableWindow. Toggleable
+// via systray; persisted like every other systray toggle.
+var minimizeWhenCantSendToBack atomic.Bool
 
 // shiftMirrorResizeEnabled gates the Shift-held resize-mirroring
 // accelerator (see handleShiftMirrorToggle): whether pressing Shift
@@ -2852,6 +2860,7 @@ var persistedSettings = []persistedSetting{
 	atomicBoolSetting("useThreadAttachInputForFocus", &useThreadAttachInputForFocus),
 	atomicBoolSetting("virtualizationDetectionEnabled", &virtualizationDetectionEnabled),
 	atomicBoolSetting("snapToEdgesEnabled", &snapToEdgesEnabled),
+	atomicBoolSetting("minimizeWhenCantSendToBack", &minimizeWhenCantSendToBack),
 	{
 		name: "disableFileLogging",
 		get:  disableFileLogging.Load,
@@ -4919,6 +4928,8 @@ func refocusCandidateVerdict(hwnd, excludeHwnd, excludeRoot windows.Handle) (eli
 		return false, "belongs to our own process"
 	case isInZOrderGroup(hwnd, excludeRoot):
 		return false, "same owner group as the window just sent to the back"
+	case !isWindowReallyOnScreen(hwnd):
+		return false, "not really on screen (minimized, DWM-cloaked, or a click-through layered overlay)"
 	}
 	if skip, why := shouldSkipFocusingIt(hwnd); skip {
 		return false, "shouldSkipFocusingIt: " + why
@@ -5021,16 +5032,9 @@ func forceForeground(target windows.Handle) bool {
 					logf("dev coding error: forceForeground is being called(next) from a threadID(%d) that wasn't mainThreadID(%d)", curTid, mainThreadID)
 				}
 
-				// Use SendMessageTimeout to see if the window is alive
-				var result uintptr
-				if res3 := wincoe.SendMessageTimeout(target,
-					wincoe.WM_NULL, // WM_NULL (harmless ping)
-					0, 0,
-					wincoe.SMTO_ABORTIFHUNG, //0x0002, // SMTO_ABORTIFHUNG
-					HungWindowTimeout,       // 150ms timeout
-					&result,
-				); res3.Failed() {
-					logf("forceForeground: Target window HWND 0x%X is HUNG err='%v'. Aborting AttachThreadInput to prevent deadlock.", target, res3.Err)
+				// // Use SendMessageTimeout to see if the window is alive
+				if pingErr := pingWindowResponsive(target); pingErr != nil {
+					logf("forceForeground: %v. Aborting AttachThreadInput to prevent deadlock.", pingErr)
 					return false
 				}
 
@@ -6384,6 +6388,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			completeSentToBackRestoration(data.SentToBackRestoreID)
 			focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
 
+			restoreIfMinimized(target)
+
 			if !forceForeground(target) {
 				logf(
 					"handleActualMoveOrResize: failed to focus HWND=0x%X after restoring sent-to-back stack entry ID=%d",
@@ -6409,7 +6415,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			))
 		} //switch
 		if data.ZOrderAction == zOrderActionSendToBack {
-			_ = ensureSentToBack(target, "after the refocus logic")
+			verifySentToBackOrMinimize(target)
 		}
 		diagZOrderSettled(data)
 	} //else
@@ -6912,6 +6918,16 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			}
 
 			{
+				var minimizeUnsendableFlags uint32 = wincoe.MF_STRING
+				if minimizeWhenCantSendToBack.Load() {
+					minimizeUnsendableFlags |= wincoe.MF_CHECKED
+				}
+				minimizeUnsendableText := "If winkey+MMB can't send a window to the very back by any method (eg. Task Manager OG), minimize it instead (winkey+shift+MMB un-minimizes it again while winkey is still held)"
+				appendMenuChecked(hMenu, minimizeUnsendableFlags,
+					MENU_TOGGLE_MINIMIZE_WHEN_CANT_SEND_TO_BACK, minimizeUnsendableText)
+			}
+
+			{
 				var useThreadAttachInputForFocusFlags uint32 = wincoe.MF_STRING
 				if useThreadAttachInputForFocus.Load() {
 					useThreadAttachInputForFocusFlags |= wincoe.MF_CHECKED
@@ -7286,6 +7302,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			case MENU_TOGGLE_UNFOCUS_SENT_TO_BACK:
 				toggleAndPersist(&unfocusSentToBackWindow)
+
+			case MENU_TOGGLE_MINIMIZE_WHEN_CANT_SEND_TO_BACK:
+				toggleAndPersist(&minimizeWhenCantSendToBack)
 
 			case MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN:
 				toggleAndPersist(&bypassGesturesWhenFullscreen)
@@ -8391,6 +8410,7 @@ func init() {
 
 	bypassGesturesWhenFullscreen.Store(false) // default off; opt-in
 	snapToEdgesEnabled.Store(true)            // default on actually
+	minimizeWhenCantSendToBack.Store(true)    // default on; only ever triggers after every z-order stage failed for a window
 	disableFileLogging.Store(false)           // default off; file logging stays on unless explicitly disabled via -nolog/--nolog or systray
 
 	shiftMirrorResizeEnabled.Store(!isEffectivelyVirtualized()) // default off under a detected (and detection-enabled) hypervisor guest; see its own doc comment
@@ -10494,12 +10514,8 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 	// this function's own doc comment. A failure here (hung target) is not
 	// itself logged as an error condition worth alarming over; skip this
 	// time and let a later click or Win+Shift+MMB retry.
-	var pingResult uintptr
-	if res2 := wincoe.SendMessageTimeout(
-		target, wincoe.WM_NULL, 0, 0,
-		wincoe.SMTO_ABORTIFHUNG, HungWindowTimeout, &pingResult,
-	); res2.Failed() {
-		logf("tryBringForegroundToFrontAt: target HWND=0x%X appears hung (SendMessageTimeout probe failed: %v); skipping synchronous promotion to avoid stalling the mouse hook", target, res2.Err)
+	if pingErr := pingWindowResponsive(target); pingErr != nil {
+		logf("tryBringForegroundToFrontAt: %v; skipping synchronous promotion to avoid stalling the mouse hook", pingErr)
 		return false
 	}
 
