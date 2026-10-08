@@ -6342,11 +6342,6 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			return
 		}
 		diagZOrderAfterSetWindowPos(data)
-		if data.ZOrderAction == zOrderActionSendToBack {
-			// SetWindowPos reporting success doesn't prove the window moved
-			// (see ensureSentToBack's doc comment).
-			_ = ensureSentToBack(target, true, "right after the first SetWindowPos")
-		}
 		switch data.ZOrderAction {
 		case zOrderActionNone:
 			// Ordinary move or asynchronous resize.
@@ -6425,7 +6420,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			))
 		} //switch
 		if data.ZOrderAction == zOrderActionSendToBack {
-			_ = ensureSentToBack(target, false, "after the refocus logic")
+			_ = ensureSentToBack(target, "after the refocus logic")
 		}
 		diagZOrderSettled(data)
 	} //else

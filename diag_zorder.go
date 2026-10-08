@@ -52,7 +52,6 @@ const (
 	gaParent uint32 = 1
 
 	// Window style bits not defined in wincoe.
-	wsMinimize    uint32 = 0x20000000
 	wsExAppWindow uint32 = 0x00040000
 )
 
@@ -110,20 +109,6 @@ func fmtHandleOrErr(h windows.Handle, err error) string {
 		return "none"
 	}
 	return fmt.Sprintf("0x%X", h)
-}
-
-// readStyleAndExStyle reads GWL_STYLE and GWL_EXSTYLE as 32-bit masks.
-func readStyleAndExStyle(hwnd windows.Handle) (style, exStyle uint32, err error) {
-	s, err1 := getWindowLongPtr(hwnd, wincoe.GWL_STYLE)
-	if err1 != nil {
-		return 0, 0, fmt.Errorf("read GWL_STYLE of HWND=0x%X: %w", hwnd, err1)
-	}
-	e, err2 := getWindowLongPtr(hwnd, wincoe.GWL_EXSTYLE)
-	if err2 != nil {
-		return 0, 0, fmt.Errorf("read GWL_EXSTYLE of HWND=0x%X: %w", hwnd, err2)
-	}
-	// #nosec G115 -- safe: Win32 window styles are 32-bit bitmasks
-	return uint32(s), uint32(e), nil
 }
 
 func decodeWindowFlags(s, ex uint32) string {
@@ -413,10 +398,10 @@ func diagLogWinEvent(event uint32, hwnd windows.Handle, idObject, idChild int32,
 	}
 
 	switch event {
-	case wincoe.EVENT_OBJECT_REORDER, wincoe.EVENT_SYSTEM_FOREGROUND:
+	case wincoe.EVENT_SYSTEM_FOREGROUND:
 		// always relevant
 	case wincoe.EVENT_OBJECT_SHOW, wincoe.EVENT_OBJECT_HIDE, wincoe.EVENT_OBJECT_CREATE,
-		wincoe.EVENT_OBJECT_DESTROY, wincoe.EVENT_OBJECT_FOCUS:
+		wincoe.EVENT_OBJECT_DESTROY, wincoe.EVENT_OBJECT_FOCUS, wincoe.EVENT_OBJECT_REORDER:
 		targetPID := zdiagEventTargetPID.Load()
 		if hwnd == 0 || targetPID == 0 {
 			return
