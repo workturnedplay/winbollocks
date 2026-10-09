@@ -5,19 +5,19 @@ github.com/nfnt/resize
 ## explicit; go 1.19
 github.com/tc-hib/winres
 github.com/tc-hib/winres/version
-# github.com/workturnedplay/wincoe v0.10.9
+# github.com/workturnedplay/wincoe v0.10.10
 ## explicit; go 1.26.2
 github.com/workturnedplay/wincoe
-# golang.org/x/image v0.45.0
-## explicit; go 1.25.0
+# golang.org/x/image v0.46.0
+## explicit; go 1.26.0
 golang.org/x/image/bmp
 golang.org/x/image/internal/safemath
-# golang.org/x/sys v0.47.0
-## explicit; go 1.25.0
+# golang.org/x/sys v0.48.0
+## explicit; go 1.26.0
 golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 golang.org/x/sys/windows/registry
-# golang.org/x/term v0.45.0
-## explicit; go 1.25.0
+# golang.org/x/term v0.46.0
+## explicit; go 1.26.0
 golang.org/x/term

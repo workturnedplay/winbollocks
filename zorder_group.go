@@ -20,7 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unsafe"
+	"sync"
 
 	"golang.org/x/sys/windows"
 
@@ -28,46 +28,29 @@ import (
 )
 
 const (
-	// zOrderOnlyFlags: change nothing but the z-order, don't activate.
-	zOrderOnlyFlags uint32 = wincoe.SWP_NOMOVE | wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE
-
 	// maxZOrderWalkSteps bounds every top-level z-order walk in this file
 	// (hidden windows are included in such walks; a few hundred is normal).
 	maxZOrderWalkSteps = 1000
-
-	// maxSameProcessChain bounds the run of consecutive same-process windows
-	// directly below the target that sameProcessWindowsDirectlyBelow collects.
-	maxSameProcessChain = 64
-
-	// wsMinimize is WS_MINIMIZE (not defined in wincoe).
-	wsMinimize uint32 = 0x20000000
-
-	// dwmwaCloaked is DWMWA_CLOAKED for DwmGetWindowAttribute.
-	dwmwaCloaked uint32 = 14
 
 	// maxBlockersLogged caps how many "visible foreign window still below the
 	// target" entries ensureSentToBack lists (and fetches) per verification.
 	maxBlockersLogged = 5
 
-	// explorerExeName is the shell process whose desktop host windows
-	// (Progman/WorkerW) legitimately sit below every normal window.
-	explorerExeName = "explorer.exe"
-
 	// maxBlockersRaised caps how many windows stageRaiseBlockersAboveTarget
 	// restacks in one go.
 	maxBlockersRaised = 64
 
-	// swMinimize / swShowMinNoActive are ShowWindow's SW_MINIMIZE (minimize
-	// and activate the next window in z-order) and SW_SHOWMINNOACTIVE
-	// (minimize without touching activation); neither is defined in wincoe.
-	swMinimize        int32 = 6
-	swShowMinNoActive int32 = 7
-)
+	// maxBuriedHelperWindows caps how many hidden same-process windows
+	// buryHiddenSameProcessWindows sends to the bottom in one go.
+	maxBuriedHelperWindows = 64
 
-// procDwmGetWindowAttributeCloaked is DwmGetWindowAttribute bound for the
-// DWORD-sized DWMWA_CLOAKED query (wincoe's own binding of the same API is
-// private to it).
-var procDwmGetWindowAttributeCloaked = wincoe.NewBoundProc4(wincoe.Dwmapi, "DwmGetWindowAttribute", wincoe.CheckHRESULT)
+	// describeTitleMaxRunes keeps one-line window descriptions readable.
+	describeTitleMaxRunes = 48
+
+	// explorerExeName is the shell process whose desktop host windows
+	// (Progman/WorkerW) legitimately sit below every normal window.
+	explorerExeName = "explorer.exe"
+)
 
 // errSendToBackFailed is wrapped by ensureSentToBack's returned error when the
 // window was verified to still NOT be visually at the back after every stage.
@@ -75,64 +58,134 @@ var procDwmGetWindowAttributeCloaked = wincoe.NewBoundProc4(wincoe.Dwmapi, "DwmG
 // minimize workaround.
 var errSendToBackFailed = errors.New("window is still not visually at the back after every fallback stage")
 
-// getRelatedWindowChecked wraps wincoe.GetWindow. A (0, nil) result means "no
-// such related window" (e.g. no owner, or no next window); an error means the
-// call really failed (e.g. invalid/destroyed handle).
-func getRelatedWindowChecked(hwnd windows.Handle, uCmd uint32) (windows.Handle, error) {
-	res := wincoe.GetWindow(hwnd, uCmd)
+// stubbornSendToBackExes remembers (lowercased exe base names) processes for
+// which a plain HWND_BOTTOM was NOT enough but burying their hidden helper
+// windows first was (observed with Task Manager OG, whose z-position seems to
+// be tied to its hidden ComboLBox windows: moving the main window alone gets
+// undone, producing visible flicker and ~1s delays while ensureSentToBack
+// walks its stages). For such processes preBuryIfKnownStubborn buries the
+// helpers BEFORE the first HWND_BOTTOM. Not persisted: it's relearned once per
+// run.
+var (
+	stubbornSendToBackMu   sync.Mutex
+	stubbornSendToBackExes = make(map[string]struct{})
+)
+
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// describeWindow renders a one-line description of hwnd for logs.
+func describeWindow(hwnd windows.Handle) string {
+	if hwnd == 0 {
+		return "HWND=0x0 (none)"
+	}
+	if !wincoe.IsWindow(hwnd) {
+		return fmt.Sprintf("HWND=0x%X (no longer a valid window)", hwnd)
+	}
+
+	class, resClass := wincoe.GetClassName(hwnd)
+	if resClass.Failed() {
+		class = fmt.Sprintf("<GetClassName failed: %v>", resClass.Err)
+	}
+	title := truncateRunes(getWindowTextFast(hwnd), describeTitleMaxRunes)
+
+	pid := getWindowPID(hwnd)
+	exe := "<unknown>"
+	if pid != 0 {
+		exe = getProcessNameFast(pid)
+	}
+	return fmt.Sprintf("HWND=0x%X class=%q title=%q exe=%s pid=%d", hwnd, class, title, exe, pid)
+}
+
+// exeKeyOfWindow returns the lowercased exe base name of hwnd's process, the
+// key used by stubbornSendToBackExes.
+func exeKeyOfWindow(hwnd windows.Handle) (string, error) {
+	pid := getWindowPID(hwnd)
+	if pid == 0 {
+		return "", fmt.Errorf("exeKeyOfWindow: couldn't get the PID of HWND=0x%X", hwnd)
+	}
+	name := getProcessNameFast(pid)
+	if strings.HasPrefix(name, "<") { // getProcessNameFast's "<failed>"/"<not found>"
+		return "", fmt.Errorf("exeKeyOfWindow: couldn't resolve the exe name of PID %d (HWND=0x%X): %s", pid, hwnd, name)
+	}
+	return strings.ToLower(name), nil
+}
+
+func markStubbornSendToBack(target windows.Handle) {
+	key, err := exeKeyOfWindow(target)
+	if err != nil {
+		logf("markStubbornSendToBack: not remembering: %v", err)
+		return
+	}
+	stubbornSendToBackMu.Lock()
+	_, already := stubbornSendToBackExes[key]
+	stubbornSendToBackExes[key] = struct{}{}
+	stubbornSendToBackMu.Unlock()
+	if !already {
+		logf("markStubbornSendToBack: %q resists a plain HWND_BOTTOM; from now on its hidden helper windows get buried BEFORE the first HWND_BOTTOM", key)
+	}
+}
+
+func isStubbornSendToBack(target windows.Handle) bool {
+	key, err := exeKeyOfWindow(target)
+	if err != nil {
+		return false // can't tell; behave like an ordinary window
+	}
+	stubbornSendToBackMu.Lock()
+	defer stubbornSendToBackMu.Unlock()
+	_, ok := stubbornSendToBackExes[key]
+	return ok
+}
+
+// isDesktopHostWindow reports whether hwnd is one of explorer's desktop host
+// windows (Progman/WorkerW), which legitimately stay below everything else even
+// after an HWND_BOTTOM. The class name alone is NOT enough: observed,
+// TOTALCMD64.EXE creates a top-level window of class "WorkerW". A failed class
+// or process lookup is treated as "no".
+func isDesktopHostWindow(hwnd windows.Handle) bool {
+	class, res := wincoe.GetClassName(hwnd)
 	if res.Failed() {
-		return 0, fmt.Errorf("GetWindow(HWND=0x%X, uCmd=%d) failed: %w", hwnd, uCmd, res.Err)
+		return false
 	}
-	return windows.Handle(res.R1), nil
+	if class != "Progman" && class != "WorkerW" {
+		return false
+	}
+	pid := getWindowPID(hwnd)
+	if pid == 0 {
+		return false
+	}
+	return strings.EqualFold(getProcessNameFast(pid), explorerExeName)
 }
 
-// readStyleAndExStyle reads GWL_STYLE and GWL_EXSTYLE as 32-bit masks.
-func readStyleAndExStyle(hwnd windows.Handle) (style, exStyle uint32, err error) {
-	s, err1 := getWindowLongPtr(hwnd, wincoe.GWL_STYLE)
-	if err1 != nil {
-		return 0, 0, fmt.Errorf("read GWL_STYLE of HWND=0x%X: %w", hwnd, err1)
+// isWindowReallyOnScreen is IsWindowVisible minus the windows that report as
+// visible but a user can't actually see or interact with: minimized, DWM
+// cloaked, or layered click-through overlays. Used so z-order verification and
+// refocus selection don't count those as real windows.
+//
+// A window whose styles can't be read is treated as not on screen (it most
+// likely vanished); a failed cloak query fails open (counts as on screen).
+func isWindowReallyOnScreen(hwnd windows.Handle) bool {
+	if !wincoe.IsWindowVisible(hwnd) || wincoe.IsIconic(hwnd) {
+		return false
 	}
-	e, err2 := getWindowLongPtr(hwnd, wincoe.GWL_EXSTYLE)
-	if err2 != nil {
-		return 0, 0, fmt.Errorf("read GWL_EXSTYLE of HWND=0x%X: %w", hwnd, err2)
-	}
-	// #nosec G115 -- safe: Win32 window styles are 32-bit bitmasks
-	return uint32(s), uint32(e), nil
-}
-
-// setWindowZOrder issues a position/size-less, non-activating SetWindowPos.
-func setWindowZOrder(hwnd, insertAfter windows.Handle) error {
-	if res := wincoe.SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, zOrderOnlyFlags); res.Failed() {
-		return fmt.Errorf("SetWindowPos(HWND=0x%X, insertAfter=0x%X) failed: %w", hwnd, insertAfter, res.Err)
-	}
-	return nil
-}
-
-// pingWindowResponsive sends a harmless WM_NULL with SMTO_ABORTIFHUNG and
-// reports an error if hwnd's thread doesn't answer within HungWindowTimeout.
-// Used before any synchronous cross-process call that could otherwise block
-// the calling thread on a hung window.
-func pingWindowResponsive(hwnd windows.Handle) error {
-	var result uintptr
-	if res := wincoe.SendMessageTimeout(hwnd,
-		wincoe.WM_NULL, // harmless ping
-		0, 0,
-		wincoe.SMTO_ABORTIFHUNG,
-		HungWindowTimeout,
-		&result,
-	); res.Failed() {
-		return fmt.Errorf("window HWND=0x%X didn't answer a WM_NULL ping within %dms (hung?): %w", hwnd, HungWindowTimeout, res.Err)
-	}
-	return nil
-}
-
-// isWindowMinimized reports whether hwnd has WS_MINIMIZE set.
-func isWindowMinimized(hwnd windows.Handle) (bool, error) {
-	style, _, styleErr := readStyleAndExStyle(hwnd)
+	_, exStyle, styleErr := wincoe.GetWindowStyleAndExStyle(hwnd)
 	if styleErr != nil {
-		return false, fmt.Errorf("isWindowMinimized: %w", styleErr)
+		return false
 	}
-	return style&wsMinimize != 0, nil
+	if exStyle&wincoe.WS_EX_LAYERED != 0 && exStyle&wincoe.WS_EX_TRANSPARENT != 0 {
+		return false
+	}
+	cloaked, cloakErr := wincoe.DwmIsWindowCloaked(hwnd)
+	if cloakErr != nil {
+		logf("isWindowReallyOnScreen: assuming HWND=0x%X is not cloaked: %v", hwnd, cloakErr)
+		return true
+	}
+	return !cloaked
 }
 
 // restoreIfMinimized un-minimizes hwnd if it's minimized (most likely by our
@@ -140,15 +193,10 @@ func isWindowMinimized(hwnd windows.Handle) (bool, error) {
 // Win+Shift+MMB restore of such a window actually brings it back:
 // SetWindowPos(HWND_TOP) and SetForegroundWindow don't un-minimize anything.
 func restoreIfMinimized(hwnd windows.Handle) {
-	minimized, minErr := isWindowMinimized(hwnd)
-	if minErr != nil {
-		logf("restoreIfMinimized: %v", minErr)
+	if !wincoe.IsIconic(hwnd) {
 		return
 	}
-	if !minimized {
-		return
-	}
-	if pingErr := pingWindowResponsive(hwnd); pingErr != nil {
+	if pingErr := wincoe.PingWindow(hwnd, HungWindowTimeout); pingErr != nil {
 		logf("restoreIfMinimized: not restoring: %v", pingErr)
 		return
 	}
@@ -160,25 +208,20 @@ func restoreIfMinimized(hwnd windows.Handle) {
 // no z-order stage managed to push to the back: minimize it so it at least
 // stops covering everything else. Must only run on the main thread.
 func minimizeUnsendableWindow(target windows.Handle) {
-	if pingErr := pingWindowResponsive(target); pingErr != nil {
+	if pingErr := wincoe.PingWindow(target, HungWindowTimeout); pingErr != nil {
 		logf("minimizeUnsendableWindow: not minimizing HWND=0x%X: %v", target, pingErr)
 		return
 	}
 
 	// A still-foreground window needs SW_MINIMIZE so the system hands
 	// activation to the next window; otherwise don't touch activation.
-	cmd := swShowMinNoActive
+	var cmd int32 = wincoe.SW_SHOWMINNOACTIVE
 	if isWindowForeground(target) {
-		cmd = swMinimize
+		cmd = wincoe.SW_MINIMIZE
 	}
 	_ = wincoe.ShowWindow(target, cmd) // return value is only the prior visibility state
 
-	minimized, minErr := isWindowMinimized(target)
-	if minErr != nil {
-		logf("minimizeUnsendableWindow: couldn't verify whether HWND=0x%X got minimized: %v", target, minErr)
-		return
-	}
-	if !minimized {
+	if !wincoe.IsIconic(target) {
 		logf("WARNING: minimizeUnsendableWindow: HWND=0x%X did not get minimized either (elevated window? UIPI) -- nothing more can be done for it", target)
 		return
 	}
@@ -205,78 +248,12 @@ func verifySentToBackOrMinimize(target windows.Handle) {
 		logf("verifySentToBackOrMinimize: %v", err)
 		return
 	}
-	logf("WARNING: HWND=0x%X could not be sent to the very back by any known method: %v | %s", target, err, describeWindow(target, false))
+	logf("WARNING: HWND=0x%X could not be sent to the very back by any known method: %v | %s", target, err, describeWindow(target))
 	if !minimizeWhenCantSendToBack.Load() {
 		logf("verifySentToBackOrMinimize: the minimize workaround is disabled (systray toggle); leaving HWND=0x%X where it is", target)
 		return
 	}
 	minimizeUnsendableWindow(target)
-}
-
-// isDesktopHostWindow reports whether hwnd is one of explorer's desktop host
-// windows (Progman/WorkerW), which legitimately stay below everything else even
-// after an HWND_BOTTOM. The class name alone is NOT enough: observed,
-// TOTALCMD64.EXE creates a top-level window of class "WorkerW", which made a
-// class-only check stop the "lowest real window" walk in the middle of the
-// z-order. A failed class or process lookup is treated as "no".
-func isDesktopHostWindow(hwnd windows.Handle) bool {
-	class, res := wincoe.GetClassName(hwnd)
-	if res.Failed() {
-		return false
-	}
-	if class != "Progman" && class != "WorkerW" {
-		return false
-	}
-	pid := getWindowPID(hwnd)
-	if pid == 0 {
-		return false
-	}
-	return strings.EqualFold(getProcessNameFast(pid), explorerExeName)
-}
-
-// isWindowCloaked reports whether DWM cloaks hwnd (e.g. UWP windows that are
-// IsWindowVisible but not actually shown, like TextInputHost's CoreWindow).
-func isWindowCloaked(hwnd windows.Handle) (bool, error) {
-	var cloaked uint32
-	res := procDwmGetWindowAttributeCloaked.Call(
-		uintptr(hwnd),
-		uintptr(dwmwaCloaked),
-		uintptr(unsafe.Pointer(&cloaked)),
-		unsafe.Sizeof(cloaked),
-	)
-	if res.Failed() {
-		return false, fmt.Errorf("DwmGetWindowAttribute(DWMWA_CLOAKED) on HWND=0x%X failed: %w", hwnd, res.Err)
-	}
-	return cloaked != 0, nil
-}
-
-// isWindowReallyOnScreen is IsWindowVisible minus the windows that report as
-// visible but a user can't actually see or interact with: minimized, DWM
-// cloaked, or layered click-through overlays. Used so z-order verification
-// doesn't count those as "a window that should be above the target".
-//
-// A window whose styles can't be read is treated as not on screen (it most
-// likely vanished); a failed cloak query fails open (counts as on screen).
-func isWindowReallyOnScreen(hwnd windows.Handle) bool {
-	if !wincoe.IsWindowVisible(hwnd) {
-		return false
-	}
-	style, exStyle, styleErr := readStyleAndExStyle(hwnd)
-	if styleErr != nil {
-		return false
-	}
-	if style&wsMinimize != 0 {
-		return false
-	}
-	if exStyle&wincoe.WS_EX_LAYERED != 0 && exStyle&wincoe.WS_EX_TRANSPARENT != 0 {
-		return false
-	}
-	cloaked, cloakErr := isWindowCloaked(hwnd)
-	if cloakErr != nil {
-		logf("isWindowReallyOnScreen: assuming HWND=0x%X is not cloaked: %v", hwnd, cloakErr)
-		return true
-	}
-	return !cloaked
 }
 
 // zOrderIndexOf returns target's 0-based index (0 = topmost) among all
@@ -296,7 +273,7 @@ func zOrderIndexOf(target windows.Handle) (index, total int, err error) {
 			index = total
 		}
 		total++
-		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
+		next, nextErr := wincoe.GetRelatedWindow(hwnd, wincoe.GW_HWNDNEXT)
 		if nextErr != nil {
 			return index, total, fmt.Errorf("zOrderIndexOf: %w", nextErr)
 		}
@@ -324,7 +301,7 @@ func visibleForeignWindowsBelow(hwnd windows.Handle, limit int) ([]windows.Handl
 	if limit < 1 {
 		return nil, fmt.Errorf("visibleForeignWindowsBelow: limit must be >= 1, got %d", limit)
 	}
-	groupRoot, rootErr := rootOwnerOf(hwnd)
+	groupRoot, rootErr := wincoe.GetRootOwner(hwnd)
 	if rootErr != nil {
 		return nil, fmt.Errorf("visibleForeignWindowsBelow: %w", rootErr)
 	}
@@ -332,7 +309,7 @@ func visibleForeignWindowsBelow(hwnd windows.Handle, limit int) ([]windows.Handl
 	var found []windows.Handle
 	cur := hwnd
 	for steps := 0; steps < maxZOrderWalkSteps; steps++ {
-		next, nextErr := getRelatedWindowChecked(cur, wincoe.GW_HWNDNEXT)
+		next, nextErr := wincoe.GetRelatedWindow(cur, wincoe.GW_HWNDNEXT)
 		if nextErr != nil {
 			return found, fmt.Errorf("visibleForeignWindowsBelow: walking below HWND=0x%X: %w", hwnd, nextErr)
 		}
@@ -364,33 +341,134 @@ func logBlockingWindows(phase string, target windows.Handle, blockers []windows.
 	}
 	logf("ensureSentToBack(%s): %d visible foreign window(s) still below HWND=0x%X%s:", phase, len(blockers), target, capped)
 	for _, b := range blockers {
-		logf("ensureSentToBack(%s):   below: %s", phase, describeWindow(b, false))
+		logf("ensureSentToBack(%s):   below: %s", phase, describeWindow(b))
 	}
 }
 
-// sameProcessWindowsDirectlyBelow returns the run of consecutive windows
-// directly below target in the z-order that belong to target's process
-// (hidden ones included; e.g. TMOG's hidden ComboLBox popups).
-func sameProcessWindowsDirectlyBelow(target windows.Handle) ([]windows.Handle, error) {
+// ---- hidden same-process helper windows ------------------------------------
+
+// hiddenSameProcessWindows returns, top-down, up to limit top-level windows
+// that belong to target's process, are NOT visible, are not in target's own
+// owner group (those follow their owner anyway) and are not topmost (sending a
+// topmost window to HWND_BOTTOM would silently strip its topmost status).
+// Refuses for explorer.exe, whose hidden windows include the desktop hosts
+// that must stay at the very bottom.
+//
+// Observed with Task Manager OG: these are its hidden ComboLBox popups, and
+// its main window can't be sent to the back until they've been moved first.
+// On a walk error, whatever was found so far is returned with the error.
+func hiddenSameProcessWindows(target windows.Handle, limit int) ([]windows.Handle, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("hiddenSameProcessWindows: limit must be >= 1, got %d", limit)
+	}
 	pid := getWindowPID(target)
 	if pid == 0 {
-		return nil, fmt.Errorf("sameProcessWindowsDirectlyBelow: couldn't get the PID of HWND=0x%X", target)
+		return nil, fmt.Errorf("hiddenSameProcessWindows: couldn't get the PID of HWND=0x%X", target)
+	}
+	if strings.EqualFold(getProcessNameFast(pid), explorerExeName) {
+		return nil, fmt.Errorf("hiddenSameProcessWindows: refusing for %s (its hidden windows include the desktop hosts)", explorerExeName)
+	}
+	groupRoot, rootErr := wincoe.GetRootOwner(target)
+	if rootErr != nil {
+		return nil, fmt.Errorf("hiddenSameProcessWindows: %w", rootErr)
+	}
+	hwnd, res := wincoe.GetTopWindow(0)
+	if res.Failed() {
+		return nil, fmt.Errorf("hiddenSameProcessWindows: GetTopWindow(0) failed: %w", res.Err)
 	}
 
-	var chain []windows.Handle
-	cur := target
-	for len(chain) < maxSameProcessChain {
-		next, err := getRelatedWindowChecked(cur, wincoe.GW_HWNDNEXT)
-		if err != nil {
-			return chain, fmt.Errorf("sameProcessWindowsDirectlyBelow: %w", err)
+	var found []windows.Handle
+	for steps := 0; hwnd != 0; steps++ {
+		if steps >= maxZOrderWalkSteps {
+			return found, fmt.Errorf("hiddenSameProcessWindows: walk exceeded %d windows", maxZOrderWalkSteps)
 		}
-		if next == 0 || getWindowPID(next) != pid {
-			return chain, nil
+		// Cheapest checks first.
+		if hwnd != target && !wincoe.IsWindowVisible(hwnd) && getWindowPID(hwnd) == pid && !isInZOrderGroup(hwnd, groupRoot) {
+			_, exStyle, styleErr := wincoe.GetWindowStyleAndExStyle(hwnd)
+			if styleErr == nil && exStyle&wincoe.WS_EX_TOPMOST == 0 {
+				found = append(found, hwnd)
+				if len(found) >= limit {
+					return found, nil
+				}
+			}
 		}
-		chain = append(chain, next)
-		cur = next
+		next, nextErr := wincoe.GetRelatedWindow(hwnd, wincoe.GW_HWNDNEXT)
+		if nextErr != nil {
+			return found, fmt.Errorf("hiddenSameProcessWindows: walk cut short: %w", nextErr)
+		}
+		hwnd = next
 	}
-	return chain, fmt.Errorf("sameProcessWindowsDirectlyBelow: more than %d consecutive same-process windows below HWND=0x%X", maxSameProcessChain, target)
+	return found, nil
+}
+
+// sendWindowsToBottom sends each window to HWND_BOTTOM, in order, so they end
+// up at the bottom in their original relative order. Each distinct UI thread
+// is pinged once first so a hung one can't block the (main) thread inside a
+// synchronous cross-process SetWindowPos. Best effort: returns every error
+// encountered.
+func sendWindowsToBottom(hwnds []windows.Handle) []error {
+	var errs []error
+	threadHealth := make(map[uint32]error) // tid -> nil if responsive, else the ping error
+	for _, h := range hwnds {
+		var pid uint32
+		tid, res := wincoe.GetWindowThreadProcessId(h, &pid)
+		if res.Failed() {
+			errs = append(errs, fmt.Errorf("sendWindowsToBottom: GetWindowThreadProcessId(HWND=0x%X) failed: %w", h, res.Err))
+			continue
+		}
+		health, seen := threadHealth[tid]
+		if !seen {
+			health = wincoe.PingWindow(h, HungWindowTimeout)
+			threadHealth[tid] = health
+		}
+		if health != nil {
+			errs = append(errs, health)
+			continue
+		}
+		if err := wincoe.SetWindowZOrder(h, wincoe.HWND_BOTTOM); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+// buryHiddenSameProcessWindows sends target's process's hidden helper windows
+// (see hiddenSameProcessWindows) to the bottom. Returns how many were found
+// (and attempted); a nil error with 0 means there was nothing to bury.
+func buryHiddenSameProcessWindows(target windows.Handle) (int, error) {
+	helpers, listErr := hiddenSameProcessWindows(target, maxBuriedHelperWindows)
+	errs := sendWindowsToBottom(helpers)
+	if listErr != nil {
+		errs = append(errs, listErr)
+	}
+	if len(errs) == 0 {
+		return len(helpers), nil
+	}
+	return len(helpers), fmt.Errorf("buryHiddenSameProcessWindows(HWND=0x%X): %w", target, errors.Join(errs...))
+}
+
+// preBuryIfKnownStubborn buries target's hidden helper windows ahead of the
+// first HWND_BOTTOM if its exe was previously found to need that (see
+// stubbornSendToBackExes), so such windows go to the back in one clean step
+// instead of flickering through ensureSentToBack's fallback stages. Main
+// thread only. Owned windows (modal dialogs etc.) keep their legacy behavior.
+func preBuryIfKnownStubborn(target windows.Handle) {
+	if !isStubbornSendToBack(target) {
+		return
+	}
+	root, rootErr := wincoe.GetRootOwner(target)
+	if rootErr != nil {
+		logf("preBuryIfKnownStubborn: not burying for HWND=0x%X: %v", target, rootErr)
+		return
+	}
+	if root != target {
+		return
+	}
+	buried, err := buryHiddenSameProcessWindows(target)
+	if err != nil {
+		logf("preBuryIfKnownStubborn: %v", err)
+	}
+	logf("preBuryIfKnownStubborn: buried %d hidden helper window(s) of HWND=0x%X ahead of its HWND_BOTTOM", buried, target)
 }
 
 // ---- send-to-back stages ---------------------------------------------------
@@ -399,71 +477,30 @@ func sameProcessWindowsDirectlyBelow(target windows.Handle) ([]windows.Handle, e
 // after the refocus: observed with Task Manager OG, the same call that does
 // nothing while the window is still the foreground window works once it isn't.
 func stagePlainBottom(target windows.Handle) error {
-	return setWindowZOrder(target, wincoe.HWND_BOTTOM)
+	return wincoe.SetWindowZOrder(target, wincoe.HWND_BOTTOM)
 }
 
-// stageInsertAfterLowestWindow inserts target directly after the lowest
-// eligible top-level window (hidden ones included) instead of using
-// HWND_BOTTOM. Eligible means: not in target's own owner group and not an
-// explorer desktop host window.
-//
-// Desktop host windows are SKIPPED, not used as a stop marker: a hidden
-// explorer WorkerW can sit in the MIDDLE of the z-order (observed with Task
-// Manager OG, with ~100 real windows below it), so stopping the walk at the
-// first one picked a window far above the real bottom and moved the target UP.
-// Skipping them is still safe: inserting after a lower window never moves the
-// target beneath a desktop host that was already below that window.
-//
-// Refuses (rather than moving the target up) if no eligible window sits
-// below the target, and refuses to insert after a topmost window, which would
-// make the target topmost.
-func stageInsertAfterLowestWindow(target windows.Handle) error {
-	groupRoot, rootErr := rootOwnerOf(target)
-	if rootErr != nil {
-		return fmt.Errorf("stageInsertAfterLowestWindow: %w", rootErr)
+// stageBuryHelpersThenBottom sends target's process's hidden helper windows to
+// the bottom first (see hiddenSameProcessWindows), then sends target itself to
+// the bottom. Observed with Task Manager OG: this is the only stage that ever
+// worked for it, apparently because it undoes a plain HWND_BOTTOM of its main
+// window unless its hidden ComboLBox windows were moved first.
+func stageBuryHelpersThenBottom(target windows.Handle) error {
+	buried, buryErr := buryHiddenSameProcessWindows(target)
+	if buryErr == nil && buried == 0 {
+		return errors.New("stageBuryHelpersThenBottom: no hidden same-process window to bury")
 	}
-	hwnd, res := wincoe.GetTopWindow(0)
-	if res.Failed() {
-		return fmt.Errorf("stageInsertAfterLowestWindow: GetTopWindow(0) failed: %w", res.Err)
+	var errs []error
+	if buryErr != nil {
+		errs = append(errs, buryErr)
 	}
-
-	var lowest windows.Handle
-	seenTarget := false
-	lowestIsBelowTarget := false
-	for steps := 0; hwnd != 0; steps++ {
-		if steps >= maxZOrderWalkSteps {
-			return fmt.Errorf("stageInsertAfterLowestWindow: walk exceeded %d windows", maxZOrderWalkSteps)
-		}
-		switch {
-		case hwnd == target:
-			seenTarget = true
-		case isInZOrderGroup(hwnd, groupRoot), isDesktopHostWindow(hwnd):
-			// not eligible; keep walking
-		default:
-			lowest = hwnd
-			lowestIsBelowTarget = seenTarget
-		}
-		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
-		if nextErr != nil {
-			return fmt.Errorf("stageInsertAfterLowestWindow: %w", nextErr)
-		}
-		hwnd = next
+	if err := wincoe.SetWindowZOrder(target, wincoe.HWND_BOTTOM); err != nil {
+		errs = append(errs, err)
 	}
-	if lowest == 0 {
-		return errors.New("stageInsertAfterLowestWindow: no suitable window found to insert after")
+	if len(errs) == 0 {
+		return nil
 	}
-	if !lowestIsBelowTarget {
-		return fmt.Errorf("stageInsertAfterLowestWindow: HWND=0x%X is already below every eligible window (lowest is HWND=0x%X); inserting after it would move the target UP", target, lowest)
-	}
-
-	_, exStyle, styleErr := readStyleAndExStyle(lowest)
-	if styleErr != nil {
-		return fmt.Errorf("stageInsertAfterLowestWindow: can't verify that HWND=0x%X isn't topmost: %w", lowest, styleErr)
-	}
-	if exStyle&wincoe.WS_EX_TOPMOST != 0 {
-		return fmt.Errorf("stageInsertAfterLowestWindow: the lowest window HWND=0x%X is topmost, inserting after it would make the target topmost", lowest)
-	}
-	return setWindowZOrder(target, lowest)
+	return fmt.Errorf("stageBuryHelpersThenBottom(HWND=0x%X): %w", target, errors.Join(errs...))
 }
 
 // insertAfterAboveGroup returns the hwndInsertAfter value that places a window
@@ -475,7 +512,7 @@ func stageInsertAfterLowestWindow(target windows.Handle) error {
 func insertAfterAboveGroup(target, groupRoot windows.Handle) (windows.Handle, error) {
 	cur := target
 	for steps := 0; steps < maxZOrderWalkSteps; steps++ {
-		prev, prevErr := getRelatedWindowChecked(cur, wincoe.GW_HWNDPREV)
+		prev, prevErr := wincoe.GetRelatedWindow(cur, wincoe.GW_HWNDPREV)
 		if prevErr != nil {
 			return 0, fmt.Errorf("insertAfterAboveGroup: %w", prevErr)
 		}
@@ -486,7 +523,7 @@ func insertAfterAboveGroup(target, groupRoot windows.Handle) (windows.Handle, er
 			cur = prev
 			continue
 		}
-		_, prevExStyle, styleErr := readStyleAndExStyle(prev)
+		_, prevExStyle, styleErr := wincoe.GetWindowStyleAndExStyle(prev)
 		if styleErr != nil {
 			return 0, fmt.Errorf("insertAfterAboveGroup: %w", styleErr)
 		}
@@ -503,14 +540,14 @@ func insertAfterAboveGroup(target, groupRoot windows.Handle) (windows.Handle, er
 // target may resist or misplace), it raises every visible foreign window below
 // it to directly above the target's owner group, preserving their relative
 // order. Doesn't depend on how the target handles its own
-// WM_WINDOWPOSCHANGING. Each blocker is pinged first so a hung window can't
-// block the main thread.
+// WM_WINDOWPOSCHANGING. Each blocker's thread is pinged first so a hung window
+// can't block the main thread.
 func stageRaiseBlockersAboveTarget(target windows.Handle) error {
-	groupRoot, rootErr := rootOwnerOf(target)
+	groupRoot, rootErr := wincoe.GetRootOwner(target)
 	if rootErr != nil {
 		return fmt.Errorf("stageRaiseBlockersAboveTarget: %w", rootErr)
 	}
-	_, targetExStyle, styleErr := readStyleAndExStyle(target)
+	_, targetExStyle, styleErr := wincoe.GetWindowStyleAndExStyle(target)
 	if styleErr != nil {
 		return fmt.Errorf("stageRaiseBlockersAboveTarget: %w", styleErr)
 	}
@@ -534,11 +571,11 @@ func stageRaiseBlockersAboveTarget(target windows.Handle) error {
 	// leaves them in their original relative order directly above the target.
 	for i := len(blockers) - 1; i >= 0; i-- {
 		blocker := blockers[i]
-		if pingErr := pingWindowResponsive(blocker); pingErr != nil {
+		if pingErr := wincoe.PingWindow(blocker, HungWindowTimeout); pingErr != nil {
 			errs = append(errs, pingErr)
 			continue
 		}
-		if err := setWindowZOrder(blocker, insertAfter); err != nil {
+		if err := wincoe.SetWindowZOrder(blocker, insertAfter); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -548,60 +585,17 @@ func stageRaiseBlockersAboveTarget(target windows.Handle) error {
 	return fmt.Errorf("stageRaiseBlockersAboveTarget(HWND=0x%X): %w", target, errors.Join(errs...))
 }
 
-// stageJumpPastSameProcessChain inserts target directly after the last of the
-// same-process windows sitting directly below it, instead of relying on
-// HWND_BOTTOM to get past them.
-func stageJumpPastSameProcessChain(target windows.Handle) error {
-	chain, chainErr := sameProcessWindowsDirectlyBelow(target)
-	if chainErr != nil {
-		return fmt.Errorf("stageJumpPastSameProcessChain: %w", chainErr)
-	}
-	if len(chain) == 0 {
-		return errors.New("stageJumpPastSameProcessChain: no same-process window directly below the target, nothing to jump past")
-	}
-	return setWindowZOrder(target, chain[len(chain)-1])
-}
-
-// stageBurySameProcessChain sends the same-process windows directly below
-// target to the bottom first (they're what target stops above), then sends
-// target to the bottom. The windows being moved are the target process's own
-// hidden helpers, on the same UI thread the target's own SetWindowPos already
-// had to talk to.
-func stageBurySameProcessChain(target windows.Handle) error {
-	chain, chainErr := sameProcessWindowsDirectlyBelow(target)
-	if chainErr != nil {
-		return fmt.Errorf("stageBurySameProcessChain: %w", chainErr)
-	}
-	if len(chain) == 0 {
-		return errors.New("stageBurySameProcessChain: no same-process window directly below the target, nothing to bury")
-	}
-
-	var errs []error
-	for _, w := range chain {
-		if err := setWindowZOrder(w, wincoe.HWND_BOTTOM); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if err := setWindowZOrder(target, wincoe.HWND_BOTTOM); err != nil {
-		errs = append(errs, err)
-	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("stageBurySameProcessChain(HWND=0x%X): %w", target, errors.Join(errs...))
-}
-
 // sendToBackStages are tried in order by ensureSentToBack until one leaves
-// the target visually at the back.
+// the target visually at the back. marksStubborn: if this stage was the one
+// that finally worked, remember the target's exe (see stubbornSendToBackExes).
 var sendToBackStages = [...]struct {
-	name string
-	run  func(target windows.Handle) error
+	name          string
+	run           func(target windows.Handle) error
+	marksStubborn bool
 }{
-	{"plain HWND_BOTTOM", stagePlainBottom},
-	{"insert after the lowest real window", stageInsertAfterLowestWindow},
-	{"insert after the last same-process window directly below", stageJumpPastSameProcessChain},
-	{"bury same-process windows directly below, then HWND_BOTTOM", stageBurySameProcessChain},
-	{"raise every visible foreign window below it above it instead", stageRaiseBlockersAboveTarget},
+	{"plain HWND_BOTTOM", stagePlainBottom, false},
+	{"bury hidden same-process windows, then HWND_BOTTOM", stageBuryHelpersThenBottom, true},
+	{"raise every visible foreign window below it above it instead", stageRaiseBlockersAboveTarget, false},
 }
 
 // ensureSentToBack verifies that target (already the subject of an
@@ -623,7 +617,7 @@ var sendToBackStages = [...]struct {
 // wraps errSendToBackFailed; any other error means verification itself
 // couldn't be done.
 func ensureSentToBack(target windows.Handle, phase string) error {
-	root, rootErr := rootOwnerOf(target)
+	root, rootErr := wincoe.GetRootOwner(target)
 	if rootErr != nil {
 		return fmt.Errorf("ensureSentToBack(%s): can't verify HWND=0x%X, not attempting fallbacks: %w", phase, target, rootErr)
 	}
@@ -654,6 +648,9 @@ func ensureSentToBack(target windows.Handle, phase string) error {
 		}
 		if len(blockers) == 0 {
 			logf("ensureSentToBack(%s): stage %q was needed and worked for HWND=0x%X", phase, stage.name, target)
+			if stage.marksStubborn {
+				markStubbornSendToBack(target)
+			}
 			return nil
 		}
 		logf("ensureSentToBack(%s): after stage %q HWND=0x%X is still not at the back", phase, stage.name, target)

@@ -3775,8 +3775,6 @@ func tryPerformMMBGestureAt(
 			return false, true // foreground is fullscreen; let event through
 		}
 
-		diagLogMMBTargetResolution(pt, hwnd)
-
 		if ShouldThrottle() { //every 10ms or more, else drop it
 			logf("tryPerformMMBGestureAt: dropping Win+MMB send-to-back for HWND=0x%X because ShouldThrottle() is true (another move/resize/z-order action was processed <%dms ago)", hwnd, forceMoveOrResizeActionsToBeThisManyMSApart)
 			droppedMoveOrResizeEvents.Add(1) //TODO: use diff. one to keep track of drops due to too-fast thus not-queued
@@ -4827,31 +4825,6 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 	return
 }
 
-// getAncestorChecked wraps wincoe.GetAncestor. A (0, nil) result means "no such
-// ancestor" (e.g. GA_PARENT of the desktop); an error means the call failed.
-func getAncestorChecked(hwnd windows.Handle, flags uint32) (windows.Handle, error) {
-	h, res := wincoe.GetAncestor(hwnd, flags)
-	if res.Failed() {
-		return 0, fmt.Errorf("GetAncestor(HWND=0x%X, flags=%d) failed: %w", hwnd, flags, res.Err)
-	}
-	return h, nil
-}
-
-// rootOwnerOf returns hwnd's GA_ROOTOWNER: the top of its parent/owner chain.
-// Windows keeps an owner and all its owned windows together in the z-order
-// (an owned window can never sit below its owner), so this identifies the
-// "z-order group" hwnd belongs to.
-func rootOwnerOf(hwnd windows.Handle) (windows.Handle, error) {
-	root, err := getAncestorChecked(hwnd, wincoe.GA_ROOTOWNER)
-	if err != nil {
-		return 0, fmt.Errorf("rootOwnerOf: %w", err)
-	}
-	if root == 0 {
-		return 0, fmt.Errorf("rootOwnerOf: GetAncestor(HWND=0x%X, GA_ROOTOWNER) returned NULL without an error", hwnd)
-	}
-	return root, nil
-}
-
 // isInZOrderGroup reports whether hwnd is groupRoot itself or an owned window
 // whose GA_ROOTOWNER is groupRoot. A failed lookup is logged and treated as
 // "not in the group" (we can't prove membership).
@@ -4862,7 +4835,7 @@ func isInZOrderGroup(hwnd, groupRoot windows.Handle) bool {
 	if hwnd == groupRoot {
 		return true
 	}
-	root, err := rootOwnerOf(hwnd)
+	root, err := wincoe.GetRootOwner(hwnd)
 	if err != nil {
 		logf("isInZOrderGroup: couldn't determine the owner group of HWND=0x%X, assuming it's not in group 0x%X: %v", hwnd, groupRoot, err)
 		return false
@@ -4888,7 +4861,7 @@ func findNewForegroundCandidateAfterSendToBack(excludeHwnd windows.Handle) windo
 	// Never refocus an owner/owned sibling of the window we just sent to the
 	// back: activating a window raises its whole owner group, which would
 	// drag the window we just backgrounded straight back to the top.
-	excludeRoot, excludeRootErr := rootOwnerOf(excludeHwnd)
+	excludeRoot, excludeRootErr := wincoe.GetRootOwner(excludeHwnd)
 	if excludeRootErr != nil {
 		logf("findNewForegroundCandidateAfterSendToBack: couldn't get the owner group of HWND=0x%X, only excluding that exact window: %v", excludeHwnd, excludeRootErr)
 		excludeRoot = excludeHwnd
@@ -4904,7 +4877,7 @@ func findNewForegroundCandidateAfterSendToBack(excludeHwnd windows.Handle) windo
 		if eligible, _ := refocusCandidateVerdict(hwnd, excludeHwnd, excludeRoot); eligible {
 			return hwnd
 		}
-		next, nextErr := getRelatedWindowChecked(hwnd, wincoe.GW_HWNDNEXT)
+		next, nextErr := wincoe.GetRelatedWindow(hwnd, wincoe.GW_HWNDNEXT)
 		if nextErr != nil {
 			logf("DEBUG: findNewForegroundCandidateAfterSendToBack: z-order walk cut short: %v", nextErr)
 			return 0 //can do 'break' too, but what the heck, wanna be sure that adding code after the 'for' won't be executed from this path!
@@ -5033,7 +5006,7 @@ func forceForeground(target windows.Handle) bool {
 				}
 
 				// // Use SendMessageTimeout to see if the window is alive
-				if pingErr := pingWindowResponsive(target); pingErr != nil {
+				if pingErr := wincoe.PingWindow(target, HungWindowTimeout); pingErr != nil {
 					logf("forceForeground: %v. Aborting AttachThreadInput to prevent deadlock.", pingErr)
 					return false
 				}
@@ -6322,7 +6295,9 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		// 	uintptr(data.Flags),
 		// )
 		//if ret == 0 { //failed
-		diagZOrderBefore(data)
+		if data.ZOrderAction == zOrderActionSendToBack {
+			preBuryIfKnownStubborn(target)
+		}
 		res4 := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H, data.Flags)
 		if res4.Failed() {
 			//errCode, _, _ := procGetLastError.Call()
@@ -6334,7 +6309,6 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			abandonPendingZOrderAction(data)
 			return
 		}
-		diagZOrderAfterSetWindowPos(data)
 		switch data.ZOrderAction {
 		case zOrderActionNone:
 			// Ordinary move or asynchronous resize.
@@ -6362,7 +6336,6 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 
 				if newTop :=
 					findNewForegroundCandidateAfterSendToBack(target); newTop != 0 {
-					diagLogRefocusCandidate(target, newTop)
 					if !forceForeground(newTop) {
 						logf(
 							"handleActualMoveOrResize: failed to shift focus to new top-of-Z-order HWND=0x%X after sending HWND=0x%X to back",
@@ -6417,7 +6390,6 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		if data.ZOrderAction == zOrderActionSendToBack {
 			verifySentToBackOrMinimize(target)
 		}
-		diagZOrderSettled(data)
 	} //else
 } //func
 
@@ -9783,8 +9755,6 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 	_ = dwEventThread //don't warn me it's unused!
 	_ = dwmsEventTime //don't warn me it's unused!
 
-	diagLogWinEvent(event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime)
-
 	// ONLY process if it's the actual window, not a sub-control/caret/item
 	if idObject != wincoe.OBJID_WINDOW { // 0 is OBJID_WINDOW
 		return 0 // WinEvent callbacks return 0 (no chaining)
@@ -10514,7 +10484,7 @@ func tryBringForegroundToFrontAt(pt wincoe.POINT) bool {
 	// this function's own doc comment. A failure here (hung target) is not
 	// itself logged as an error condition worth alarming over; skip this
 	// time and let a later click or Win+Shift+MMB retry.
-	if pingErr := pingWindowResponsive(target); pingErr != nil {
+	if pingErr := wincoe.PingWindow(target, HungWindowTimeout); pingErr != nil {
 		logf("tryBringForegroundToFrontAt: %v; skipping synchronous promotion to avoid stalling the mouse hook", pingErr)
 		return false
 	}

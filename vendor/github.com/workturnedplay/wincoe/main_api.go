@@ -1553,6 +1553,7 @@ var (
 	// (visible or not), not a failure indicator -- also CheckNone.
 	procIsWindowVisible = NewBoundProc1(User32, "IsWindowVisible", CheckNone)
 	procIsWindow        = NewBoundProc1(User32, "IsWindow", CheckNone)
+	procIsIconic        = NewBoundProc1(User32, "IsIconic", CheckNone) // BOOL: nonzero == minimized, 0 is a legitimate answer
 
 	// Iphlpapi routing procs
 	procGetBestInterface     = NewBoundProc2(Iphlpapi, "GetBestInterface", CheckErrno)
@@ -3841,6 +3842,10 @@ func GetClientRect(hwnd windows.Handle, rect *RECT) WinResult {
 // bottom edges (not the top) of resizable top-level windows.
 const DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
+// DWMWA_CLOAKED is the DwmGetWindowAttribute attribute reporting whether DWM
+// cloaks a window (e.g. UWP windows that are IsWindowVisible but not shown).
+const DWMWA_CLOAKED = 14
+
 // DwmGetExtendedFrameBounds retrieves hwnd's true visible screen bounds via
 // DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS), as opposed to
 // GetWindowRect's rect, which additionally includes several pixels of
@@ -3869,6 +3874,10 @@ func DwmGetExtendedFrameBounds(hwnd windows.Handle) (RECT, error) {
 const (
 	SW_RESTORE  = 9
 	SW_MAXIMIZE = 3
+	// SW_MINIMIZE minimizes the window and activates the next top-level window in the z-order.
+	SW_MINIMIZE = 6
+	// SW_SHOWMINNOACTIVE minimizes the window without changing activation.
+	SW_SHOWMINNOACTIVE = 7
 
 	SWP_NOSIZE         = 0x0001
 	SWP_NOMOVE         = 0x0002
@@ -4515,6 +4524,103 @@ func IsWindow(hwnd windows.Handle) bool {
 	// return !res.Failed()
 	res := IsWindowRaw(hwnd)
 	return res.R1 != 0
+}
+
+// IsIconic reports whether hwnd is minimized. Returns false for an invalid
+// handle (the API has no error channel; 0 is a legitimate "no" answer).
+func IsIconic(hwnd windows.Handle) bool {
+	return procIsIconic.Call(uintptr(hwnd)).R1 != 0
+}
+
+// GetRelatedWindow wraps GetWindow. A (0, nil) result means "no such related
+// window" (e.g. no owner, or no next window); an error means the call really
+// failed (e.g. invalid/destroyed handle).
+func GetRelatedWindow(hwnd windows.Handle, uCmd uint32) (windows.Handle, error) {
+	res := GetWindow(hwnd, uCmd)
+	if res.Failed() {
+		return 0, fmt.Errorf("GetWindow(HWND=0x%X, uCmd=%d) failed: %w", hwnd, uCmd, res.Err)
+	}
+	return windows.Handle(res.R1), nil
+}
+
+// GetAncestorChecked wraps GetAncestor. A (0, nil) result means "no such
+// ancestor" (e.g. GA_PARENT of the desktop); an error means the call failed.
+func GetAncestorChecked(hwnd windows.Handle, flags uint32) (windows.Handle, error) {
+	h, res := GetAncestor(hwnd, flags)
+	if res.Failed() {
+		return 0, fmt.Errorf("GetAncestor(HWND=0x%X, flags=%d) failed: %w", hwnd, flags, res.Err)
+	}
+	return h, nil
+}
+
+// GetRootOwner returns hwnd's GA_ROOTOWNER: the top of its parent/owner chain.
+// Windows keeps an owner and all its owned windows together in the z-order (an
+// owned window can never sit below its owner), so this identifies the
+// "z-order group" hwnd belongs to. A NULL result is reported as an error.
+func GetRootOwner(hwnd windows.Handle) (windows.Handle, error) {
+	root, err := GetAncestorChecked(hwnd, GA_ROOTOWNER)
+	if err != nil {
+		return 0, fmt.Errorf("GetRootOwner: %w", err)
+	}
+	if root == 0 {
+		return 0, fmt.Errorf("GetRootOwner: GetAncestor(HWND=0x%X, GA_ROOTOWNER) returned NULL without an error", hwnd)
+	}
+	return root, nil
+}
+
+// GetWindowStyleAndExStyle reads GWL_STYLE and GWL_EXSTYLE as 32-bit masks.
+func GetWindowStyleAndExStyle(hwnd windows.Handle) (style, exStyle uint32, err error) {
+	if hwnd == 0 {
+		return 0, 0, errors.New("GetWindowStyleAndExStyle: hwnd is 0")
+	}
+	resStyle := GetWindowLongPtrW(hwnd, GWL_STYLE)
+	if resStyle.Failed() {
+		return 0, 0, fmt.Errorf("read GWL_STYLE of HWND=0x%X: %w", hwnd, resStyle.Err)
+	}
+	resEx := GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+	if resEx.Failed() {
+		return 0, 0, fmt.Errorf("read GWL_EXSTYLE of HWND=0x%X: %w", hwnd, resEx.Err)
+	}
+	// #nosec G115 -- safe: Win32 window styles are 32-bit bitmasks
+	return uint32(resStyle.R1), uint32(resEx.R1), nil
+}
+
+// PingWindow sends a harmless WM_NULL with SMTO_ABORTIFHUNG and reports an
+// error if hwnd's thread doesn't answer within timeoutMs. Use it before any
+// synchronous cross-process call that could otherwise block the calling
+// thread on a hung window.
+func PingWindow(hwnd windows.Handle, timeoutMs uint32) error {
+	var result uintptr
+	if res := SendMessageTimeout(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, timeoutMs, &result); res.Failed() {
+		return fmt.Errorf("window HWND=0x%X didn't answer a WM_NULL ping within %dms (hung?): %w", hwnd, timeoutMs, res.Err)
+	}
+	return nil
+}
+
+// SetWindowZOrder issues a position/size-less, non-activating SetWindowPos
+// that changes nothing but hwnd's z-order (insertAfter may be HWND_TOP,
+// HWND_BOTTOM, HWND_TOPMOST, HWND_NOTOPMOST or a window handle).
+func SetWindowZOrder(hwnd, insertAfter windows.Handle) error {
+	if res := SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE); res.Failed() {
+		return fmt.Errorf("SetWindowPos(HWND=0x%X, insertAfter=0x%X) failed: %w", hwnd, insertAfter, res.Err)
+	}
+	return nil
+}
+
+// DwmIsWindowCloaked reports whether DWM cloaks hwnd (a cloaked window can be
+// IsWindowVisible yet not actually shown, e.g. UWP shell frames).
+func DwmIsWindowCloaked(hwnd windows.Handle) (bool, error) {
+	var cloaked uint32
+	res := procDwmGetWindowAttribute.Call(
+		uintptr(hwnd),
+		uintptr(DWMWA_CLOAKED),
+		uintptr(unsafe.Pointer(&cloaked)),
+		unsafe.Sizeof(cloaked),
+	)
+	if res.Failed() {
+		return false, fmt.Errorf("DwmGetWindowAttribute(DWMWA_CLOAKED) on HWND=0x%X failed: %w", hwnd, res.Err)
+	}
+	return cloaked != 0, nil
 }
 
 // GetSystemMetrics retrieves the specified system metric or system configuration setting.
@@ -5363,6 +5469,7 @@ func SetProcessWorkingSetSize(hProcess windows.Handle, dwMinimumWorkingSetSize, 
 const (
 	WS_DISABLED = 0x08000000
 	WS_VISIBLE  = 0x10000000
+	WS_MINIMIZE = 0x20000000
 )
 
 // GetWindowLongPtrW retrieves information about the specified window.
