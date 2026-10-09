@@ -477,7 +477,10 @@ func preBuryIfKnownStubborn(target windows.Handle) {
 // after the refocus: observed with Task Manager OG, the same call that does
 // nothing while the window is still the foreground window works once it isn't.
 func stagePlainBottom(target windows.Handle) error {
-	return wincoe.SetWindowZOrder(target, wincoe.HWND_BOTTOM)
+	if err := wincoe.SetWindowZOrder(target, wincoe.HWND_BOTTOM); err != nil {
+		return fmt.Errorf("stagePlainBottom(HWND=0x%X): %w", target, err)
+	}
+	return nil
 }
 
 // stageBuryHelpersThenBottom sends target's process's hidden helper windows to
