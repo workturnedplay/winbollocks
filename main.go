@@ -6277,8 +6277,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			// 	logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
 	} else {
-		//here for ModeMove OR async resize
-		//XXX: unfixable bug here with async resize, it will move the window even tho the window resisted resizing, during resize only!
+		//here for ModeMove(which is hardcoded async) OR for async resize
+		//XXX: unfixable bug here with async resize, it will move the window even tho(well, because!) the window resisted resizing, during resize only!
 		// FALLBACK: Normal single-pass execution for asynchronous mode or simple moves
 
 		// res4 := procSetWindowPos.Call(
@@ -6298,7 +6298,39 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		if data.ZOrderAction == zOrderActionSendToBack {
 			preBuryIfKnownStubborn(target)
 		}
-		res4 := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H, data.Flags)
+
+		// Diagnostic instrumentation: measure the synchronous cost of
+		// ordinary moves separately from resize handling. Queue depth is
+		// sampled immediately before the call; it is diagnostic only.
+		var moveQueueDepth int
+		var moveStart time.Time
+		if !async {
+			moveQueueDepth = len(moveDataChan)
+			moveStart = time.Now()
+		}
+		res4 := wincoe.SetWindowPos(
+			target, data.InsertAfter,
+			data.X, data.Y, data.W, data.H,
+			data.Flags, //search for SWP_ASYNCWINDOWPOS to see that Move has it hardcoded already (in v0.25.0 at least)
+		)
+		if !async {
+			moveDuration := time.Since(moveStart)
+
+			const ifMoreThanMs = 25 //ms
+			if moveDuration > ifMoreThanMs*time.Millisecond {
+				logf(
+					"SetWindowPos/Move for HWND 0x%X took %d ms (>%dms); async=%t queueDepthBefore=%d position=(%d,%d) size=(%d,%d) flags=0x%X",
+					target,
+					moveDuration.Milliseconds(),
+					ifMoreThanMs,
+					async,
+					moveQueueDepth,
+					data.X, data.Y,
+					data.W, data.H,
+					data.Flags,
+				)
+			}
+		}
 		if res4.Failed() {
 			//errCode, _, _ := procGetLastError.Call()
 			logf("SetWindowPos/Move-or-AsyncResize failed(from within main message loop): hwnd=0x%x err=%v", target, res4.Err)
