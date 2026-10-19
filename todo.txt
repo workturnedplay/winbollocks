@@ -1,5 +1,7 @@
 todos for winbollocks:
 
+* make sure the existing .ini gets the missing settings written in, this is for the future case when I add new ones, so we shouldn't have to change something in systray first to get the new setting inside the .ini ! Just do it auto on startup, if it's missing - add it in the .ini  Also, add a timestamp for the last update and a reason like user changed and which setting name (to what value is obvious) or that we added missing settings (and comma separated list of them), this info is added in one or more comments in the .ini file, or like first time created (if it's missing) with the defaults.
+
 * this may be too spammy:
  [Wed Jul 29 22:23:11.546355100 CEST 2026] SetWindowPos/Resize for HWND 0x20206 took 25 ms >25ms
 
