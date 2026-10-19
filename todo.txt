@@ -1,5 +1,7 @@
 todos for winbollocks:
 
+* find a solution for ModeMove since both async and sync SetWindowPosition are needed, depending on the case, regedit's Find window(search in progress) respectively Windows Firewall(delayed move due to window repaiting itself when moved back into desktop view)
+
 * make sure the existing .ini gets the missing settings written in, this is for the future case when I add new ones, so we shouldn't have to change something in systray first to get the new setting inside the .ini ! Just do it auto on startup, if it's missing - add it in the .ini  Also, add a timestamp for the last update and a reason like user changed and which setting name (to what value is obvious) or that we added missing settings (and comma separated list of them), this info is added in one or more comments in the .ini file, or like first time created (if it's missing) with the defaults.
 
 * this may be too spammy:

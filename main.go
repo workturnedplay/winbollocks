@@ -5375,6 +5375,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 						InsertAfter: 0, // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
 
 						Flags: wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE | wincoe.SWP_NOZORDER | wincoe.SWP_ASYNCWINDOWPOS, // for ModeMove
+						// wincoe.SWP_ASYNCWINDOWPOS is needed for ModeMove otherwise the Find window during an active search in regedit.exe can stop responding for 2.4sec which means our SetWindowPos call in main thread stops for 2.4 sec waiting for this window to finish
+						//however with wincoe.SWP_ASYNCWINDOWPOS then "Windows Defender Firewall with Advanced Security" window with a blue row(aka selected, ie. LMB it) in the Output Rules list when dragged from half-way off-screen back into visible desktop area, it will keep repaiting which is 100ms+ costly on every ModeMove and won't stop until it catches up and you're not moving at that time!
+						//FIXME: make this a systray toggle, and find a better solution that works for both cases maybe?
 					}
 					//data.Hwnd = targetWnd
 					//data.X = newX // int32, full range
