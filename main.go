@@ -703,7 +703,10 @@ var asyncMoveFlowControlEnabled atomic.Bool
 // additionally holds the next move back until the target's own update region
 // is empty, so a move isn't queued behind a repaint that the previous move
 // started (observed: Windows Firewall console flashing on every step).
-// Default off: experimental, see asyncMoveFlow.paintSettled.
+// Default on. Only the target's own top-level update region is consulted, so
+// a target that tracks all its invalidation on child windows wouldn't be
+// gated (it worked for the Firewall console). paintSettled caps the wait, so
+// continuously repainting targets aren't throttled forever.
 var asyncMovePaintGateEnabled atomic.Bool
 
 var requireWinDownHeldDuringGesture atomic.Bool // if true, the gesture(resize or move) stops when winkey is UP
@@ -7349,7 +7352,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				asyncMoveFlowControlEnabled.Load(), syncMoveEnabled.Load())
 
 			appendToggleMenuItem(hMenu, MENU_TOGGLE_ASYNC_MOVE_PAINT_GATE,
-				"(experimental) Async moves: also wait for the target's own repaint to finish before posting the next move (needs the option above; may not see repaints of child controls)",
+				"Async moves: also wait for the target's own repaint to finish before posting the next move (needs the option above; stops repaint flashing/lag while dragging slow-repainting windows)",
 				asyncMovePaintGateEnabled.Load(), syncMoveEnabled.Load() || !asyncMoveFlowControlEnabled.Load())
 
 			{
@@ -8776,7 +8779,7 @@ func init() {
 	asyncResize.Store(false)                      // default to sync
 	syncMoveEnabled.Store(false)                  // default async; see its doc comment
 	asyncMoveFlowControlEnabled.Store(true)       // default on; see its doc comment
-	asyncMovePaintGateEnabled.Store(false)        // default off; experimental, see its doc comment
+	asyncMovePaintGateEnabled.Store(true)         // default on; see its doc comment
 	requireWinDownHeldDuringGesture.Store((true)) // default to true
 	coalesceMoveResizeEvents.Store(true)          //default to true
 	immediateOverlayRepaint.Store(false)          // default to false
