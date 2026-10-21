@@ -249,6 +249,12 @@ const (
 	// gestureCursorTimerMs is the reassert interval. 16ms ≈ 60Hz is enough to
 	// win the race against most targets without measurable CPU cost.
 	gestureCursorTimerMs = 16
+
+	// asyncMoveFlushTimerID is the SetTimer nIDEvent that retries a pending,
+	// flow-controlled async move while the previous one is still in flight
+	// (see pumpAsyncMoveFlow). Only armed while a move is actually waiting.
+	asyncMoveFlushTimerID = 2
+	asyncMoveFlushTimerMs = 16
 )
 const (
 	MENU_EXIT                                      = 1
@@ -277,6 +283,8 @@ const (
 	MENU_TOGGLE_SNAP_TO_EDGES                      = 24
 	MENU_TOGGLE_DISABLE_FILE_LOGGING               = 25
 	MENU_TOGGLE_MINIMIZE_WHEN_CANT_SEND_TO_BACK    = 26
+	MENU_TOGGLE_SYNC_MOVE                          = 27
+	MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL            = 28
 )
 
 const (
@@ -647,6 +655,21 @@ var doLMBClick2FocusAsFallback atomic.Bool // if normal(thread attach) focus fai
 var ratelimitOnMove atomic.Bool            // use less CPU (see CPU time in task manager) but it's choppier and subconsciously no fun!
 var shouldLogDragRate atomic.Bool          // but only when ratelimitOnMove is true
 var asyncResize atomic.Bool
+
+// syncMoveEnabled selects plain synchronous SetWindowPos for ModeMove instead
+// of SWP_ASYNCWINDOWPOS. Sync never lets requests pile up on the target, but
+// blocks the main thread for as long as the target takes to answer (observed:
+// ~2.5s with regedit's Find window mid-search). Default false (async).
+var syncMoveEnabled atomic.Bool
+
+// asyncMoveFlowControlEnabled (only meaningful while syncMoveEnabled is
+// false) limits async ModeMove to one outstanding SetWindowPos per window,
+// coalescing newer positions into a single pending slot -- see
+// submitAsyncMoveWithFlowControl. Off = the legacy behaviour of posting every
+// step, which lets a slow-repainting target (observed: Windows Defender
+// Firewall with Advanced Security) fall seconds behind the cursor.
+var asyncMoveFlowControlEnabled atomic.Bool
+
 var requireWinDownHeldDuringGesture atomic.Bool // if true, the gesture(resize or move) stops when winkey is UP
 var coalesceMoveResizeEvents atomic.Bool
 var immediateOverlayRepaint atomic.Bool
@@ -2463,6 +2486,18 @@ func appendMenuChecked(hMenu windows.Handle, flags uint32, id uintptr, textStr s
 	}
 }
 
+// appendToggleMenuItem appends a checkable menu item, optionally greyed out.
+func appendToggleMenuItem(hMenu windows.Handle, id uintptr, text string, checked, disabled bool) {
+	flags := uint32(wincoe.MF_STRING)
+	if checked {
+		flags |= wincoe.MF_CHECKED
+	}
+	if disabled {
+		flags |= wincoe.MF_DISABLED | wincoe.MF_GRAYED
+	}
+	appendMenuChecked(hMenu, flags, id, text)
+}
+
 // copyUTF16Truncated copies s (as UTF-16) into dst, guaranteeing dst ends up
 // null-terminated even when s must be truncated to fit. A bare
 // copy(dst, windows.StringToUTF16(s)) can silently drop the terminator
@@ -2843,6 +2878,8 @@ var persistedSettings = []persistedSetting{
 	atomicBoolSetting("ratelimitOnMove", &ratelimitOnMove),
 	atomicBoolSetting("shouldLogDragRate", &shouldLogDragRate),
 	atomicBoolSetting("asyncResize", &asyncResize),
+	atomicBoolSetting("syncMoveEnabled", &syncMoveEnabled),
+	atomicBoolSetting("asyncMoveFlowControlEnabled", &asyncMoveFlowControlEnabled),
 	atomicBoolSetting("requireWinDownHeldDuringGesture", &requireWinDownHeldDuringGesture),
 	atomicBoolSetting("coalesceMoveResizeEvents", &coalesceMoveResizeEvents),
 	atomicBoolSetting("immediateOverlayRepaint", &immediateOverlayRepaint),
@@ -3303,34 +3340,47 @@ var gestureCursorTimerArmed atomic.Bool
 // reasserted even when the mouse is still (or the target outpaces our move drain).
 // Idempotent: SetTimer with the same id resets the interval; armed stays true.
 func startGestureCursorTimer() {
-	msgHwnd := loadMainMsgHwnd()
-	if msgHwnd == 0 {
-		return
-	}
-	if _, res := wincoe.SetTimer(msgHwnd, gestureCursorTimerID, gestureCursorTimerMs, 0); res.Failed() {
-		logf("startGestureCursorTimer: SetTimer failed: %v", res.Err)
-		return
-	}
-	gestureCursorTimerArmed.Store(true)
+	armMainThreadTimer(gestureCursorTimerID, gestureCursorTimerMs, &gestureCursorTimerArmed, "gesture cursor reassert")
 }
 
 // stopGestureCursorTimer kills the reassert timer if we previously armed it.
 // Idempotent and silent when the timer was never started or already stopped —
 // that is the normal path when softReset and WM_DO_RELEASE_CAPTURE both clear.
 func stopGestureCursorTimer() {
-	if !gestureCursorTimerArmed.CompareAndSwap(true, false) {
+	disarmMainThreadTimer(gestureCursorTimerID, &gestureCursorTimerArmed, "gesture cursor reassert")
+}
+
+// armMainThreadTimer arms a WM_TIMER on the main message window, doing
+// nothing if armed already says it's running (so hot paths can call it every
+// time without a syscall). Main thread only. A failure is logged and leaves
+// armed false so a later call can retry.
+func armMainThreadTimer(id uintptr, ms uint32, armed *atomic.Bool, name string) {
+	if armed.Load() {
 		return
 	}
 	msgHwnd := loadMainMsgHwnd()
 	if msgHwnd == 0 {
-		// Window already gone; timer dies with it. armed already cleared above.
 		return
 	}
-	if res := wincoe.KillTimer(msgHwnd, gestureCursorTimerID); res.Failed() {
-		// Only log when we believed the timer was live: genuine failure, not
-		// a double-stop. Still not fatal — worst case a few extra WM_TIMERs
-		// until the window is destroyed.
-		logf("stopGestureCursorTimer: KillTimer failed: %v", res.Err)
+	if _, res := wincoe.SetTimer(msgHwnd, id, ms, 0); res.Failed() {
+		logf("armMainThreadTimer(%s): SetTimer failed: %v", name, res.Err)
+		return
+	}
+	armed.Store(true)
+}
+
+// disarmMainThreadTimer kills a timer previously armed via armMainThreadTimer.
+// Idempotent and silent if it wasn't armed (the normal double-stop path).
+func disarmMainThreadTimer(id uintptr, armed *atomic.Bool, name string) {
+	if !armed.CompareAndSwap(true, false) {
+		return
+	}
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		return // window already gone; the timer died with it
+	}
+	if res := wincoe.KillTimer(msgHwnd, id); res.Failed() {
+		logf("disarmMainThreadTimer(%s): KillTimer failed: %v", name, res.Err)
 	}
 }
 
@@ -4133,6 +4183,10 @@ func cancelActiveGesture(session *dragSession) {
 
 	logf("Cancelling in-progress %v gesture on HWND=0x%X via ESC; restoring to original rect (%d,%d)-(%d,%d), wasMaximizedAtStart=%v",
 		session.mode, target, r.Left, r.Top, r.Right, r.Bottom, session.wasMaximizedAtStart)
+
+	// A flow-controlled move still pending would otherwise be posted after
+	// this restore and undo it.
+	discardAsyncMoveFlow(target)
 
 	if res := wincoe.SetWindowPos(target, 0, r.Left, r.Top, w, h,
 		wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
@@ -5374,10 +5428,11 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 						Y:           newY,
 						InsertAfter: 0, // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
 
-						Flags: wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE | wincoe.SWP_NOZORDER | wincoe.SWP_ASYNCWINDOWPOS, // for ModeMove
-						// wincoe.SWP_ASYNCWINDOWPOS is needed for ModeMove otherwise the Find window during an active search in regedit.exe can stop responding for 2.4sec which means our SetWindowPos call in main thread stops for 2.4 sec waiting for this window to finish
-						//however with wincoe.SWP_ASYNCWINDOWPOS then "Windows Defender Firewall with Advanced Security" window with a blue row(aka selected, ie. LMB it) in the Output Rules list when dragged from half-way off-screen back into visible desktop area, it will keep repaiting which is 100ms+ costly on every ModeMove and won't stop until it catches up and you're not moving at that time!
-						//FIXME: make this a systray toggle, and find a better solution that works for both cases maybe?
+						// Flags: wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE | wincoe.SWP_NOZORDER | wincoe.SWP_ASYNCWINDOWPOS, // for ModeMove
+						// // wincoe.SWP_ASYNCWINDOWPOS is needed for ModeMove otherwise the Find window during an active search in regedit.exe can stop responding for 2.4sec which means our SetWindowPos call in main thread stops for 2.4 sec waiting for this window to finish
+						// //however with wincoe.SWP_ASYNCWINDOWPOS then "Windows Defender Firewall with Advanced Security" window with a blue row(aka selected, ie. LMB it) in the Output Rules list when dragged from half-way off-screen back into visible desktop area, it will keep repaiting which is 100ms+ costly on every ModeMove and won't stop until it catches up and you're not moving at that time!
+						// //doneFIXME: make this a systray toggle, and find a better solution that works for both cases maybe?
+						Flags: moveGestureSwpFlags(), // async vs sync per systray, see syncMoveEnabled/asyncMoveFlowControlEnabled
 					}
 					//data.Hwnd = targetWnd
 					//data.X = newX // int32, full range
@@ -5473,10 +5528,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				// not from live GetAsyncKeyState — so shift+winkey+RMB
 				// shrinks for the whole drag. Edge/corner zones ignore it.
 				nx, ny, nw, nh := calculateResize(session, info.Pt, session.resizeZone, session.centerShrinkActive) //TODO: move this into wndProc aka into handleActualMove() ?! seems fast enough to keep in this
-				flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
-				if asyncResize.Load() {
-					flags |= wincoe.SWP_ASYNCWINDOWPOS
-				}
+				flags := resizeSwpFlags()
 				data := WindowMoveData{
 					Hwnd:       session.targetWnd,
 					X:          nx,
@@ -6040,6 +6092,185 @@ func MarkAsResizedNow() {
 
 const forceMoveOrResizeActionsToBeThisManyMSApart = 16 // 16ms is 60fps, 10ms is 100fps
 
+// moveGestureSwpFlags returns the SetWindowPos flags for a ModeMove step,
+// honoring the sync/async systray setting at the moment the step is built.
+func moveGestureSwpFlags() uint32 {
+	flags := uint32(wincoe.SWP_NOSIZE | wincoe.SWP_NOACTIVATE | wincoe.SWP_NOZORDER)
+	if !syncMoveEnabled.Load() {
+		flags |= wincoe.SWP_ASYNCWINDOWPOS
+	}
+	return flags
+}
+
+// resizeSwpFlags returns the SetWindowPos flags for a ModeResize step,
+// honoring the async-resize systray setting.
+func resizeSwpFlags() uint32 {
+	flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
+	if asyncResize.Load() {
+		flags |= wincoe.SWP_ASYNCWINDOWPOS
+	}
+	return flags
+}
+
+// isPlainMoveData reports whether data is an ordinary position-only move (as
+// built by moveGestureSwpFlags), as opposed to a resize or a Z-order command.
+func isPlainMoveData(data WindowMoveData) bool {
+	return data.ZOrderAction == zOrderActionNone &&
+		data.Flags&wincoe.SWP_NOSIZE != 0 &&
+		data.Flags&wincoe.SWP_NOMOVE == 0
+}
+
+// logSetWindowPosFailure logs a SetWindowPos failure from the main message
+// loop and, if it was access-denied (UIPI), tells the user via the tray.
+func logSetWindowPosFailure(what string, hwnd windows.Handle, res wincoe.WinResult, elevatedMsg string) {
+	logf("%s failed(from within main message loop): hwnd=0x%x err=%v", what, hwnd, res.Err)
+	if res.ErrIs(windows.ERROR_ACCESS_DENIED) { // aka UIPI likely
+		showTrayInfo(selfName, elevatedMsg)
+	}
+}
+
+// asyncMoveInFlightTimeout is how long an async move may stay unobserved as
+// applied before the next one is posted anyway (target hung, or it resists
+// the move so its rect never changes).
+const asyncMoveInFlightTimeout = 250 * time.Millisecond
+
+// asyncMoveFlow is the per-window state behind flow-controlled async moves:
+// at most ONE SetWindowPos(SWP_ASYNCWINDOWPOS) outstanding at a time, plus one
+// "latest wins" pending slot. Touched only by the main thread (same as
+// everything that calls SetWindowPos), so it needs no locking.
+type asyncMoveFlow struct {
+	hwnd windows.Handle
+
+	pending    WindowMoveData
+	hasPending bool
+
+	inFlight         bool
+	postedAt         time.Time
+	postedX, postedY int32
+	baseline         wincoe.RECT // the window's rect when the in-flight move was posted
+	baselineKnown    bool
+}
+
+var (
+	asyncMoveFlowState       asyncMoveFlow
+	asyncMoveFlushTimerArmed atomic.Bool
+)
+
+func armAsyncMoveFlushTimer() {
+	armMainThreadTimer(asyncMoveFlushTimerID, asyncMoveFlushTimerMs, &asyncMoveFlushTimerArmed, "async move flush")
+}
+
+func stopAsyncMoveFlushTimer() {
+	disarmMainThreadTimer(asyncMoveFlushTimerID, &asyncMoveFlushTimerArmed, "async move flush")
+}
+
+// observedApplied reports whether live shows the in-flight move as applied:
+// either the window is where we asked, or it moved away from where it was
+// when we posted (covers a target that clamped our request).
+func (st *asyncMoveFlow) observedApplied(live wincoe.RECT) bool {
+	if live.Left == st.postedX && live.Top == st.postedY {
+		return true
+	}
+	return st.baselineKnown && (live.Left != st.baseline.Left || live.Top != st.baseline.Top)
+}
+
+// submitAsyncMoveWithFlowControl is the entry point for plain moves while
+// async + flow control are on. It records data as the newest wanted position
+// and immediately tries to post it (see pumpAsyncMoveFlow).
+func submitAsyncMoveWithFlowControl(data WindowMoveData) {
+	st := &asyncMoveFlowState
+	if st.hwnd != data.Hwnd {
+		// Different window than the one tracked: land what the old one is
+		// still owed, then start fresh for the new one.
+		pumpAsyncMoveFlow(true)
+		*st = asyncMoveFlow{hwnd: data.Hwnd}
+	}
+	st.pending = data
+	st.hasPending = true
+	pumpAsyncMoveFlow(false)
+}
+
+// pumpAsyncMoveFlow posts the pending move if nothing is outstanding for the
+// window (or the outstanding one was observed applied/timed out), otherwise
+// arms asyncMoveFlushTimer to retry shortly. force ignores any outstanding
+// request. Called from submitAsyncMoveWithFlowControl and from WM_TIMER, so a
+// gesture's final position still lands even if the mouse stops moving.
+// Main thread only.
+func pumpAsyncMoveFlow(force bool) {
+	st := &asyncMoveFlowState
+	if !st.hasPending {
+		stopAsyncMoveFlushTimer() // idle tick: nothing left to wait for
+		return
+	}
+	target := st.hwnd
+
+	var live wincoe.RECT
+	liveOK := false
+	if res := wincoe.GetWindowRect(target, &live); res.Failed() {
+		if !wincoe.IsWindow(target) {
+			logf("pumpAsyncMoveFlow: HWND=0x%X no longer exists; dropping its pending async move", target)
+			*st = asyncMoveFlow{}
+			stopAsyncMoveFlushTimer()
+			return
+		}
+		logf("pumpAsyncMoveFlow: GetWindowRect failed for HWND=0x%X, err: %v; flow control degrades to timeout-only for this step", target, res.Err)
+	} else {
+		liveOK = true
+	}
+
+	// priorUnresolved: an earlier post may still be sitting unapplied in the
+	// target's queue, so "the window is already where we want it" can't be
+	// trusted to mean "nothing to do".
+	priorUnresolved := false
+	if st.inFlight {
+		switch {
+		case liveOK && st.observedApplied(live):
+			// settled
+		case force:
+			priorUnresolved = true
+		case time.Since(st.postedAt) >= asyncMoveInFlightTimeout:
+			logf("pumpAsyncMoveFlow: previous async move of HWND=0x%X to (%d,%d) not observed applied within %v; posting the next one anyway",
+				target, st.postedX, st.postedY, asyncMoveInFlightTimeout)
+			priorUnresolved = true
+		default:
+			armAsyncMoveFlushTimer() // still waiting; the newest position stays pending
+			return
+		}
+		st.inFlight = false
+	}
+
+	data := st.pending
+	if !priorUnresolved && liveOK && live.Left == data.X && live.Top == data.Y {
+		st.hasPending = false // already there; nothing to post
+		return
+	}
+
+	st.hasPending = false
+	if res := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H,
+		data.Flags|wincoe.SWP_ASYNCWINDOWPOS); res.Failed() {
+		// Pending is already cleared: retrying a failing call at timer rate would only spam the log.
+		logSetWindowPosFailure("SetWindowPos/Move(async, flow-controlled)", target, res,
+			"Cannot move elevated window (access denied), you'd have to run as admin.")
+		return
+	}
+	st.inFlight = true
+	st.postedAt = time.Now()
+	st.postedX, st.postedY = data.X, data.Y
+	st.baseline, st.baselineKnown = live, liveOK
+}
+
+// discardAsyncMoveFlow forgets any pending/in-flight flow-controlled move for
+// hwnd, so a stale pending position can't be posted after the gesture was
+// cancelled (see cancelActiveGesture). A request already posted to the
+// target's queue can't be recalled; flow control keeps that to at most one.
+func discardAsyncMoveFlow(hwnd windows.Handle) {
+	if asyncMoveFlowState.hwnd != hwnd {
+		return
+	}
+	asyncMoveFlowState = asyncMoveFlow{}
+	stopAsyncMoveFlushTimer()
+}
+
 func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	//Top of handleActualMoveOrResize, before the rate-limit check (capture should be set even if we throttle the actual SetWindowPos):
 	// Lazy once-per-session SetCapture.
@@ -6280,7 +6511,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			// 	logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
 	} else {
-		//here for ModeMove(which is hardcoded async) OR for async resize
+		//here for ModeMove (sync or async per the systray setting) OR for async resize
 		//XXX: unfixable bug here with async resize, it will move the window even tho(well, because!) the window resisted resizing, during resize only!
 		// FALLBACK: Normal single-pass execution for asynchronous mode or simple moves
 
@@ -6298,6 +6529,10 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		// 	uintptr(data.Flags),
 		// )
 		//if ret == 0 { //failed
+		if async && asyncMoveFlowControlEnabled.Load() && isPlainMoveData(data) {
+			submitAsyncMoveWithFlowControl(data)
+			return
+		}
 		if data.ZOrderAction == zOrderActionSendToBack {
 			preBuryIfKnownStubborn(target)
 		}
@@ -6314,7 +6549,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		res4 := wincoe.SetWindowPos(
 			target, data.InsertAfter,
 			data.X, data.Y, data.W, data.H,
-			data.Flags, //search for SWP_ASYNCWINDOWPOS to see that Move has it hardcoded already (in v0.25.0 at least)
+			data.Flags, // moveGestureSwpFlags()/resizeSwpFlags() decide whether SWP_ASYNCWINDOWPOS is in here
 		)
 		if !async {
 			moveDuration := time.Since(moveStart)
@@ -6335,12 +6570,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 			}
 		}
 		if res4.Failed() {
-			//errCode, _, _ := procGetLastError.Call()
-			logf("SetWindowPos/Move-or-AsyncResize failed(from within main message loop): hwnd=0x%x err=%v", target, res4.Err)
-			// if errCode == 5 { // Access denied (UIPI likely)
-			if res4.ErrIs(windows.ERROR_ACCESS_DENIED) { // ==5 aka Access denied (UIPI likely)
-				showTrayInfo(selfName, "Cannot Move-or-AsyncResize elevated window (access denied), you'd have to run as admin.")
-			}
+			logSetWindowPosFailure("SetWindowPos/Move-or-AsyncResize", target, res4,
+				"Cannot Move-or-AsyncResize elevated window (access denied), you'd have to run as admin.")
 			abandonPendingZOrderAction(data)
 			return
 		}
@@ -6516,11 +6747,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
 
 	case wincoe.WM_TIMER:
-		// Periodic SetCursor reassert while a gesture is active. Needed for
-		// targets that force a private cursor every mouse message (VS Code,
-		// mintty/git-bash, …): last SetCursor wins, so we keep re-stating ours
-		// from the capture-holding main thread at ~60Hz.
-		if wParam == gestureCursorTimerID {
+		switch wParam {
+		case gestureCursorTimerID:
+			// Periodic SetCursor reassert while a gesture is active. Needed for
+			// targets that force a private cursor every mouse message (VS Code,
+			// mintty/git-bash, …): last SetCursor wins, so we keep re-stating ours
+			// from the capture-holding main thread at ~60Hz.
 			if session := activeSession.Load(); session != nil {
 				reassertGestureCursorSetCursor(cursorForSession(session))
 			} else {
@@ -6528,6 +6760,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				// clearGestureCursor always runs); self-heal.
 				stopGestureCursorTimer()
 			}
+			return 0
+		case asyncMoveFlushTimerID:
+			pumpAsyncMoveFlow(false)
 			return 0
 		}
 		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
@@ -6654,10 +6889,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				session = &next
 			}
 			nx, ny, nw, nh := calculateResize(session, cursorPt, ZONE_CENTER, session.centerShrinkActive)
-			flags := uint32(wincoe.SWP_NOZORDER | wincoe.SWP_NOACTIVATE)
-			if asyncResize.Load() {
-				flags |= wincoe.SWP_ASYNCWINDOWPOS
-			}
+			flags := resizeSwpFlags()
 			enqueueMoveOrResize(WindowMoveData{
 				Hwnd:       session.targetWnd,
 				X:          nx,
@@ -6991,6 +7223,14 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 					MENU_TOGGLE_ASYNC_RESIZE, asyncText)
 			}
 
+			appendToggleMenuItem(hMenu, MENU_TOGGLE_SYNC_MOVE,
+				"Use synchronous SetWindowPos for window moves (off = async: never blocks us on a busy target, e.g. regedit's Find while searching; on = never lags behind but a busy target can stall our main thread)",
+				syncMoveEnabled.Load(), false)
+
+			appendToggleMenuItem(hMenu, MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL,
+				"Async moves: allow only one outstanding move per window, newest position wins (stops slow-repainting windows, e.g. Windows Firewall console, from lagging seconds behind the cursor)",
+				asyncMoveFlowControlEnabled.Load(), syncMoveEnabled.Load())
+
 			{
 				var reqWinDownFlags uint32 = wincoe.MF_STRING
 				if requireWinDownHeldDuringGesture.Load() {
@@ -7279,6 +7519,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 
 			case MENU_TOGGLE_ASYNC_RESIZE:
 				toggleAndPersist(&asyncResize)
+
+			case MENU_TOGGLE_SYNC_MOVE:
+				toggleAndPersist(&syncMoveEnabled)
+
+			case MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL:
+				toggleAndPersist(&asyncMoveFlowControlEnabled)
 
 			case MENU_TOGGLE_REQUIRE_WINDOWN:
 				toggleAndPersist(&requireWinDownHeldDuringGesture)
@@ -8404,6 +8650,8 @@ func init() {
 	ratelimitOnMove.Store(false)
 	shouldLogDragRate.Store(false)
 	asyncResize.Store(false)                      // default to sync
+	syncMoveEnabled.Store(false)                  // default async; see its doc comment
+	asyncMoveFlowControlEnabled.Store(true)       // default on; see its doc comment
 	requireWinDownHeldDuringGesture.Store((true)) // default to true
 	coalesceMoveResizeEvents.Store(true)          //default to true
 	immediateOverlayRepaint.Store(false)          // default to false
