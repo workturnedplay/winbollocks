@@ -2838,8 +2838,7 @@ func updateTrayTooltipInputStateIfChanged() {
 // silently corrupt if fields were ever reordered.
 type persistedSetting struct {
 	name string
-	get  func() bool
-	set  func(bool)
+	v    *atomic.Bool
 
 	// skip, if non-nil and returns true, makes loadSettings ignore this
 	// setting's persisted value entirely for this run (keeping whatever
@@ -2849,17 +2848,29 @@ type persistedSetting struct {
 	// an earlier session -- see disableFileLoggingForcedByCmdline. Every
 	// other entry leaves this nil.
 	skip func() bool
+
+	// diskValue is what the settings file held for this setting when
+	// loadSettings read it (false if absent/unparsable). Consulted only
+	// while skip() is true: such a setting is a one-run override, so
+	// saveSettings must write what was on disk (or the default, which is
+	// false for every such setting) rather than persist the override
+	// itself -- see valueToPersist.
+	diskValue bool
 }
 
-// atomicBoolSetting constructs the get/set closures for the overwhelmingly
-// common case (a plain *atomic.Bool toggle with no skip condition), so each
-// ordinary entry in persistedSettings below is a single line.
-func atomicBoolSetting(name string, v *atomic.Bool) persistedSetting {
-	return persistedSetting{
-		name: name,
-		get:  v.Load,
-		set:  v.Store,
+// valueToPersist is what saveSettings writes for this setting.
+func (s *persistedSetting) valueToPersist() bool {
+	if s.skip != nil && s.skip() {
+		return s.diskValue
 	}
+	return s.v.Load()
+}
+
+// atomicBoolSetting constructs the entry for the overwhelmingly common case
+// (a plain *atomic.Bool toggle with no skip condition), so each ordinary
+// entry in persistedSettings below is a single line.
+func atomicBoolSetting(name string, v *atomic.Bool) persistedSetting {
+	return persistedSetting{name: name, v: v}
 }
 
 // settingsFilePath is the on-disk location of the persisted systray toggle
@@ -2941,10 +2952,21 @@ var persistedSettings = []persistedSetting{
 	atomicBoolSetting("minimizeWhenCantSendToBack", &minimizeWhenCantSendToBack),
 	{
 		name: "disableFileLogging",
-		get:  disableFileLogging.Load,
-		set:  disableFileLogging.Store,
+		v:    &disableFileLogging,
 		skip: func() bool { return disableFileLoggingForcedByCmdline },
 	},
+}
+
+// persistedSettingName returns the on-disk name registered for v, for the
+// "user changed ..." reason recorded in the settings file.
+func persistedSettingName(v *atomic.Bool) string {
+	for i := range persistedSettings {
+		if persistedSettings[i].v == v {
+			return persistedSettings[i].name
+		}
+	}
+	logf("persistedSettingName: BUG: toggled setting isn't registered in persistedSettings, so it won't survive a restart")
+	return "<unregistered setting>"
 }
 
 // toggleAndPersist flips v and immediately persists all current settings to
@@ -2953,32 +2975,30 @@ var persistedSettings = []persistedSetting{
 // there's no separate "save on exit" step to miss.
 func toggleAndPersist(v *atomic.Bool) {
 	v.Store(!v.Load())
-	saveSettings()
+	saveSettings("user changed " + persistedSettingName(v))
 }
 
 // saveSettings serializes every entry in persistedSettings to
-// settingsFilePath as simple "name = true"/"name = false" lines (one per
-// line, matching this project's existing readcfg.env key=value
-// convention), written via wincoe's crash-safe FileWriter so a mid-write
-// crash or power loss can never leave a truncated, unparsable settings
-// file behind.
+// settingsFilePath as simple "name = true"/"name = false" lines (matching
+// this project's existing readcfg.env key=value convention), preceded by
+// comments recording when this write happened and why (reason, e.g. "user
+// changed X"), written via wincoe's crash-safe FileWriter so a mid-write
+// crash or power loss can never leave a truncated, unparsable settings file
+// behind.
 //
-// Called synchronously from the main thread every time a systray toggle
-// changes (see toggleAndPersist) -- a human clicking a tray menu item is
+// Called synchronously from the main thread (tray toggles, and
+// reconcileSettingsFile at startup) -- a human clicking a tray menu item is
 // far too infrequent an event for the resulting tiny, synchronous file
-// write to matter, and TrackPopupMenu already blocks the main thread in
-// its own modal loop for the whole time the menu is open regardless.
+// write to matter.
 //
 // Failures are logged but otherwise swallowed: settings persistence is a
-// convenience, never a correctness requirement, and refusing to continue
-// running winbollocks just because its settings file couldn't be written
-// would be a wildly disproportionate response to e.g. a temporarily
-// locked/read-only file.
-func saveSettings() {
+// convenience, never a correctness requirement.
+func saveSettings(reason string) {
 	var b strings.Builder
 	b.WriteString("# winbollocks systray settings -- auto-generated, edit while winbollocks is NOT running or your edits will be overwritten/lost!\n")
-	for _, s := range persistedSettings {
-		fmt.Fprintf(&b, "%s = %t\n", s.name, s.get())
+	fmt.Fprintf(&b, "# last updated: %s, reason: %s\n", time.Now().Format(time.RFC3339), reason)
+	for i := range persistedSettings {
+		fmt.Fprintf(&b, "%s = %t\n", persistedSettings[i].name, persistedSettings[i].valueToPersist())
 	}
 
 	// #nosec G302 -- 0644 not 0600: winbollocks often runs elevated (see
@@ -2986,8 +3006,40 @@ func saveSettings() {
 	// user should be able to read/edit their own settings file without
 	// needing to become admin to do so.
 	if err := settingsFileWriter.SafeWriteFile(settingsFilePath, []byte(b.String()), 0644); err != nil {
-		logf("saveSettings: failed to write %q, err: %v", settingsFilePath, err)
+		logf("saveSettings: failed to write %q (reason: %s), err: %v", settingsFilePath, reason, err)
 	}
+}
+
+type settingsLineKind int
+
+const (
+	settingsLineIgnorable settingsLineKind = iota // blank line or comment
+	settingsLineMalformed                         // has content but no '='
+	settingsLineKeyValue
+)
+
+// parseSettingsLine is the single place that understands the settings
+// file's line syntax, shared by loadSettings and
+// readPersistedDisableFileLoggingEarly. key/val are only meaningful for
+// settingsLineKeyValue.
+func parseSettingsLine(rawLine string) (key, val string, kind settingsLineKind) {
+	line := strings.TrimSpace(rawLine)
+	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		return "", "", settingsLineIgnorable
+	}
+	k, v, found := strings.Cut(line, "=")
+	if !found {
+		return "", "", settingsLineMalformed
+	}
+	return strings.TrimSpace(k), strings.TrimSpace(v), settingsLineKeyValue
+}
+
+// settingsLoadResult tells reconcileSettingsFile what loadSettings found.
+type settingsLoadResult struct {
+	fileExisted bool
+	readFailed  bool     // the file exists but couldn't be read; must not be overwritten
+	missing     []string // registered settings with no line in the file
+	invalid     []string // registered settings whose line had an unparsable value
 }
 
 // loadSettings reads settingsFilePath (if present) and applies any
@@ -2996,63 +3048,114 @@ func saveSettings() {
 // already set. Must run after every init() function that seeds a default
 // for one of these toggles (e.g. shiftMirrorResizeEnabled's
 // virtualization-dependent default), and before the tray menu can first be
-// shown, so the very first time a person opens the tray menu it already
-// reflects their saved choices rather than a fresh default that then flips
-// out from under them shortly after.
+// shown.
 //
-// A missing file is the ordinary, expected first-run state and is silently
-// ignored, NOT logged as an error. An unrecognized key (e.g. a setting that
-// existed in an older version and was since removed) is skipped with a log
-// line rather than treated as fatal, so a settings file written by a newer
-// or older build of winbollocks never prevents startup. A malformed value
-// (anything strconv.ParseBool can't parse) for a recognized key is
-// likewise skipped with a log line, leaving that one toggle at whatever its
-// own init()-computed default already was.
-func loadSettings() {
+// A missing file is the ordinary first-run state and is reported via the
+// result, not logged as an error. An unrecognized key (e.g. a setting that
+// was since removed) is skipped with a log line rather than treated as
+// fatal. A malformed value for a recognized key is skipped with a log line,
+// leaving that toggle at its init()-computed default, and is reported in
+// result.invalid so reconcileSettingsFile can repair the file.
+func loadSettings() settingsLoadResult {
+	var result settingsLoadResult
+
 	data, err := os.ReadFile(settingsFilePath) //nolint:gosec // G304: settingsFilePath is a fixed, hardcoded constant, never derived from user/network input
 	if err != nil {
-		if !os.IsNotExist(err) {
-			logf("loadSettings: failed to read %q, err: %v; continuing with defaults", settingsFilePath, err)
+		if os.IsNotExist(err) {
+			return result // first run; reconcileSettingsFile creates the file from the defaults
 		}
-		return
+		result.readFailed = true
+		logf("loadSettings: failed to read %q, err: %v; continuing with defaults and NOT rewriting that file this run", settingsFilePath, err)
+		return result
 	}
+	result.fileExisted = true
 
 	byName := make(map[string]*persistedSetting, len(persistedSettings))
 	for i := range persistedSettings {
 		byName[persistedSettings[i].name] = &persistedSettings[i]
 	}
+	valid := make(map[string]bool, len(persistedSettings))
+	unparsable := make(map[string]bool)
 
-	lines := strings.Split(string(data), "\n")
-	for lineNum, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+	for lineNum, rawLine := range strings.Split(string(data), "\n") {
+		key, val, kind := parseSettingsLine(rawLine)
+		switch kind {
+		case settingsLineIgnorable:
 			continue
-		}
-		key, val, found := strings.Cut(line, "=")
-		if !found {
+		case settingsLineMalformed:
 			logf("loadSettings: %q line %d: missing '=', skipping: %q", settingsFilePath, lineNum+1, rawLine)
 			continue
+		case settingsLineKeyValue:
+			// handled below
 		}
-		key = strings.TrimSpace(key)
-		val = strings.TrimSpace(val)
 
 		setting, ok := byName[key]
 		if !ok {
 			logf("loadSettings: %q line %d: unrecognized setting %q, skipping", settingsFilePath, lineNum+1, key)
 			continue
 		}
+
+		parsed, parseErr := strconv.ParseBool(val)
+		if parseErr != nil {
+			unparsable[key] = true
+			logf("loadSettings: %q line %d: setting %q has unparsable value %q, skipping (keeping computed default), err: %v", settingsFilePath, lineNum+1, key, val, parseErr)
+			continue
+		}
+		valid[key] = true
+		setting.diskValue = parsed
+
 		if setting.skip != nil && setting.skip() {
 			logf("loadSettings: %q line %d: skipping persisted %q for this run (overridden by an explicit command-line flag)", settingsFilePath, lineNum+1, key)
 			continue
 		}
-
-		parsed, err := strconv.ParseBool(val)
-		if err != nil {
-			logf("loadSettings: %q line %d: setting %q has unparsable value %q, skipping (keeping computed default), err: %v", settingsFilePath, lineNum+1, key, val, err)
-			continue
-		}
-		setting.set(parsed)
+		setting.v.Store(parsed)
 	}
+
+	for i := range persistedSettings {
+		name := persistedSettings[i].name
+		switch {
+		case valid[name]:
+		case unparsable[name]:
+			result.invalid = append(result.invalid, name)
+		default:
+			result.missing = append(result.missing, name)
+		}
+	}
+	return result
+}
+
+// reconcileSettingsFile makes the settings file complete: it creates it
+// from the current defaults if it didn't exist, or rewrites it if
+// loadSettings found registered settings missing/unparsable (new ones added
+// in a newer build, or hand-edit mistakes), recording the reason in the
+// file's comments. Does nothing if the file is already complete, or if it
+// exists but couldn't be read (rewriting then could destroy settings we
+// couldn't see).
+func reconcileSettingsFile(res settingsLoadResult) {
+	if res.readFailed {
+		logf("reconcileSettingsFile: leaving %q alone because it exists but couldn't be read", settingsFilePath)
+		return
+	}
+
+	var reason string
+	if !res.fileExisted {
+		reason = "first created with defaults"
+	} else {
+		var parts []string
+		if len(res.missing) > 0 {
+			parts = append(parts, "added missing settings: "+strings.Join(res.missing, ", "))
+		}
+		if len(res.invalid) > 0 {
+			parts = append(parts, "reset unparsable settings to their defaults: "+strings.Join(res.invalid, ", "))
+		}
+		if len(parts) == 0 {
+			return // already complete
+		}
+		reason = strings.Join(parts, "; ")
+	}
+
+	logf("reconcileSettingsFile: rewriting %q (%s)", settingsFilePath, reason)
+	saveSettings(reason)
 }
 
 // parseDisableFileLoggingCmdlineFlag scans os.Args for "-nolog" or
@@ -3124,15 +3227,11 @@ func readPersistedDisableFileLoggingEarly() {
 
 	const wantedKey = "disableFileLogging"
 	for _, rawLine := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		key, val, kind := parseSettingsLine(rawLine)
+		if kind != settingsLineKeyValue || key != wantedKey {
 			continue
 		}
-		key, val, found := strings.Cut(line, "=")
-		if !found || strings.TrimSpace(key) != wantedKey {
-			continue
-		}
-		if parsed, parseErr := strconv.ParseBool(strings.TrimSpace(val)); parseErr == nil {
+		if parsed, parseErr := strconv.ParseBool(val); parseErr == nil {
 			disableFileLogging.Store(parsed)
 		}
 		return // found the key (whether or not it parsed); nothing more to do
@@ -9444,7 +9543,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 	initWincoeLogging() // ← must be before any wincoe calls
 
 	settingsFileWriter.CheckPowerLossFile(settingsFilePath)
-	loadSettings()
+	reconcileSettingsFile(loadSettings())
 
 	// Capture the actual terminal/console window that launched us
 	//resFg := procGetForegroundWindow.Call()
