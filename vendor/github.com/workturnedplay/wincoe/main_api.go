@@ -1486,6 +1486,10 @@ var (
 	// procInvalidateRect = user32.NewProc("InvalidateRect")
 	procInvalidateRect = NewBoundProc3(User32, "InvalidateRect", CheckBool)
 
+	// GetUpdateRect returns nonzero if the window has a non-empty update
+	// region; 0 is the legitimate "nothing to paint" answer, so CheckNone.
+	procGetUpdateRect = NewBoundProc3(User32, "GetUpdateRect", CheckNone)
+
 	// GetWindowLongPtrW returns LONG_PTR (can be 0 legitimately); we treat non-zero as "success" for most usages
 	//Microsoft’s documentation for GetWindowLongPtrW explicitly states: "If the function fails, the return value is zero." It never returns a non-zero value when an error occurs.
 	procGetWindowLongPtrW = NewBoundProc2(User32, "GetWindowLongPtrW", CheckNullWithLastError) //was CheckNone and CheckNull is not enough!
@@ -4251,6 +4255,15 @@ func InvalidateRect(hwnd windows.Handle, rect *RECT, erase bool) WinResult {
 		erasePtr = 1
 	}
 	return procInvalidateRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)), erasePtr)
+}
+
+// HasUpdateRegion reports whether hwnd currently has a non-empty update
+// region (an invalidated area still waiting to be painted). Local read of
+// kernel state: bErase is always FALSE so no WM_ERASEBKGND is ever sent to
+// the (possibly busy) target. Returns false for an invalid window. Only
+// hwnd's own region is reported, not its child windows'.
+func HasUpdateRegion(hwnd windows.Handle) bool {
+	return procGetUpdateRect.Call(uintptr(hwnd), 0, 0).R1 != 0
 }
 
 // UpdateWindow updates the client area of the specified window.
