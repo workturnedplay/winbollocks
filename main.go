@@ -250,11 +250,12 @@ const (
 	// win the race against most targets without measurable CPU cost.
 	gestureCursorTimerMs = 16
 
-	// asyncMoveFlushTimerID is the SetTimer nIDEvent that retries a pending,
-	// flow-controlled async move while the previous one is still in flight
-	// (see pumpAsyncMoveFlow). Only armed while a move is actually waiting.
-	asyncMoveFlushTimerID = 2
-	asyncMoveFlushTimerMs = 16
+	// moveFlowTimerID is the SetTimer nIDEvent that retries a pending move/resize
+	// held back by the flow controller (previous async request still in flight,
+	// or the target still repainting) -- see pumpMoveFlow. Only armed while
+	// something is actually waiting.
+	moveFlowTimerID = 2
+	moveFlowTimerMs = 16
 )
 const (
 	MENU_EXIT                                      = 1
@@ -284,8 +285,8 @@ const (
 	MENU_TOGGLE_DISABLE_FILE_LOGGING               = 25
 	MENU_TOGGLE_MINIMIZE_WHEN_CANT_SEND_TO_BACK    = 26
 	MENU_TOGGLE_SYNC_MOVE                          = 27
-	MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL            = 28
-	MENU_TOGGLE_ASYNC_MOVE_PAINT_GATE              = 29
+	MENU_TOGGLE_ASYNC_FLOW_CONTROL                 = 28
+	MENU_TOGGLE_PAINT_GATE                         = 29
 )
 
 const (
@@ -691,23 +692,23 @@ var asyncResize atomic.Bool
 // ~2.5s with regedit's Find window mid-search). Default false (async).
 var syncMoveEnabled atomic.Bool
 
-// asyncMoveFlowControlEnabled (only meaningful while syncMoveEnabled is
-// false) limits async ModeMove to one outstanding SetWindowPos per window,
-// coalescing newer positions into a single pending slot -- see
-// submitAsyncMoveWithFlowControl. Off = the legacy behaviour of posting every
-// step, which lets a slow-repainting target (observed: Windows Defender
-// Firewall with Advanced Security) fall seconds behind the cursor.
-var asyncMoveFlowControlEnabled atomic.Bool
+// asyncFlowControlEnabled limits async moves AND async resizes
+// (SWP_ASYNCWINDOWPOS) to one outstanding SetWindowPos per window, coalescing
+// newer positions into a single pending slot -- see pumpMoveFlow. Off = the
+// legacy behaviour of posting every step, which lets a slow-repainting target
+// (observed: Windows Defender Firewall with Advanced Security) fall seconds
+// behind the cursor. Irrelevant while both moves and resizes are synchronous.
+var asyncFlowControlEnabled atomic.Bool
 
-// asyncMovePaintGateEnabled (only meaningful with async + flow control)
-// additionally holds the next move back until the target's own update region
-// is empty, so a move isn't queued behind a repaint that the previous move
-// started (observed: Windows Firewall console flashing on every step).
-// Default on. Only the target's own top-level update region is consulted, so
-// a target that tracks all its invalidation on child windows wouldn't be
-// gated (it worked for the Firewall console). paintSettled caps the wait, so
-// continuously repainting targets aren't throttled forever.
-var asyncMovePaintGateEnabled atomic.Bool
+// paintGateEnabled holds the next move/resize back until the target's own
+// update region is empty, so a request isn't queued behind a repaint that the
+// previous one started (observed: Windows Firewall console flashing/lagging
+// on every step). Applies to sync moves/resizes directly, and to async ones
+// only together with asyncFlowControlEnabled. Only the target's own top-level
+// update region is consulted, and a region is cleared when its paint STARTS, so
+// a paint already running isn't visible to it. moveFlowPaintSettleTimeout caps
+// the wait, so continuously repainting targets aren't throttled forever.
+var paintGateEnabled atomic.Bool
 
 var requireWinDownHeldDuringGesture atomic.Bool // if true, the gesture(resize or move) stops when winkey is UP
 var coalesceMoveResizeEvents atomic.Bool
@@ -2930,8 +2931,8 @@ var persistedSettings = []persistedSetting{
 	atomicBoolSetting("shouldLogDragRate", &shouldLogDragRate),
 	atomicBoolSetting("asyncResize", &asyncResize),
 	atomicBoolSetting("syncMoveEnabled", &syncMoveEnabled),
-	atomicBoolSetting("asyncMoveFlowControlEnabled", &asyncMoveFlowControlEnabled),
-	atomicBoolSetting("asyncMovePaintGateEnabled", &asyncMovePaintGateEnabled),
+	atomicBoolSetting("asyncFlowControlEnabled", &asyncFlowControlEnabled),
+	atomicBoolSetting("paintGateEnabled", &paintGateEnabled),
 	atomicBoolSetting("requireWinDownHeldDuringGesture", &requireWinDownHeldDuringGesture),
 	atomicBoolSetting("coalesceMoveResizeEvents", &coalesceMoveResizeEvents),
 	atomicBoolSetting("immediateOverlayRepaint", &immediateOverlayRepaint),
@@ -4335,7 +4336,7 @@ func cancelActiveGesture(session *dragSession) {
 	} else {
 		logf("cancelActiveGesture: session for HWND=0x%X has no cancel token (unexpected); queued moves of this gesture may still be applied after the restore", target)
 	}
-	discardAsyncMoveFlow(target)
+	discardMoveFlow(target)
 
 	// 2. Restore through the target thread's own posted-request queue (async),
 	// NOT a synchronous SetWindowPos: a sync call is a sent message and runs
@@ -5599,7 +5600,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 						// // wincoe.SWP_ASYNCWINDOWPOS is needed for ModeMove otherwise the Find window during an active search in regedit.exe can stop responding for 2.4sec which means our SetWindowPos call in main thread stops for 2.4 sec waiting for this window to finish
 						// //however with wincoe.SWP_ASYNCWINDOWPOS then "Windows Defender Firewall with Advanced Security" window with a blue row(aka selected, ie. LMB it) in the Output Rules list when dragged from half-way off-screen back into visible desktop area, it will keep repaiting which is 100ms+ costly on every ModeMove and won't stop until it catches up and you're not moving at that time!
 						// //doneFIXME: make this a systray toggle, and find a better solution that works for both cases maybe?
-						Flags: moveGestureSwpFlags(), // async vs sync per systray, see syncMoveEnabled/asyncMoveFlowControlEnabled
+						Flags: moveGestureSwpFlags(), // async vs sync per systray, see syncMoveEnabled/asyncFlowControlEnabled
 					}
 					//data.Hwnd = targetWnd
 					//data.X = newX // int32, full range
@@ -6280,14 +6281,6 @@ func resizeSwpFlags() uint32 {
 	return flags
 }
 
-// isPlainMoveData reports whether data is an ordinary position-only move (as
-// built by moveGestureSwpFlags), as opposed to a resize or a Z-order command.
-func isPlainMoveData(data WindowMoveData) bool {
-	return data.ZOrderAction == zOrderActionNone &&
-		data.Flags&wincoe.SWP_NOSIZE != 0 &&
-		data.Flags&wincoe.SWP_NOMOVE == 0
-}
-
 // logSetWindowPosFailure logs a SetWindowPos failure from the main message
 // loop and, if it was access-denied (UIPI), tells the user via the tray.
 func logSetWindowPosFailure(what string, hwnd windows.Handle, res wincoe.WinResult, elevatedMsg string) {
@@ -6297,116 +6290,151 @@ func logSetWindowPosFailure(what string, hwnd windows.Handle, res wincoe.WinResu
 	}
 }
 
-// asyncMoveInFlightTimeout is how long an async move may stay unobserved as
-// applied before the next one is posted anyway (target hung, or it resists
-// the move so its rect never changes).
-const asyncMoveInFlightTimeout = 250 * time.Millisecond
+// isResizeData reports whether data resizes the window (as opposed to a plain
+// move, whose W/H are 0 and carry SWP_NOSIZE).
+func isResizeData(data WindowMoveData) bool {
+	return data.W != 0 || data.H != 0
+}
 
-// asyncMovePaintSettleTimeout caps how long, after a move was observed
-// applied, the paint gate keeps holding the next move back waiting for the
-// target's update region to clear (a target that repaints continuously must
-// not be throttled forever).
-const asyncMovePaintSettleTimeout = 200 * time.Millisecond
+// movePlacementRect is the rect data asks for. For a plain move only
+// Left/Top are meaningful (see placementDiffers).
+func movePlacementRect(data WindowMoveData) wincoe.RECT {
+	return wincoe.RECT{Left: data.X, Top: data.Y, Right: data.X + data.W, Bottom: data.Y + data.H}
+}
 
-// asyncMoveFlow is the per-window state behind flow-controlled async moves:
-// at most ONE SetWindowPos(SWP_ASYNCWINDOWPOS) outstanding at a time, plus one
-// "latest wins" pending slot. Touched only by the main thread (same as
-// everything that calls SetWindowPos), so it needs no locking.
-type asyncMoveFlow struct {
-	hwnd windows.Handle
+// placementDiffers reports whether a and b differ in what a move (Left/Top)
+// or, if resize, a resize (all four edges) would change.
+func placementDiffers(a, b wincoe.RECT, resize bool) bool {
+	if a.Left != b.Left || a.Top != b.Top {
+		return true
+	}
+	return resize && (a.Right != b.Right || a.Bottom != b.Bottom)
+}
+
+// moveFlowManages reports whether data must go through the flow controller
+// instead of being applied immediately: async requests when flow control is
+// on, sync ones when the paint gate is on. Z-order commands never do.
+func moveFlowManages(data WindowMoveData) bool {
+	if data.ZOrderAction != zOrderActionNone {
+		return false
+	}
+	if data.Flags&wincoe.SWP_ASYNCWINDOWPOS != 0 {
+		return asyncFlowControlEnabled.Load()
+	}
+	return paintGateEnabled.Load()
+}
+
+// moveFlowInFlightTimeout is how long an async move/resize may stay unobserved
+// as applied before the next one is posted anyway (target hung, or it resists
+// the request so its rect never changes).
+const moveFlowInFlightTimeout = 250 * time.Millisecond
+
+// moveFlowPaintSettleTimeout caps how long, once a move/resize is applied, the
+// paint gate holds the next one back waiting for the target's update region to
+// clear.
+const moveFlowPaintSettleTimeout = 200 * time.Millisecond
+
+// moveFlow is the per-gesture state of the flow controller for moves and
+// resizes, sync or async: a single "latest wins" pending slot; for async, at
+// most ONE SetWindowPos(SWP_ASYNCWINDOWPOS) outstanding; and the paint gate
+// between a request being applied and the next one being issued. Touched only
+// by the main thread (like everything that calls SetWindowPos), so no locking.
+type moveFlow struct {
+	hwnd  windows.Handle
+	token *gestureCancelToken // gesture this state belongs to
 
 	pending    WindowMoveData
 	hasPending bool
 
-	inFlight         bool
-	postedAt         time.Time
-	postedX, postedY int32
-	baseline         wincoe.RECT // the window's rect when the in-flight move was posted
-	baselineKnown    bool
+	// async only: the one outstanding request
+	inFlight      bool
+	posted        WindowMoveData
+	postedAt      time.Time
+	baseline      wincoe.RECT // the window's rect when it was posted
+	baselineKnown bool
 
-	// appliedSeenAt is when the in-flight move was first observed applied
-	// while the paint gate was waiting; zero otherwise.
-	appliedSeenAt time.Time
+	// settleStart is when we started waiting for the target's repaint of the
+	// last applied request; zero = not waiting.
+	settleStart time.Time
 }
 
 var (
-	asyncMoveFlowState       asyncMoveFlow
-	asyncMoveFlushTimerArmed atomic.Bool
+	moveFlowState      moveFlow
+	moveFlowTimerArmed atomic.Bool
 )
 
-func armAsyncMoveFlushTimer() {
-	armMainThreadTimer(asyncMoveFlushTimerID, asyncMoveFlushTimerMs, &asyncMoveFlushTimerArmed, "async move flush")
+func armMoveFlowTimer() {
+	armMainThreadTimer(moveFlowTimerID, moveFlowTimerMs, &moveFlowTimerArmed, "move/resize flow")
 }
 
-func stopAsyncMoveFlushTimer() {
-	disarmMainThreadTimer(asyncMoveFlushTimerID, &asyncMoveFlushTimerArmed, "async move flush")
+func stopMoveFlowTimer() {
+	disarmMainThreadTimer(moveFlowTimerID, &moveFlowTimerArmed, "move/resize flow")
 }
 
-// observedApplied reports whether live shows the in-flight move as applied:
-// either the window is where we asked, or it moved away from where it was
-// when we posted (covers a target that clamped our request).
-func (st *asyncMoveFlow) observedApplied(live wincoe.RECT) bool {
-	if live.Left == st.postedX && live.Top == st.postedY {
+// observedApplied reports whether live shows the in-flight async request as
+// applied: the window is where we asked, or it changed from where it was when
+// we posted (covers a target that clamped our request).
+func (st *moveFlow) observedApplied(live wincoe.RECT) bool {
+	resize := isResizeData(st.posted)
+	if !placementDiffers(live, movePlacementRect(st.posted), resize) {
 		return true
 	}
-	return st.baselineKnown && (live.Left != st.baseline.Left || live.Top != st.baseline.Top)
+	return st.baselineKnown && placementDiffers(live, st.baseline, resize)
 }
 
-// paintSettled reports whether the paint gate lets the next move be posted:
-// true if the gate is off, force is set, the target's update region is
-// empty, or asyncMovePaintSettleTimeout elapsed since the previous move was
-// first seen applied. Only meaningful once observedApplied was true.
-func (st *asyncMoveFlow) paintSettled(force bool) bool {
-	if force || !asyncMovePaintGateEnabled.Load() {
+// beginPaintWait starts the paint gate's clock, once per applied request.
+func (st *moveFlow) beginPaintWait() {
+	if st.settleStart.IsZero() {
+		st.settleStart = time.Now()
+	}
+}
+
+// paintSettled reports whether the gate lets the next request through: gate
+// off, the target's update region is empty, or moveFlowPaintSettleTimeout
+// elapsed since the previous request was applied.
+func (st *moveFlow) paintSettled() bool {
+	if !paintGateEnabled.Load() || !wincoe.HasUpdateRegion(st.hwnd) {
 		return true
 	}
-	if st.appliedSeenAt.IsZero() {
-		st.appliedSeenAt = time.Now()
-	}
-	if !wincoe.HasUpdateRegion(st.hwnd) {
-		return true
-	}
-	if time.Since(st.appliedSeenAt) >= asyncMovePaintSettleTimeout {
+	if time.Since(st.settleStart) >= moveFlowPaintSettleTimeout {
 		if rateLimitedLogDue(&lastPaintGateLogTime, time.Second) {
-			logf("asyncMoveFlow.paintSettled: HWND=0x%X still has an update region %v after its move was applied; posting the next move anyway (log rate-limited to 1/sec)",
-				st.hwnd, asyncMovePaintSettleTimeout)
+			logf("moveFlow.paintSettled: HWND=0x%X still has an update region %v after its move/resize was applied; issuing the next one anyway (log rate-limited to 1/sec)",
+				st.hwnd, moveFlowPaintSettleTimeout)
 		}
 		return true
 	}
 	return false
 }
 
-// submitAsyncMoveWithFlowControl is the entry point for plain moves while
-// async + flow control are on. It records data as the newest wanted position
-// and immediately tries to post it (see pumpAsyncMoveFlow).
-func submitAsyncMoveWithFlowControl(data WindowMoveData) {
-	st := &asyncMoveFlowState
-	if st.hwnd != data.Hwnd {
-		// Different window than the one tracked: land what the old one is
-		// still owed, then start fresh for the new one.
-		pumpAsyncMoveFlow(true)
-		*st = asyncMoveFlow{hwnd: data.Hwnd}
+// submitToMoveFlow records data as the newest wanted placement and tries to
+// issue it right away (see pumpMoveFlow).
+func submitToMoveFlow(data WindowMoveData) {
+	st := &moveFlowState
+	if st.hwnd != data.Hwnd || st.token != data.Token {
+		// A different window or a new gesture: land what the old one is still
+		// owed (dropped if it was cancelled), then start fresh.
+		pumpMoveFlow(true)
+		*st = moveFlow{hwnd: data.Hwnd, token: data.Token}
 	}
 	st.pending = data
 	st.hasPending = true
-	pumpAsyncMoveFlow(false)
+	pumpMoveFlow(false)
 }
 
-// pumpAsyncMoveFlow posts the pending move if nothing is outstanding for the
-// window (or the outstanding one was observed applied/timed out), otherwise
-// arms asyncMoveFlushTimer to retry shortly. force ignores any outstanding
-// request. Called from submitAsyncMoveWithFlowControl and from WM_TIMER, so a
-// gesture's final position still lands even if the mouse stops moving.
-// Main thread only.
-func pumpAsyncMoveFlow(force bool) {
-	st := &asyncMoveFlowState
+// pumpMoveFlow issues the pending request if the flow allows it, otherwise
+// arms moveFlowTimer to retry shortly. force ignores any outstanding request
+// and the paint gate. Called from submitToMoveFlow and from WM_TIMER, so a
+// gesture's final placement lands even if the mouse stops moving. Main thread
+// only.
+func pumpMoveFlow(force bool) {
+	st := &moveFlowState
 	if !st.hasPending {
-		stopAsyncMoveFlushTimer() // idle tick: nothing left to wait for
+		stopMoveFlowTimer() // idle tick: nothing left to wait for
 		return
 	}
 	if isCancelledGestureMove(st.pending) {
-		*st = asyncMoveFlow{} // cancelled after it was queued; never post it
-		stopAsyncMoveFlushTimer()
+		*st = moveFlow{} // cancelled after it was queued; never issue it
+		stopMoveFlowTimer()
 		return
 	}
 	target := st.hwnd
@@ -6415,71 +6443,80 @@ func pumpAsyncMoveFlow(force bool) {
 	liveOK := false
 	if res := wincoe.GetWindowRect(target, &live); res.Failed() {
 		if !wincoe.IsWindow(target) {
-			logf("pumpAsyncMoveFlow: HWND=0x%X no longer exists; dropping its pending async move", target)
-			*st = asyncMoveFlow{}
-			stopAsyncMoveFlushTimer()
+			logf("pumpMoveFlow: HWND=0x%X no longer exists; dropping its pending move/resize", target)
+			*st = moveFlow{}
+			stopMoveFlowTimer()
 			return
 		}
-		logf("pumpAsyncMoveFlow: GetWindowRect failed for HWND=0x%X, err: %v; flow control degrades to timeout-only for this step", target, res.Err)
+		logf("pumpMoveFlow: GetWindowRect failed for HWND=0x%X, err: %v; flow control degrades to timeout-only for this step", target, res.Err)
 	} else {
 		liveOK = true
 	}
 
-	// priorUnresolved: an earlier post may still be sitting unapplied in the
+	isAsync := st.pending.Flags&wincoe.SWP_ASYNCWINDOWPOS != 0
+
+	// priorUnresolved: an earlier async post may still sit unapplied in the
 	// target's queue, so "the window is already where we want it" can't be
 	// trusted to mean "nothing to do".
 	priorUnresolved := false
 	if st.inFlight {
 		switch {
 		case liveOK && st.observedApplied(live):
-			if !st.paintSettled(force) {
-				armAsyncMoveFlushTimer() // applied, but its repaint isn't done; newest position stays pending
-				return
-			}
+			st.inFlight = false
+			st.beginPaintWait()
 		case force:
+			st.inFlight = false
 			priorUnresolved = true
-		case time.Since(st.postedAt) >= asyncMoveInFlightTimeout:
-			logf("pumpAsyncMoveFlow: previous async move of HWND=0x%X to (%d,%d) not observed applied within %v; posting the next one anyway",
-				target, st.postedX, st.postedY, asyncMoveInFlightTimeout)
+		case time.Since(st.postedAt) >= moveFlowInFlightTimeout:
+			logf("pumpMoveFlow: previous async request for HWND=0x%X to (%d,%d %dx%d) not observed applied within %v; issuing the next one anyway",
+				target, st.posted.X, st.posted.Y, st.posted.W, st.posted.H, moveFlowInFlightTimeout)
+			st.inFlight = false
 			priorUnresolved = true
 		default:
-			armAsyncMoveFlushTimer() // still waiting; the newest position stays pending
+			armMoveFlowTimer() // still waiting; the newest placement stays pending
 			return
 		}
-		st.inFlight = false
 	}
 
+	if !force && !st.settleStart.IsZero() && !st.paintSettled() {
+		armMoveFlowTimer() // applied, but its repaint isn't done; newest placement stays pending
+		return
+	}
+	st.settleStart = time.Time{}
+
 	data := st.pending
-	if !priorUnresolved && liveOK && live.Left == data.X && live.Top == data.Y {
+	// Async only: a sync request is always executed, even a no-op one, since
+	// the sync resize path also refreshes the overlay.
+	if isAsync && !priorUnresolved && liveOK && !placementDiffers(live, movePlacementRect(data), isResizeData(data)) {
 		st.hasPending = false // already there; nothing to post
 		return
 	}
 
 	st.hasPending = false
-	if res := wincoe.SetWindowPos(target, data.InsertAfter, data.X, data.Y, data.W, data.H,
-		data.Flags|wincoe.SWP_ASYNCWINDOWPOS); res.Failed() {
-		// Pending is already cleared: retrying a failing call at timer rate would only spam the log.
-		logSetWindowPosFailure("SetWindowPos/Move(async, flow-controlled)", target, res,
-			"Cannot move elevated window (access denied), you'd have to run as admin.")
-		return
+	MarkAsResizedNow()
+	executeMoveOrResize(data)
+	if isAsync {
+		// executeMoveOrResize doesn't report failure; a failed post simply
+		// never shows as applied and the in-flight timeout releases it.
+		st.inFlight = true
+		st.posted = data
+		st.postedAt = time.Now()
+		st.baseline, st.baselineKnown = live, liveOK
+	} else {
+		st.beginPaintWait()
 	}
-	st.inFlight = true
-	st.appliedSeenAt = time.Time{}
-	st.postedAt = time.Now()
-	st.postedX, st.postedY = data.X, data.Y
-	st.baseline, st.baselineKnown = live, liveOK
 }
 
-// discardAsyncMoveFlow forgets any pending/in-flight flow-controlled move for
-// hwnd, so a stale pending position can't be posted after the gesture was
-// cancelled (see cancelActiveGesture). A request already posted to the
-// target's queue can't be recalled; flow control keeps that to at most one.
-func discardAsyncMoveFlow(hwnd windows.Handle) {
-	if asyncMoveFlowState.hwnd != hwnd {
+// discardMoveFlow forgets any pending/in-flight request for hwnd, so a stale
+// pending placement can't be issued after the gesture was cancelled (see
+// cancelActiveGesture). A request already posted to the target's queue can't
+// be recalled; flow control keeps that to at most one.
+func discardMoveFlow(hwnd windows.Handle) {
+	if moveFlowState.hwnd != hwnd {
 		return
 	}
-	asyncMoveFlowState = asyncMoveFlow{}
-	stopAsyncMoveFlushTimer()
+	moveFlowState = moveFlow{}
+	stopMoveFlowTimer()
 }
 
 func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
@@ -6538,7 +6575,18 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	// 	//lastResize.Store(time.Now())
 	// 	MarkAsResized()
 	// }()
+	if moveFlowManages(data) {
+		submitToMoveFlow(data)
+		return
+	}
+	executeMoveOrResize(data)
+}
 
+// executeMoveOrResize applies data via SetWindowPos right now: the sync resize
+// two-step pipeline, or the single-call path for moves and async resizes, plus
+// the Z-order action handling. Capture, cursor, throttling and flow control are
+// handleActualMoveOrResize's / pumpMoveFlow's business, not this function's.
+func executeMoveOrResize(data WindowMoveData) {
 	target := data.Hwnd
 	// if resizing {
 	// 	//actually we could be done resizing and still get resize things or move things from the queue due to delays.
@@ -6556,7 +6604,7 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	// 	panic("bad coding, you passed SWP_NOSIZE while attempting to resize!")
 	// }
 
-	isResizeEvent := data.W != 0 || data.H != 0 //is a resize not move event
+	isResizeEvent := isResizeData(data) //is a resize not move event
 
 	// //disabled, some windows are resizeable yet still hit this
 	// if false && isResizeEvent {
@@ -6747,10 +6795,10 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 		// 	uintptr(data.Flags),
 		// )
 		//if ret == 0 { //failed
-		if async && asyncMoveFlowControlEnabled.Load() && isPlainMoveData(data) {
-			submitAsyncMoveWithFlowControl(data)
-			return
-		}
+		// if async && asyncFlowControlEnabled.Load() && isPlainMoveData(data) {
+		// 	submitAsyncMoveWithFlowControl(data)
+		// 	return
+		// }
 		if data.ZOrderAction == zOrderActionSendToBack {
 			preBuryIfKnownStubborn(target)
 		}
@@ -6979,8 +7027,8 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				stopGestureCursorTimer()
 			}
 			return 0
-		case asyncMoveFlushTimerID:
-			pumpAsyncMoveFlow(false)
+		case moveFlowTimerID:
+			pumpMoveFlow(false)
 			return 0
 		}
 		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
@@ -7446,13 +7494,13 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				"Use synchronous SetWindowPos for window moves (off = async: never blocks us on a busy target, e.g. regedit's Find while searching; on = never lags behind but a busy target can stall our main thread)",
 				syncMoveEnabled.Load(), false)
 
-			appendToggleMenuItem(hMenu, MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL,
-				"Async moves: allow only one outstanding move per window, newest position wins (stops slow-repainting windows, e.g. Windows Firewall console, from lagging seconds behind the cursor)",
-				asyncMoveFlowControlEnabled.Load(), syncMoveEnabled.Load())
+			appendToggleMenuItem(hMenu, MENU_TOGGLE_ASYNC_FLOW_CONTROL,
+				"Async moves/resizes: allow only one outstanding move/resize per window, newest position wins (stops slow-repainting windows, e.g. Windows Firewall console, from lagging seconds behind the cursor)",
+				asyncFlowControlEnabled.Load(), syncMoveEnabled.Load() && !asyncResize.Load())
 
-			appendToggleMenuItem(hMenu, MENU_TOGGLE_ASYNC_MOVE_PAINT_GATE,
-				"Async moves: also wait for the target's own repaint to finish before posting the next move (needs the option above; stops repaint flashing/lag while dragging slow-repainting windows)",
-				asyncMovePaintGateEnabled.Load(), syncMoveEnabled.Load() || !asyncMoveFlowControlEnabled.Load())
+			appendToggleMenuItem(hMenu, MENU_TOGGLE_PAINT_GATE,
+				"Wait for the target's own repaint (from the previous move/resize) to finish before the next one (stops repaint flashing/lag on slow-repainting windows; async moves/resizes need the option above too)",
+				paintGateEnabled.Load(), false)
 
 			{
 				var reqWinDownFlags uint32 = wincoe.MF_STRING
@@ -7746,11 +7794,11 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			case MENU_TOGGLE_SYNC_MOVE:
 				toggleAndPersist(&syncMoveEnabled)
 
-			case MENU_TOGGLE_ASYNC_MOVE_FLOW_CONTROL:
-				toggleAndPersist(&asyncMoveFlowControlEnabled)
+			case MENU_TOGGLE_ASYNC_FLOW_CONTROL:
+				toggleAndPersist(&asyncFlowControlEnabled)
 
-			case MENU_TOGGLE_ASYNC_MOVE_PAINT_GATE:
-				toggleAndPersist(&asyncMovePaintGateEnabled)
+			case MENU_TOGGLE_PAINT_GATE:
+				toggleAndPersist(&paintGateEnabled)
 
 			case MENU_TOGGLE_REQUIRE_WINDOWN:
 				toggleAndPersist(&requireWinDownHeldDuringGesture)
@@ -8877,8 +8925,8 @@ func init() {
 	shouldLogDragRate.Store(false)
 	asyncResize.Store(false)                      // default to sync
 	syncMoveEnabled.Store(false)                  // default async; see its doc comment
-	asyncMoveFlowControlEnabled.Store(true)       // default on; see its doc comment
-	asyncMovePaintGateEnabled.Store(true)         // default on; see its doc comment
+	asyncFlowControlEnabled.Store(true)           // default on; see its doc comment
+	paintGateEnabled.Store(true)                  // default on; see its doc comment
 	requireWinDownHeldDuringGesture.Store((true)) // default to true
 	coalesceMoveResizeEvents.Store(true)          //default to true
 	immediateOverlayRepaint.Store(false)          // default to false
