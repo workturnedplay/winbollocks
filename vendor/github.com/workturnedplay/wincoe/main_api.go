@@ -1338,6 +1338,11 @@ var (
 	// so it's technically a CheckBool but it's not an error, it's just an fyi
 	procShowWindow = NewBoundProc2(User32, "ShowWindow", CheckNone)
 
+	// ShowWindowAsync posts the show command to the window's own thread
+	// (ordered after SetWindowPos(SWP_ASYNCWINDOWPOS) requests posted earlier
+	// to that thread). Nonzero means "posted", so CheckBool.
+	procShowWindowAsync = NewBoundProc2(User32, "ShowWindowAsync", CheckBool)
+
 	procSetWindowPos = NewBoundProc7(User32, "SetWindowPos", CheckBool)
 
 	// procDefWindowProc   = user32.NewProc("DefWindowProcW")
@@ -3944,6 +3949,14 @@ func ShowWindow(hwnd windows.Handle, nCmdShow int32) (wasShownBefore bool) {
 		return true
 	}
 	return false
+}
+
+// ShowWindowAsync posts nCmdShow to the thread that owns hwnd without waiting
+// for it to be processed. A failed WinResult means the request couldn't be
+// posted (invalid window, UIPI, ...), not that the window ignored it later.
+func ShowWindowAsync(hwnd windows.Handle, nCmdShow int32) WinResult {
+	// #nosec G115 -- Win32 nCmdShow int32 converted to uintptr for syscall
+	return procShowWindowAsync.Call(uintptr(hwnd), uintptr(nCmdShow))
 }
 
 // DestroyWindow destroys the specified window.

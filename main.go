@@ -324,6 +324,24 @@ const (
 	zOrderActionRestoreFocused
 )
 
+// gestureCancelToken is shared by every dragSession of one physical gesture
+// (the RCU copies made by handleShiftMirrorToggle / the radial-center branch
+// carry the same pointer) and stamped on every WindowMoveData that gesture
+// enqueues. cancelActiveGesture sets cancelled so moves still sitting in
+// moveDataChan, or enqueued by the hook thread between the ESC keypress and
+// the main thread handling WM_CANCEL_GESTURE, are discarded instead of being
+// applied on top of the cancel's restore.
+type gestureCancelToken struct {
+	cancelled atomic.Bool
+}
+
+// isCancelledGestureMove reports whether data belongs to a gesture that was
+// cancelled via ESC. Z-order commands and anything without a token are never
+// considered cancelled.
+func isCancelledGestureMove(data WindowMoveData) bool {
+	return data.Token != nil && data.Token.cancelled.Load()
+}
+
 type WindowMoveData struct {
 	Hwnd        windows.Handle // Target window
 	X           int32          // New X (full 32-bit)
@@ -332,6 +350,10 @@ type WindowMoveData struct {
 	InsertAfter windows.Handle // ← this one: HWND_TOP, HWND_BOTTOM, etc.
 	Flags       uint32         // Optional: extra SWP_ flags
 	ResizeZone  int
+
+	// Token identifies the gesture that produced this move; nil for
+	// non-gesture operations (Win+MMB Z-order commands). See gestureCancelToken.
+	Token *gestureCancelToken
 
 	// ZOrderAction records the application-level meaning of this operation.
 	// Do not infer that meaning later from InsertAfter: WindowMoveData is
@@ -542,10 +564,16 @@ const (
 
 type dragSession struct {
 	//currently or previously dragged window HWND, helps with state after doing winkey+L then unlocking session while dragging was in progress.
-	targetWnd          windows.Handle
-	state              dragState
-	resizeZone         int
-	mode               DragMode
+	targetWnd  windows.Handle
+	state      dragState
+	resizeZone int
+	mode       DragMode
+
+	// token is this gesture's cancel token, shared across RCU copies of the
+	// session; see gestureCancelToken. Never nil for a session created by
+	// startManualDrag/tryBeginResizeGestureAt.
+	token *gestureCancelToken
+
 	initialAspectRatio float64
 
 	// viaMissedGestureRecovery is true when this session was started by the
@@ -1282,6 +1310,7 @@ func handleShiftMirrorToggle(session *dragSession, cursorPt wincoe.POINT, shiftD
 		initialAspectRatio:       float64(w) / float64(h),
 		originalRect:             session.originalRect, // carried through unchanged, see doc comment
 		originalPt:               session.originalPt,
+		token:                    session.token, // same gesture, same cancel token; (next := *session in the WM_APPLY_SHIFT_MIRROR radial branch already copies the pointer.)
 		visualInsetLeft:          session.visualInsetLeft,
 		visualInsetTop:           session.visualInsetTop,
 		visualInsetRight:         session.visualInsetRight,
@@ -3459,6 +3488,7 @@ func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecov
 	sess := &dragSession{
 		targetWnd:                hwnd,
 		mode:                     ModeMove,
+		token:                    new(gestureCancelToken),
 		state:                    dragState{startPt: pt, startRect: r},
 		viaMissedGestureRecovery: viaMissedGestureRecovery,
 		wasMaximizedAtStart:      wasMaximized,
@@ -3765,6 +3795,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 	sess := &dragSession{
 		targetWnd: wantTargetWnd,
 		mode:      ModeResize,
+		token:     new(gestureCancelToken),
 		state:     dragState{startPt: pt, startRect: r},
 
 		resizeZone:               zone,
@@ -4184,23 +4215,37 @@ func cancelActiveGesture(session *dragSession) {
 	logf("Cancelling in-progress %v gesture on HWND=0x%X via ESC; restoring to original rect (%d,%d)-(%d,%d), wasMaximizedAtStart=%v",
 		session.mode, target, r.Left, r.Top, r.Right, r.Bottom, session.wasMaximizedAtStart)
 
-	// A flow-controlled move still pending would otherwise be posted after
-	// this restore and undo it.
+	// 1. Poison everything of this gesture that winbollocks itself still
+	// holds: entries in moveDataChan (including ones the hook thread adds
+	// before softReset below clears activeSession) and the flow-controlled
+	// async pending slot.
+	if session.token != nil {
+		session.token.cancelled.Store(true)
+	} else {
+		logf("cancelActiveGesture: session for HWND=0x%X has no cancel token (unexpected); queued moves of this gesture may still be applied after the restore", target)
+	}
 	discardAsyncMoveFlow(target)
 
+	// 2. Restore through the target thread's own posted-request queue (async),
+	// NOT a synchronous SetWindowPos: a sync call is a sent message and runs
+	// BEFORE async moves already posted to that thread, which would then
+	// land on top of the restore. Posted requests run FIFO, so the restore
+	// goes after any move still outstanding (flow control keeps that to at
+	// most one). It also can't block the main thread on a busy target.
 	if res := wincoe.SetWindowPos(target, 0, r.Left, r.Top, w, h,
-		wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
+		wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE|wincoe.SWP_ASYNCWINDOWPOS,
 	); res.Failed() {
-		logf("cancelActiveGesture: SetWindowPos (restore original rect) on HWND=0x%X failed: %v", target, res.Err)
+		logSetWindowPosFailure("SetWindowPos/Restore-on-cancel(async)", target, res,
+			"Cannot restore elevated window (access denied), you'd have to run as admin.")
 	}
 
 	if session.wasMaximizedAtStart {
-		// See startDrag/tryBeginResizeGestureAt's identical
-		// "_ = wincoe.ShowWindow(hwnd, wincoe.SW_RESTORE)" pattern -- the
-		// return value only reports the window's PRIOR visibility state,
-		// not whether the maximize request itself succeeded, so there's
-		// nothing meaningful to check or log here.
-		_ = wincoe.ShowWindow(target, wincoe.SW_MAXIMIZE)
+		// Async for the same ordering reason; it must come after the rect
+		// restore above (same FIFO) so the window re-maximizes from its
+		// original restored position.
+		if res := wincoe.ShowWindowAsync(target, wincoe.SW_MAXIMIZE); res.Failed() {
+			logf("cancelActiveGesture: ShowWindowAsync(SW_MAXIMIZE) on HWND=0x%X failed: %v", target, res.Err)
+		}
 	}
 
 	if res := wincoe.SetCursorPos(session.originalPt.X, session.originalPt.Y); res.Failed() {
@@ -5424,6 +5469,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					// This stays on the STACK, so it's lightning fast.
 					data := WindowMoveData{
 						Hwnd:        session.targetWnd,
+						Token:       session.token,
 						X:           newX,
 						Y:           newY,
 						InsertAfter: 0, // this is the value for HWND_TOP but SWP_NOZORDER below makes it unused, supposedly!
@@ -5531,6 +5577,7 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 				flags := resizeSwpFlags()
 				data := WindowMoveData{
 					Hwnd:       session.targetWnd,
+					Token:      session.token,
 					X:          nx,
 					Y:          ny,
 					W:          nw,
@@ -6202,6 +6249,11 @@ func pumpAsyncMoveFlow(force bool) {
 		stopAsyncMoveFlushTimer() // idle tick: nothing left to wait for
 		return
 	}
+	if isCancelledGestureMove(st.pending) {
+		*st = asyncMoveFlow{} // cancelled after it was queued; never post it
+		stopAsyncMoveFlushTimer()
+		return
+	}
 	target := st.hwnd
 
 	var live wincoe.RECT
@@ -6272,6 +6324,13 @@ func discardAsyncMoveFlow(hwnd windows.Handle) {
 }
 
 func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
+	// A move/resize of a gesture that ESC already cancelled must never be
+	// applied: it would land on top of cancelActiveGesture's restore. Checked
+	// before the lazy SetCapture below so a stale entry can't re-grab capture.
+	if isCancelledGestureMove(data) {
+		abandonPendingZOrderAction(data) // no-op for plain moves; keeps the invariant uniform
+		return
+	}
 	//Top of handleActualMoveOrResize, before the rate-limit check (capture should be set even if we throttle the actual SetWindowPos):
 	// Lazy once-per-session SetCapture.
 	// We are guaranteed to be on the main thread here (wndProc context).
@@ -6892,6 +6951,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			flags := resizeSwpFlags()
 			enqueueMoveOrResize(WindowMoveData{
 				Hwnd:       session.targetWnd,
+				Token:      session.token,
 				X:          nx,
 				Y:          ny,
 				W:          nw,
