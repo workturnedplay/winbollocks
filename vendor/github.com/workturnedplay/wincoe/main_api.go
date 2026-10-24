@@ -2600,6 +2600,10 @@ var (
 	serviceCacheTTL = 60 * time.Second
 )
 
+// serviceCacheMaxEntries is the size above which expired entries are purged
+// opportunistically on insert, bounding the map under PID churn.
+const serviceCacheMaxEntries = 1024
+
 // serviceLookupInFlight coordinates a single in-progress
 // GetServiceNamesFromPIDUncached call for a given PID, so concurrent cache
 // misses for the SAME PID (e.g. a burst of UDP/TCP packets from one process
@@ -2661,6 +2665,14 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 
 	if err == nil {
 		serviceCacheMu.Lock()
+		if len(serviceCache) >= serviceCacheMaxEntries {
+			now := time.Now()
+			for pid, e := range serviceCache {
+				if now.After(e.expiresAt) {
+					delete(serviceCache, pid)
+				}
+			}
+		}
 		serviceCache[targetPID] = serviceCacheEntry{
 			names:     names,
 			expiresAt: time.Now().Add(serviceCacheTTL),
