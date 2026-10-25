@@ -93,7 +93,7 @@ When `winbollocks` is run without administrative privileges, it cannot reliably 
 * It does **not** modify system keyboard mappings.
 * It does **not** require administrator privileges (unless you want to manipulate admin windows like Task Manager).
 
-The keyboard hook exists **solely** to track modifier key state (Win / Shift / Ctrl / Alt) and suppress Start menu activation after handled gestures (by swallowing the `winkey_UP` event and injecting a quick RShift tap). No other key combinations are acted upon.
+The keyboard hook exists to track modifier key state (Win / Shift / Ctrl / Alt), to suppress Start menu activation after handled gestures (by swallowing the `winkey_UP` event and injecting a quick Right-Ctrl tap), to cancel an active gesture on ESC, and to react to Shift press/release during an active resize (mirror / radial shrink). No other key combinations are acted upon.
 
 ---
 

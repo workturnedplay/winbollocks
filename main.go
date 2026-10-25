@@ -29,6 +29,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -418,6 +419,11 @@ var (
 	lmbDownSwallowed atomic.Bool
 	rmbDownSwallowed atomic.Bool
 	mmbDownSwallowed atomic.Bool
+
+	// escDownSwallowed is true from the moment we swallow an ESC key-down (the one that cancelled a
+	// gesture) until its matching key-up is seen; auto-repeat downs and the up are swallowed too so
+	// the target never sees an unbalanced ESC.
+	escDownSwallowed atomic.Bool
 )
 
 // resetStaleGestureFlags clears winGestureUsed and lmbDownSwallowed/
@@ -462,6 +468,7 @@ func resetStaleGestureFlags() {
 	lmbDownSwallowed.Store(false)
 	rmbDownSwallowed.Store(false)
 	mmbDownSwallowed.Store(false)
+	escDownSwallowed.Store(false)
 }
 
 // isSpuriousDuplicateButtonDown reports whether a WM_LBUTTONDOWN/
@@ -727,7 +734,7 @@ var checkForMissedGestureOnNextMove atomic.Bool
 
 // reconciliationFireCount counts how many times the
 // GetForegroundWindow()-reconciliation workaround has actually fired (see
-// forceReconcile below in winEventProc, and caveats1.txt for the
+// forceReconcile below in winEventProc, and caveat1.txt for the
 // underlying Windows quirk this works around: an occasionally-omitted
 // EVENT_SYSTEM_FOREGROUND delivery). Expected to be at most 1 for the
 // entire lifetime of the process -- anything beyond that is logged as a
@@ -1625,7 +1632,7 @@ const (
 // intent that should be able to trigger our winkey+mouse gestures like any
 // physical input would.
 //
-// Chosen as an arbitrary, distinctive 64-bit value ("WBLK" repeated) rather
+// Chosen as an arbitrary, distinctive 64-bit value ("WINBOLLX" in ASCII) rather
 // than e.g. 1: a well-behaved third-party injector that ALSO happens to tag
 // its own input via dwExtraInfo (some do, for their own analogous
 // ignore-my-own-injections filtering) is exceedingly unlikely to pick this
@@ -2133,8 +2140,11 @@ func injectLMBClickAtCoords(x, y int32) {
 	//   rightmost pixel -> 65535
 	//
 	// exactly.
-	normalizedX := (relX * 65535) / (virtualWidth - 1)
-	normalizedY := (relY * 65535) / (virtualHeight - 1)
+	// int64 math: relX*65535 overflows int32 once the virtual desktop is wider than 32767px.
+	// #nosec G115 -- safe: the quotient is always within 0..65535
+	normalizedX := int32((int64(relX) * 65535) / int64(virtualWidth-1))
+	// #nosec G115 -- safe: the quotient is always within 0..65535
+	normalizedY := int32((int64(relY) * 65535) / int64(virtualHeight-1))
 
 	inputs := []wincoe.KEYANDMOUSE_INPUT{
 		{
@@ -2282,7 +2292,13 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	var needed uint32
 	err = windows.GetTokenInformation(token, windows.TokenIntegrityLevel, nil, 0, &needed)
 	if err == nil {
-		return 0, fmt.Errorf("GetTokenInformation getting the proper size, succeeded but it's supposed to fail because we're passing 0 to get the proper size")
+		return 0, errors.New("GetTokenInformation size query succeeded, but it's supposed to fail with ERROR_INSUFFICIENT_BUFFER because we pass a 0-sized buffer")
+	}
+	if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) {
+		return 0, fmt.Errorf("GetTokenInformation size query failed with something other than ERROR_INSUFFICIENT_BUFFER: %w", err)
+	}
+	if needed == 0 {
+		return 0, errors.New("GetTokenInformation size query reported a required size of 0 bytes")
 	}
 
 	buf := make([]byte, needed)
@@ -2296,6 +2312,8 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 
 	// TOKEN_MANDATORY_LABEL header is 16 bytes on 64-bit (pointer + attributes + padding)
 	const headerSize = 16
+	// SID_MAX_SUB_AUTHORITIES
+	const maxSIDSubAuthorities = 15
 	lenb := len(buf)
 	if lenb < headerSize+8 { // + min SID header
 		return 0, fmt.Errorf("buffer too small: %s", humanBytes(uintptr(lenb)))
@@ -2309,8 +2327,8 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	//subCountPtr := (*uint8)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[headerSize])) + 1))
 	subCountPtr := (*uint8)(unsafe.Add(unsafe.Pointer(&buf[headerSize]), 1))
 	subCount := *subCountPtr
-	if subCount == 0 {
-		return 0, fmt.Errorf("invalid subauthority count: 0")
+	if subCount == 0 || subCount > maxSIDSubAuthorities {
+		return 0, fmt.Errorf("invalid SID subauthority count: %d (valid range is 1..%d)", subCount, maxSIDSubAuthorities)
 	}
 
 	// SubAuthority array starts at offset 8 from SID base
@@ -2320,7 +2338,7 @@ func processIntegrityLevel(pid uint32) (uint32, error) { // grok 4.1 fast thinki
 	//ridOffset := uintptr(subCount-1) * 4
 	//ridPtr := (*uint32)(unsafe.Pointer(subAuthBase + ridOffset))
 	//ridPtr := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[headerSize])) + 8 + (uintptr(subCount-1) * 4))) //this is fine
-	offset := uintptr(8 + (subCount-1)*4)
+	offset := 8 + uintptr(subCount-1)*4
 	if requiredLen := headerSize + int(offset) + 4; requiredLen > lenb {
 		return 0, fmt.Errorf("SID subauthority count %d would read past end of token-information buffer (need %d bytes, have %d)", subCount, requiredLen, lenb)
 	}
@@ -3019,6 +3037,13 @@ const (
 	settingsLineKeyValue
 )
 
+// splitSettingsLines splits raw settings-file contents into lines, tolerating a leading UTF-8 BOM
+// (added by Notepad and friends, which would otherwise corrupt the first line's key).
+// CRLF is handled by parseSettingsLine's TrimSpace.
+func splitSettingsLines(data []byte) []string {
+	return strings.Split(strings.TrimPrefix(string(data), "\ufeff"), "\n")
+}
+
 // parseSettingsLine is the single place that understands the settings
 // file's line syntax, shared by loadSettings and
 // readPersistedDisableFileLoggingEarly. key/val are only meaningful for
@@ -3078,7 +3103,7 @@ func loadSettings() settingsLoadResult {
 	valid := make(map[string]bool, len(persistedSettings))
 	unparsable := make(map[string]bool)
 
-	for lineNum, rawLine := range strings.Split(string(data), "\n") {
+	for lineNum, rawLine := range splitSettingsLines(data) {
 		key, val, kind := parseSettingsLine(rawLine)
 		switch kind {
 		case settingsLineIgnorable:
@@ -3227,7 +3252,7 @@ func readPersistedDisableFileLoggingEarly() {
 	}
 
 	const wantedKey = "disableFileLogging"
-	for _, rawLine := range strings.Split(string(data), "\n") {
+	for _, rawLine := range splitSettingsLines(data) {
 		key, val, kind := parseSettingsLine(rawLine)
 		if kind != settingsLineKeyValue || key != wantedKey {
 			continue
@@ -3549,51 +3574,53 @@ func clearGestureCursor() {
 
 /* ---------------- Drag Logic ---------------- */
 
-func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery, wasMaximized bool, preRestoreRect wincoe.RECT) bool {
+// prepareWindowRectForGesture is the shared first step of every move/resize gesture: if hwnd is
+// maximized it is restored (and repositioned so the cursor keeps its proportional spot), then the
+// rect the gesture must baseline against is returned. wasMaximized stays true even if the cursor
+// alignment had to be skipped, so ESC can still re-maximize the window afterwards.
+//
+// ShowWindow(SW_RESTORE) and SetWindowPos send messages to the target synchronously and this
+// runs on the hook thread, so a maximized target that doesn't answer a ping promptly is refused
+// (error) instead of risking a stalled global hook.
+func prepareWindowRectForGesture(hwnd windows.Handle, pt wincoe.POINT) (r wincoe.RECT, wasMaximized bool, err error) {
+	wasMaximized = isMaximized(hwnd)
+
+	var preRestoreRect wincoe.RECT
+	canAlignToCursor := false
+	if wasMaximized {
+		if pingErr := wincoe.PingWindow(hwnd, HungWindowTimeout); pingErr != nil {
+			return wincoe.RECT{}, false, fmt.Errorf("prepareWindowRectForGesture: not restoring maximized HWND=0x%X: %w", hwnd, pingErr)
+		}
+		if res := wincoe.GetWindowRect(hwnd, &preRestoreRect); res.Failed() {
+			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", hwnd, res.Err)
+		} else {
+			canAlignToCursor = true
+		}
+		_ = wincoe.ShowWindow(hwnd, wincoe.SW_RESTORE) // return value is only the prior visibility state
+	}
+
+	if res := wincoe.GetWindowRect(hwnd, &r); res.Failed() {
+		return wincoe.RECT{}, wasMaximized, fmt.Errorf("prepareWindowRectForGesture: GetWindowRect on HWND=0x%X failed: %w", hwnd, res.Err)
+	}
+
+	if canAlignToCursor {
+		r = alignRestoredWindowToCursor(pt, preRestoreRect, r)
+		if res := wincoe.SetWindowPos(hwnd, 0, r.Left, r.Top, 0, 0,
+			wincoe.SWP_NOSIZE|wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
+		); res.Failed() {
+			logf("SetWindowPos (post-restore alignment) on HWND=0x%X failed: %v; re-reading rect for a consistent gesture origin", hwnd, res.Err)
+			if res2 := wincoe.GetWindowRect(hwnd, &r); res2.Failed() {
+				logf("GetWindowRect (post-SetWindowPos failure) on HWND=0x%X also failed: %v", hwnd, res2.Err)
+			}
+		}
+	}
+	return r, wasMaximized, nil
+}
+
+func startManualDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery, wasMaximized bool, r wincoe.RECT) bool {
 	if cur := activeSession.Load(); cur != nil {
 		logf("unexpected startManualDrag while already having an activeSession(either drag-move or resizing) mode:%d", cur.mode)
 		return false
-	}
-
-	var r wincoe.RECT
-	//procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r)))
-	if res1 := wincoe.GetWindowRect(hwnd, &r); res1.Failed() {
-		logf("GetWindowRect on target HWND=0x%X failed for move startup, err:%v", hwnd, res1.Err)
-		return false
-	}
-
-	if wasMaximized {
-		// Compute a top-left so the cursor sits at the same proportional
-		// position within the restored window as it had within the maximized one.
-		r = alignRestoredWindowToCursor(pt, preRestoreRect, r)
-		// Reposition immediately, before the first WM_MOUSEMOVE arrives.
-		// if res := procSetWindowPos.Call(
-		// 	uintptr(hwnd),
-		// 	0, // ignored due to SWP_NOZORDER
-		// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		// 	uintptr(r.Left),
-		// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		// 	uintptr(r.Top),
-		// 	0, 0, // ignored due to SWP_NOSIZE
-		// 	SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
-		// ); res.Failed() {
-		if res := wincoe.SetWindowPos(
-			hwnd,
-			0, // ignored due to SWP_NOZORDER
-			r.Left,
-			r.Top,
-			0, 0, // ignored due to SWP_NOSIZE
-			wincoe.SWP_NOSIZE|wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
-		); res.Failed() {
-			logf("SetWindowPos (post-restore alignment) on HWND=0x%X failed: %v; re-reading rect for consistent drag origin", hwnd, res.Err)
-			// Re-read the rect so startPt arithmetic stays consistent with
-			// wherever the window actually landed.
-			//if res2 := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&r))); res2.Failed() {
-			if res2 := wincoe.GetWindowRect(hwnd, &r); res2.Failed() {
-				logf("GetWindowRect (post-SetWindowPos failure) on HWND=0x%X also failed: %v", hwnd, res2.Err)
-				// r is still the aligned value; better than nothing.
-			}
-		}
 	}
 
 	insetL, insetT, insetR, insetB := windowVisualEdgeInsets(hwnd)
@@ -3633,21 +3660,12 @@ func startDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery bo
 		logf("startDrag:processIntegrityLevel failed, but continuing, err was: %v", e1)
 	}
 
-	var preRestoreRect wincoe.RECT
-	wasMaximized := isMaximized(hwnd)
-	if wasMaximized {
-		// Capture the maximized rect before restoring so alignRestoredWindowToCursor
-		// can compute the proportional cursor position within the restored window.
-		//if res := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&preRestoreRect))); res.Failed() {
-		if res := wincoe.GetWindowRect(hwnd, &preRestoreRect); res.Failed() {
-			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", hwnd, res.Err)
-			wasMaximized = false // skip alignment rather than use a zero rect
-		}
-		//_ = procShowWindow.Call(uintptr(hwnd), SW_RESTORE)
-		_ = wincoe.ShowWindow(hwnd, wincoe.SW_RESTORE)
-		//TODO: should I re-maximize if it was maximized, after drag/move is done? probably not!
+	r, wasMaximized, err := prepareWindowRectForGesture(hwnd, pt)
+	if err != nil {
+		logf("startDrag: %v", err)
+		return false
 	}
-	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, preRestoreRect)
+	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, r)
 }
 
 // applyFocusAndBringToFrontOnGestureStart optionally brings targetWnd to the
@@ -3805,7 +3823,7 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDown bool) (started, bypassed bool) {
 	wantTargetWnd, res0 := wincoe.RootWindowFromPoint(pt)
 	if wantTargetWnd == 0 {
-		logf("Invalid window(tryBeginMoveGestureAt:RootWindowFromPoint res:%v), window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)", res0)
+		logf("Invalid window(tryBeginResizeGestureAt:RootWindowFromPoint res:%v), window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)", res0)
 		return false, false
 	}
 
@@ -3838,58 +3856,10 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		softReset(true)
 	}
 
-	// Capture the maximized rect before restoring so alignRestoredWindowToCursor
-	// can compute the proportional cursor position within the restored window.
-	var preRestoreRect wincoe.RECT
-	wasMaximized := isMaximized(wantTargetWnd)
-
-	if wasMaximized {
-		// if res := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&preRestoreRect))); res.Failed() {
-		if res := wincoe.GetWindowRect(wantTargetWnd, &preRestoreRect); res.Failed() {
-			logf("GetWindowRect (pre-restore) on HWND=0x%X failed: %v; cursor alignment after restore will be skipped", wantTargetWnd, res.Err)
-			wasMaximized = false // skip alignment rather than use a zero rect
-		}
-
-		// Restore the window first so the resize starts from, and is measured
-		// against, the non-maximized rect. Without this the OS leaves the window
-		// in a mixed state (visually resized but still flagged as maximized).
-		//_ = procShowWindow.Call(uintptr(wantTargetWnd), SW_RESTORE)
-		_ = wincoe.ShowWindow(wantTargetWnd, wincoe.SW_RESTORE)
-	}
-
-	var r wincoe.RECT
-	//res1 := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r)))
-	if res1 := wincoe.GetWindowRect(wantTargetWnd, &r); res1.Failed() {
-		logf("GetWindowRect on target HWND=0x%X failed(ret is 0) for resize startup, err:%v", wantTargetWnd, res1.Err)
+	r, wasMaximized, err := prepareWindowRectForGesture(wantTargetWnd, pt)
+	if err != nil {
+		logf("tryBeginResizeGestureAt: %v", err)
 		return false, false
-	}
-
-	// Reposition the restored window under the cursor BEFORE setting up the resize session
-	if wasMaximized {
-		r = alignRestoredWindowToCursor(pt, preRestoreRect, r)
-		// if res := procSetWindowPos.Call(
-		// 	uintptr(wantTargetWnd),
-		// 	0, // ignored due to SWP_NOZORDER
-		// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		// 	uintptr(r.Left),
-		// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-		// 	uintptr(r.Top),
-		// 	0, 0, // ignored due to SWP_NOSIZE
-		// 	SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE,
-		if res := wincoe.SetWindowPos(
-			wantTargetWnd,
-			0, // ignored due to SWP_NOZORDER
-			r.Left,
-			r.Top,
-			0, 0, // ignored due to SWP_NOSIZE
-			wincoe.SWP_NOSIZE|wincoe.SWP_NOZORDER|wincoe.SWP_NOACTIVATE,
-		); res.Failed() {
-			logf("SetWindowPos (post-restore alignment) on HWND=0x%X failed: %v; re-reading rect for consistent resize origin", wantTargetWnd, res.Err)
-			//if res2 := procGetWindowRect.Call(uintptr(wantTargetWnd), uintptr(unsafe.Pointer(&r))); res2.Failed() {
-			if res2 := wincoe.GetWindowRect(wantTargetWnd, &r); res2.Failed() {
-				logf("GetWindowRect (post-SetWindowPos failure) on HWND=0x%X also failed: %v", wantTargetWnd, res2.Err)
-			}
-		}
 	}
 
 	w := r.Right - r.Left
@@ -4803,29 +4773,17 @@ func isWindowFullscreenOnMonitor(hwnd windows.Handle) bool {
 	}
 
 	// 4. STYLE TIE-BREAKER: It fills the screen, but is it just a maximized window?
-	if style, err := getWindowLongPtr(hwnd, wincoe.GWL_STYLE); err != nil {
-		logf("isWindowFullscreenOnMonitor:GetWindowLongPtr GWL_STYLE failed: %v", err)
-		// Fallback: if style check fails but it fills the screen, err on the side of caution
+	style, _, styleErr := wincoe.GetWindowStyleAndExStyle(hwnd)
+	if styleErr != nil {
+		logf("isWindowFullscreenOnMonitor: %v", styleErr)
+		// Fallback: if the style check fails but it fills the screen, err on the side of caution
 		return true
-	} else { //nolint:gocritic // elseif: can replace 'else {if cond {}}' with 'else if cond {}' (gocritic) // no it can't: i need the comment!
-		// If it fills the screen AND has a caption, it's just a normal maximized window
-		// (likely bleeding over the edges due to an auto-hidden taskbar).
-		if (style & wincoe.WS_CAPTION) == wincoe.WS_CAPTION {
-			//Checking GetWindowPlacement's ShowCmd (via
-			// isMaximized, already used elsewhere in this file) is more reliable
-			// than inferring from the WS_CAPTION style bit: some borderless-fullscreen
-			// games/apps hide their frame via other means (SetWindowRgn, DWM
-			// composition attributes) while still leaving WS_CAPTION set in their
-			// style, which would make a WS_CAPTION-only check false-negative --
-			// failing to bypass gestures for exactly the games this feature targets.
-			// A window that reached SW_MAXIMIZE natively (double-click titlebar,
-			// Win+Up, snap-to-maximize) is the "just a normal maximized window"
-			// case (its rect often bleeds slightly past the monitor edges due to
-			// the invisible resize border, which isSpanningMonitor's >=/<= already
-			// tolerates); anything else that still spans the monitor is treated as
-			// fullscreen (exclusive or borderless), regardless of its style bits.
-			return !isMaximized(hwnd)
-		}
+	}
+	// Fills the screen AND has a caption: a normal maximized window (rect bleeding past the edges)
+	// unless it is NOT natively maximized, in which case treat it as fullscreen/borderless regardless
+	// of its style bits (keep your existing long comment about SetWindowRgn/DWM here if you like).
+	if style&wincoe.WS_CAPTION == wincoe.WS_CAPTION {
+		return !isMaximized(hwnd)
 	}
 
 	// It fills the screen and does NOT have a caption (Chrome, Firefox F11, Games, etc.)
@@ -4936,64 +4894,6 @@ func focusThisHwnd(target windows.Handle) (gotFocused bool) {
 	return setForegroundWindow(target, "failed SetForegroundWindow")
 }
 
-func getWindowLongPtr(hwnd windows.Handle, index int32) (uintptr, error) {
-	if hwnd == 0 {
-		return 0, fmt.Errorf("getWindowLongPtr: hwnd is 0")
-	}
-
-	// //to prevent preemption and running of another goroutine between procSetLastError and procGetWindowLongPtrW, must LockOsThread()
-	// runtime.LockOSThread()
-	// defer runtime.UnlockOSThread()
-	// /*
-	// 		The documented pattern is:
-
-	// 	Clear last error.
-	// 	Call GetWindowLongPtrW.
-	// 	If return value is 0, call GetLastError.
-	// 	If error is non-zero → failure.
-	// 	If error is zero → success, because the actual value was legitimately zero.
-	// */
-
-	// // Clear last error so we can detect real failure
-	// //windows.SetLastError(0)
-	// // Clear last error so we can detect real failure
-	// _ = procSetLastError.Call(0) //You scrubbed the thread's error state clean. Since lasterror is stored in TLS aka thread local storage
-	// //windows.SetLastError(0)
-
-	//as per https://github.com/golang/go/issues/41220 there's no need to call setlasterror because it happens automatically!
-	// res1 := procGetWindowLongPtrW.Call( //it's a CheckNone so res1.Err is nil
-	// 	uintptr(hwnd),
-	// 	// #nosec G115 -- safe: Win32 ABI expects negative offsets to be cast to uintptr
-	// 	uintptr(index),
-	// ) //Go executes the C code and atomically grabs LastError before anything else can touch it. as the 3rd arg well as res1.CallStatus !
-	//ret := res1.R1
-	//Do NOT trust the third return from .Call
-	//You did the right thing ignoring it. For many Win32 APIs it is unreliable.
-
-	// Important edge case:
-	// GetWindowLongPtr can legally return 0 even on success.
-	// The only reliable failure signal is GetLastError.
-	// if ret == 0 {
-	if res1 := wincoe.GetWindowLongPtrW(hwnd, index); res1.Failed() {
-		//lastErr := windows.GetLastError() //XXX: so, needed! probably the only case so far! NO, this is always 0/nil because each syscall(which this is) from Go will setlasterr(0) first, as per https://github.com/golang/go/issues/41220
-		// lastErr := res1.CallStatus
-		/*
-				Why windows.GetLastError() is Tricky
-			In Go's golang.org/x/sys/windows package, windows.GetLastError() returns an error interface type (under the hood, it’s a windows.Errno).
-			If the underlying Windows API reports 0 (which matches ERROR_SUCCESS), Go's windows package translates this to a literal nil error interface, not an error object containing ERROR_SUCCESS.
-			Therefore, you will never get an error object where errors.Is(err, windows.ERROR_SUCCESS) evaluates to true, because by the time it reaches your code, a success is just a plain old nil.
-		*/
-		// GetLastError returns nil if the last error code is 0 (ERROR_SUCCESS)
-		// if lastErr != nil { //&& !errors.Is(lastErr, windows.ERROR_SUCCESS) {//
-		return 0, fmt.Errorf("GetWindowLongPtrW failed: %w", res1.Err)
-		// //nolint:wrapcheck
-		// return 0, lastErr
-		// }
-	} else {
-		return res1.R1, nil
-	}
-}
-
 func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 	ret = true
 	if hwnd == 0 {
@@ -5001,27 +4901,12 @@ func shouldSkipFocusingIt(hwnd windows.Handle) (ret bool, reason string) {
 		return
 	}
 
-	// 2. Read styles
-	// style, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_STYLE))
-	// exStyle, _, _ := procGetWindowLongPtr.Call(uintptr(hwnd), uintptr(GWL_EXSTYLE))
-	style, err := getWindowLongPtr(hwnd, wincoe.GWL_STYLE)
+	s, ex, err := wincoe.GetWindowStyleAndExStyle(hwnd)
 	if err != nil {
-		logf("GetWindowLongPtr GWL_STYLE failed: %v", err)
-		reason = "GetWindowLongPtr GWL_STYLE failed"
+		logf("shouldSkipFocusingIt: %v", err)
+		reason = "reading the window styles failed"
 		return
 	}
-
-	exStyle, err := getWindowLongPtr(hwnd, wincoe.GWL_EXSTYLE)
-	if err != nil {
-		logf("GetWindowLongPtr GWL_EXSTYLE failed: %v", err)
-		reason = "GetWindowLongPtr GWL_EXSTYLE failed"
-		return
-	}
-
-	// #nosec G115 -- safe: Win32 window styles are 32-bit bitmasks
-	s := uint32(style)
-	// #nosec G115 -- safe: Win32 extended window styles are 32-bit bitmasks
-	ex := uint32(exStyle)
 
 	// Child windows cannot be foreground windows
 	if s&wincoe.WS_CHILD != 0 {
@@ -6560,7 +6445,8 @@ func handleActualMoveOrResize(data WindowMoveData, bypassThrottle bool) {
 	// 1. RATE LIMIT: Don't hit the OS more than once every 10-16ms (approx 60-100Hz)
 	// Most monitors are 60Hz-144Hz. Anything faster than 10ms is wasted CPU.
 	// If bypassed (e.g. from a coalesced batch), we MUST apply it so we don't drop the final state.
-	if !bypassThrottle && ShouldThrottle() {
+	// Z-order actions are one-shot commands, never interchangeable position snapshots: never throttle them.
+	if !bypassThrottle && data.ZOrderAction == zOrderActionNone && ShouldThrottle() {
 		// dropped because of execution speed limit
 		droppedMoveOrResizeEvents.Add(1) //TODO: so this was queued but decided not to do the action, maybe we need a diff. counter for each kind of dropped type/reason?
 		abandonPendingZOrderAction(data)
@@ -6764,15 +6650,14 @@ func executeMoveOrResize(data WindowMoveData) {
 
 		session := activeSession.Load()
 		if session != nil {
-			//session := *ptr // noneedTODO: use this on-stack thing for other session:=activeSession.Load() places; so this was for "The compiler can then perform an optimization called Register Promotion. It can load your entire struct's fields directly into CPU registers (RAX, RBX, etc.)."
 			if session.mode != ModeResize {
-				//if !resizing.Load() {
-				logf("delayed resizing detected, while not 'resizing'.")
+				logf("delayed resizing detected while a %v gesture is now active on HWND=0x%X; not touching the overlay", session.mode, session.targetWnd)
+			} else {
+				// originalRect, not state.startRect: the latter is rebaselined on every Shift-mirror toggle.
+				startW := session.originalRect.Right - session.originalRect.Left
+				startH := session.originalRect.Bottom - session.originalRect.Top
+				updateOverlay(nx, ny, nw, nh, startW, startH)
 			}
-			//update overlay
-			startW := session.state.startRect.Right - session.state.startRect.Left
-			startH := session.state.startRect.Bottom - session.state.startRect.Top
-			updateOverlay(nx, ny, nw, nh, startW, startH)
 			// } else {
 			// 	logf("did a resize but the overlay wasn't updated/shown due to gesture wasn't in effect anymore.")
 		}
@@ -8550,7 +8435,8 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 	// Key DOWN
 	if wParam == wincoe.WM_KEYDOWN || wParam == wincoe.WM_SYSKEYDOWN {
-		if vk == wincoe.VK_ESCAPE && tryCancelActiveGestureViaEsc() {
+		if vk == wincoe.VK_ESCAPE && (tryCancelActiveGestureViaEsc() || escDownSwallowed.Load()) {
+			escDownSwallowed.Store(true)
 			// Swallow ESC entirely: the target window under an in-progress
 			// winkey+LMB/RMB gesture never saw the original button-down (it
 			// was swallowed at gesture start -- see mouseProc's
@@ -8572,6 +8458,9 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 	// Key UP
 	if wParam == wincoe.WM_KEYUP || wParam == wincoe.WM_SYSKEYUP {
+		if vk == wincoe.VK_ESCAPE && escDownSwallowed.CompareAndSwap(true, false) {
+			return 1 // balance the ESC down we swallowed
+		}
 		if vk == wincoe.VK_SHIFT || vk == wincoe.VK_LSHIFT || vk == wincoe.VK_RSHIFT {
 			postShiftMirrorToggleIfNeeded(false)
 		}
@@ -8645,7 +8534,13 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			if requireWinDownHeldDuringGesture.Load() {
 				if session := activeSession.Load(); session != nil {
 					logf("keyboardProc: real winkey-up observed while a %v gesture on HWND=0x%X is still active; stopping it immediately", session.mode, session.targetWnd)
-					hardReset(true)
+					// softReset, NOT hardReset: winGestureUsed must stay set so the swallow +
+					// WM_INJECT_SEQUENCE path below still runs (hardReset would inject its own RCtrl
+					// tap from this hook thread, based on the stale GetAsyncKeyState, and clear the flag).
+					// Acting here on the one event that unambiguously IS the transition also makes us
+					// independent of a later GetAsyncKeyState poll that a third-party keyboard-capture
+					// layer (e.g. VirtualBox's Auto capture keyboard) can leave permanently stale.
+					softReset(true)
 				}
 			}
 
@@ -8733,35 +8628,6 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					logf("keyboardProc: PostMessage WM_INJECT_SEQUENCE at end of gesture, failed, mainMsgHwnd was 0")
 				}
 
-				// requireWinDownHeldDuringGesture's own WM_MOUSEMOVE check
-				// (mouseProc's ModeMove/ModeResize cases) normally detects
-				// "winkey was released mid-gesture" REACTIVELY, by polling
-				// keyDown(VK_LWIN)/keyDown(VK_RWIN) -- i.e. GetAsyncKeyState
-				// -- on the next mouse move. That polled state can be left
-				// permanently wrong by a THIRD-PARTY application's own
-				// keyboard-capture layer -- observed concretely with
-				// VirtualBox's "Auto capture keyboard" setting, which can
-				// swallow keyboard events (including our own synthetic
-				// winkey-up compensation injected just above via
-				// WM_INJECT_SEQUENCE -> injectShiftTapThenWinUp) into the
-				// guest while its window has focus, leaving
-				// GetAsyncKeyState(VK_LWIN/VK_RWIN) stuck reporting "down"
-				// indefinitely even though the user's REAL, physical
-				// winkey-up -- the one THIS handler is processing right
-				// now -- has already genuinely happened. Since we ourselves
-				// unambiguously just observed that real transition
-				// (regardless of what any other application's hook does
-				// with our synthetic re-injection afterward), stop any
-				// currently active gesture immediately and directly here,
-				// rather than depending on that polling to ever correctly
-				// notice.
-				if requireWinDownHeldDuringGesture.Load() {
-					if session := activeSession.Load(); session != nil {
-						logf("keyboardProc: real winkey-up observed while a %v gesture on HWND=0x%X is still active; stopping it immediately rather than relying on a later GetAsyncKeyState poll (which a third-party keyboard-capture layer, e.g. VirtualBox's Auto capture keyboard, can leave permanently stale)", session.mode, session.targetWnd)
-						hardReset(true)
-					}
-				}
-
 				return 1 // eat this winUP here(by returning non-zero!), else the injects are queued after it, so it opens Start right after this !
 				/* well crap:
 								Explorer / the shell ignores injected keyboard events when deciding whether to open Start.
@@ -8806,6 +8672,7 @@ func assertStructSizes() {
 	const (
 		expectedINPUT      uintptr = 40 // sizeof(INPUT) on x64: 4 type + 4 pad + 32 union
 		expectedKEYBDINPUT uintptr = 24 // sizeof(KEYBDINPUT) on x64: with 8-byte DwExtraInfo
+		expectedMOUSEINPUT uintptr = 32 // sizeof(MOUSEINPUT) on x64; mouseInputView reinterprets Ki+tail padding as this
 	)
 
 	if got := unsafe.Sizeof(wincoe.KEYANDMOUSE_INPUT{}); got != expectedINPUT {
@@ -8818,6 +8685,12 @@ func assertStructSizes() {
 		badprogramming(fmt.Sprintf(
 			"KEYBDINPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d",
 			got, expectedKEYBDINPUT,
+		))
+	}
+	if got := unsafe.Sizeof(wincoe.MOUSEINPUT{}); got != expectedMOUSEINPUT {
+		badprogramming(fmt.Sprintf(
+			"MOUSEINPUT ABI size mismatch: Go struct is %d bytes, Win32 x64 expects %d",
+			got, expectedMOUSEINPUT,
 		))
 	}
 }
@@ -9087,6 +8960,7 @@ func ensureSingleInstance(name string, scope MutexScope) {
 	}
 	//didn't fail, succeeded, but GetLastError() aka res1.CallStatus can still be set:
 	if res1.CallStatusIs(windows.ERROR_ALREADY_EXISTS) {
+		closeHandleLogged(&mH, "ensureSingleInstance: handle to the already-existing mutex")
 		exitf(5, "Application '%s' is already running.", name)
 	}
 
@@ -9930,7 +9804,7 @@ func humanBytes(bytes uintptr) string {
 		div *= unit
 		exp++
 	}
-	suffix := []string{"KiB", "MiB", "GiB", "TiB"}[exp]
+	suffix := []string{"KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}[exp]
 	return fmt.Sprintf("%.2f %s", float64(bytes)/float64(div), suffix)
 }
 
@@ -9945,7 +9819,9 @@ func withCommas(n uint64) string {
 func withCommasSigned(n int64) string {
 	s := strconv.FormatInt(n, 10)
 	if n < 0 {
-		return "-" + withCommasSigned(-n)
+		// -(n+1)+1 == |n| without overflowing on math.MinInt64
+		// #nosec G115 -- safe: n < 0 so -(n+1) >= 0
+		return "-" + withCommas(uint64(-(n+1))+1)
 	}
 	for i := len(s) - 3; i > 0; i -= 3 {
 		s = s[:i] + "," + s[i:]
@@ -10466,7 +10342,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 		title := getWindowTextFast(rootHwnd)
 		procName := getProcessNameFast(pid)
 		class, res2 := wincoe.GetClassName(targetHwnd)
-		// if (event == EVENT_SYSTEM_CAPTURESTART) || (event == EVENT_SYSTEM_CAPTUREEND) { // yes it does have focus, even tho EVENT_SYSTEM_FOREGROUND is never sent! see caveats1.txt
+		// if (event == EVENT_SYSTEM_CAPTURESTART) || (event == EVENT_SYSTEM_CAPTUREEND) { // yes it does have focus, even tho EVENT_SYSTEM_FOREGROUND is never sent! see caveat1.txt
 		//	focusedHwnd := getForegroundWindow()
 		// 	if focusedHwnd == hwnd || focusedHwnd == rootHwnd {
 		// 		logf("at %s, the foreground window 0x%X is the same one that caused this event 0x%X or its rootHwnd 0x%X !", eventName, focusedHwnd, hwnd, rootHwnd)
@@ -10539,7 +10415,7 @@ func winEventProc(hWinEventHook windows.Handle, event uint32, hwnd windows.Handl
 						fireCount := reconciliationFireCount.Add(1)
 						reason = fmt.Sprintf("reconciliation via %s (fire #%d; should only happen once, the first time after just started %s)", reason, fireCount, selfName)
 						if fireCount > 1 {
-							logf("WARNING(for dev.): the GetForegroundWindow()-reconciliation workaround (see caveats1.txt) has now fired %d times this run; it was expected to fire at most once.", fireCount)
+							logf("WARNING(for dev.): the GetForegroundWindow()-reconciliation workaround (see caveat1.txt) has now fired %d times this run; it was expected to fire at most once.", fireCount)
 						}
 					}
 					logf("Foreground regained a non-blocking integrity level (HWND=0x%x, PID=%d, IL=0x%x) [%s] after previously being blocked by a higher-integrity window; arming missed-gesture recovery check for the next mouse move.", targetHwnd, pid, targetIL, reason)
@@ -10623,7 +10499,7 @@ func getWindowTextFast(hwnd windows.Handle) string {
 		}
 		return "" // genuinely empty title, not a failure
 	}
-	return windows.UTF16ToString(buf[:length])
+	return windows.UTF16ToString(buf[:min(int(length), len(buf))])
 }
 
 // Package-level. Non-nil = capture is currently held for that session pointer.

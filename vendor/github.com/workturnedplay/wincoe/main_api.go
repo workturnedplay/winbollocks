@@ -2659,9 +2659,23 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	serviceInFlight[targetPID] = inFlight
 	serviceInFlightMu.Unlock()
 
+	// Whatever happens below, including a panic inside the lookup, the in-flight entry MUST be
+	// removed and done MUST be closed, or every later caller for this PID joins a flight that never lands.
+	finished := false
+	defer func() {
+		if !finished {
+			inFlight.err = fmt.Errorf("GetServiceNamesFromPIDCached: the lookup for PID %d panicked or was aborted before producing a result", targetPID)
+		}
+		serviceInFlightMu.Lock()
+		delete(serviceInFlight, targetPID)
+		serviceInFlightMu.Unlock()
+		close(inFlight.done)
+	}()
+
 	names, err := GetServiceNamesFromPIDUncached(targetPID)
 	inFlight.names = names
 	inFlight.err = err
+	finished = true
 
 	if err == nil {
 		serviceCacheMu.Lock()
@@ -2679,25 +2693,6 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 		}
 		serviceCacheMu.Unlock()
 	}
-
-	// Remove ourselves from the in-flight map before broadcasting, so that
-	// as soon as waiters wake up, a fresh caller either sees the (already
-	// updated, on success) cache entry or is free to start a brand-new
-	// lookup rather than incorrectly rejoining a completed one.
-	//
-	// NOTE: there's a narrow, benign race on the failure path (err != nil,
-	// so the cache is intentionally NOT updated): a caller arriving between
-	// the delete below and the close(inFlight.done) broadcast finds neither
-	// a fresh cache entry nor an in-flight lookup, and starts its own
-	// redundant GetServiceNamesFromPIDUncached call. That's an acceptable,
-	// rare duplicate call — the same trade-off any singleflight-style
-	// "forget" step makes — and is categorically better than every
-	// concurrent caller stampeding the SCM on every miss.
-	serviceInFlightMu.Lock()
-	delete(serviceInFlight, targetPID)
-	serviceInFlightMu.Unlock()
-
-	close(inFlight.done)
 
 	return names, err
 }
@@ -3345,8 +3340,8 @@ func writeStagingFileWithRetry(tmpName string, data []byte, perm os.FileMode, ma
 		syncErr := tmpFile.Sync()
 		closeErr := tmpFile.Close()
 
-		if writeErr != nil || syncErr != nil || closeErr != nil {
-			return fmt.Errorf("write/sync/close failed (write=%w sync=%w close=%w)", writeErr, syncErr, closeErr)
+		if joined := errors.Join(writeErr, syncErr, closeErr); joined != nil {
+			return fmt.Errorf("write/sync/close of staging file %q failed: %w", tmpName, joined)
 		}
 		return nil
 	})
@@ -4682,7 +4677,7 @@ func MonitorFromWindow(hwnd windows.Handle, dwFlags uint32) windows.Handle {
 // GetMonitorInfo retrieves information about a display monitor.
 func GetMonitorInfo(hMonitor windows.Handle, lpmi *MONITORINFO) WinResult {
 	if lpmi == nil {
-		return WinResult{R1: 0, Err: windows.ERROR_INVALID_PARAMETER}
+		return WinResult{R1: 0, Err: fmt.Errorf("GetMonitorInfo: nil MONITORINFO pointer: %w", windows.ERROR_INVALID_PARAMETER)}
 	}
 
 	// Windows requires CbSize to be pre-set to sizeof(MONITORINFO)
@@ -5109,7 +5104,7 @@ func LoadIcon(hInstance windows.Handle, lpIconName *uint16) (windows.Handle, Win
 func LoadIconByName(hInstance windows.Handle, name string) (windows.Handle, WinResult) {
 	namePtr, err := windows.UTF16PtrFromString(name)
 	if err != nil {
-		return 0, WinResult{Err: err}
+		return 0, WinResult{Err: fmt.Errorf("LoadIconByName: converting %q to UTF-16: %w", name, err)}
 	}
 	return LoadIcon(hInstance, namePtr)
 }
@@ -5707,7 +5702,7 @@ func GetClassName(hwnd windows.Handle) (string, WinResult) {
 		return "", res1
 	}
 	// R1 is the length of the string copied (0 means failure)
-	return windows.UTF16ToString(buf[:res1.R1]), res1
+	return windows.UTF16ToString(buf[:min(int(res1.R1), len(buf))]), res1
 }
 
 // InternalGetWindowTextRaw returns the full WinResult for empty-title vs true-failure checks

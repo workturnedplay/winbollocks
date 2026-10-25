@@ -81,7 +81,7 @@ echo Running go vet for shadowing ...
 set "shade=%USERPROFILE%\go\bin\shadow.exe"
 :: Check if shadow.exe exists, if not, install it
 if not exist "%shade%" (
-    echo [!] shadow.exe not found. Installing via go install...
+    echo [^^!] shadow.exe not found. Installing via go install...
     "%goexe%" install golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow@latest
     
     :: Double check if installation actually succeeded
@@ -90,7 +90,7 @@ if not exist "%shade%" (
         exit /b 1
     )
 )
-"%goexe%"  vet -vettool="%shade%"
+"%goexe%"  vet !MOD_FLAG! -vettool="%shade%" ./...
 if errorlevel 1 goto :fail
 
 echo Running go vet on everything...
@@ -100,7 +100,7 @@ if errorlevel 1 goto :fail
 set "lintexe=%USERPROFILE%\go\bin\golangci-lint.exe"
 rem :: Check if golangci-lint.exe exists, if not, install it
 if not exist "%lintexe%" (
-    echo [!] golangci-lint.exe not found. Installing via go install...
+    echo [^^!] golangci-lint.exe not found. Installing via go install...
     "%goexe%" install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
     
     :: Double check if installation actually succeeded
@@ -112,21 +112,21 @@ if not exist "%lintexe%" (
 echo Checking if lint file .golangci.yml is valid
 rem Only v1.68+ requires internet now: "Failed executing command with error: [..\.golangci.yml] validate: compile schema: failing loading "https://golangci-lint.run/jsonschema/golangci.v1.64.jsonschema.json": Get "https://golangci-lint.run/jsonschema/golangci.v1.64.jsonschema.json": dial tcp: lookup golangci-lint.run: no such host"
 rem but this is supposed to be v2 so like: golangci-lint has version 2.12.3-0.20260726112511-6b2ddf922476
-"%lintexe%" config verify
+"%lintexe%" --color always config verify
 if errorlevel 1 goto :fail
 
 echo Running %lintexe% run !LINT_MOD_FLAG! ./...
-"%lintexe%" run !LINT_MOD_FLAG! ./...
+"%lintexe%" --color always run !LINT_MOD_FLAG! ./...
 if errorlevel 1 goto :fail
 
 
-echo Check succeeded.
-pause
+echo Check succeeded ^^!
+if NOT "%1" == "silent" pause
 goto :eof
 
 :fail
 echo.
 echo *** CHECK FAILED ***
-pause
+if NOT "%1" == "silent" pause
 exit /b 1
 

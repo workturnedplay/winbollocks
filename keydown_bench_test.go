@@ -32,6 +32,9 @@ func TestKeyDownAllocs(t *testing.T) {
 	})
 
 	t.Logf("keyDown: %.6f allocs/call", allocs)
+	if allocs != 0 {
+		t.Errorf("keyDown: expected 0 allocs/call, got %.6f", allocs)
+	}
 }
 
 func BenchmarkBoundProcKeyDown(b *testing.B) {

@@ -119,8 +119,8 @@ if "!COMPARE_RESULT!"=="0" (
     rem Check if Project > Installed (The "Future Version" problem)
     powershell -NoProfile -command "if ([version]'!PROJECT_VER!' -gt [version]'!INSTALLED_VER!') { exit 0 } else { exit 1 }" >nul 2>&1
     if !errorlevel! equ 0 (
-        echo [!] WARNING: go.mod wants !PROJECT_VER!, but you only have !INSTALLED_VER!.
-        echo [!] Go will attempt to download the toolchain now...
+        echo [^^!] WARNING: go.mod wants !PROJECT_VER!, but you only have !INSTALLED_VER!.
+        echo [^^!] Go will attempt to download the toolchain now...
         go version
         if !errorlevel! neq 0 (set "stage=Go version self-updating from the internet" & goto :failed)
     ) else (
@@ -138,7 +138,7 @@ if "!HAS_WORKSPACE!"=="1" (
       for /f "tokens=2" %%v in ('findstr /b "go " "!WS_PATH!"') do set "WORK_VER=%%v"
 
       if "!WORK_VER!"=="" (
-          echo [!] WARNING: go.work found but no 'go' version line detected. Skipping.
+          echo [^^!] WARNING: go.work found but no 'go' version line detected. Skipping.
       ) else (
           rem Validate the version string found in go.work
           set "CHECK_TARGET=!WORK_VER!"
@@ -194,6 +194,8 @@ pause
 exit /b 0
 
 :failed
+set "failcode=!errorlevel!"
+if "!failcode!"=="0" set "failcode=1"
 echo.
 echo ########################################
 echo ERROR: !stage! failed with exit code !errorlevel!.

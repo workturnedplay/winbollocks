@@ -46,7 +46,7 @@ if "!HAS_WORKSPACE!"=="1" (
 call .\prebuildcheck.bat silent
 if errorlevel 1 (
     echo.
-    choice /c NY /m "%lintexe% found issues. Stop build?"
+    choice /c NY /m "prebuildcheck.bat found issues. Stop build?"
     if errorlevel 2 goto :fail
 )
 

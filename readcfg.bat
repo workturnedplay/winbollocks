@@ -23,7 +23,7 @@ set "TMP_readcfg_dir=%~dp0"
 if "%TMP_readcfg_dir:~-1%"=="\" set "TMP_readcfg_dir=%TMP_readcfg_dir:~0,-1%"
 
 if /i "%CD%" NEQ "%TMP_readcfg_dir%" (
-    echo WARNING: Current working directory does NOT match readcfg.bat directory! This isn not supported yet, you have to put readcfg.* into same dir, that is, in: %CD%
+    echo WARNING: Current working directory does NOT match readcfg.bat directory! This is not supported yet, you have to put readcfg.* into same dir, that is, in: %CD%
     echo Press Ctrl+C to exit now or see lots of failures following due to this.
     echo Current CWD    : "%CD%"
     echo readcfg.bat DIR: "%TMP_readcfg_dir%"
@@ -128,7 +128,7 @@ if "!READCFG_PRIME!" == "DEBUG" (
   echo DEBUG is all done.
   pause
 )
-exit /b
+exit /b 0
 
 goto :after_trim
 

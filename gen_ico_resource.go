@@ -46,24 +46,34 @@ func main() {
 		fmt.Printf("Error writing %s: %v\n", icoFile.Name(), err)
 		os.Exit(1)
 	}
-	icoFile.Close()
+	if err := icoFile.Close(); err != nil {
+		fmt.Printf("Error closing %s: %v\n", icoFile.Name(), err)
+		os.Exit(1)
+	}
 	fmt.Printf("Successfully saved %s to disk.\n", icoFile.Name())
 
 	// 4. Set the icon as Resource ID 1 (Standard executable icon ID)
-	rs.SetIcon(winres.ID(1), icon)
+	if err := rs.SetIcon(winres.ID(1), icon); err != nil {
+		fmt.Printf("Error setting icon resource: %v\n", err)
+		os.Exit(1)
+	}
 
 	// 5. Write out the COFF object file for x64 Windows
-	sysoFile, err := os.Create("rsrc_windows_amd64.syso")
+	const sysoName = "rsrc_windows_amd64.syso"
+	sysoFile, err := os.Create(sysoName)
 	if err != nil {
-		fmt.Printf("Error creating .syso file %s, err: %v\n", sysoFile.Name(), err)
+		fmt.Printf("Error creating .syso file %s, err: %v\n", sysoName, err)
 		os.Exit(1)
 	}
-	defer sysoFile.Close()
-
 	if err := rs.WriteObject(sysoFile, winres.ArchAMD64); err != nil {
-		fmt.Printf("Error writing object %s: %v\n", sysoFile.Name(), err)
+		sysoFile.Close()
+		fmt.Printf("Error writing object %s: %v\n", sysoName, err)
+		os.Exit(1)
+	}
+	if err := sysoFile.Close(); err != nil {
+		fmt.Printf("Error closing %s: %v\n", sysoName, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Successfully generated %s\n", sysoFile.Name())
+	fmt.Printf("Successfully generated %s\n", sysoName)
 }
