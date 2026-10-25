@@ -125,12 +125,6 @@ rem set "iso_date=!DATE:~10,4!-!DATE:~4,2!-!DATE:~7,2!"
 rem set "iso_time=!TIME: =0!"
 rem set "ts=!iso_date!T!iso_time!"
 
-if "!ec!"=="130" (
-    echo time=!ts! "!exe_name!" exited with code 130 ^(sigint^) ie. via ctrl+break or ctrl+c - which to this bat file means we should be restarting it... ^(use alt+x to not do this next time^)
-    pause
-    goto run
-)
-
 if "!ec!"=="0" (
     echo time=!ts! "!exe_name!" finished successfully.
 ) else (
@@ -145,7 +139,9 @@ if "!ec!"=="0" (
 )
 pause
 
-rem Prevents falling into the subroutine during a normal sequential run
+exit /b !ec!
+
+rem Prevents falling into the subroutine during a normal sequential run, but the above exit takes precedence currently! left it here for future purposes.
 goto :eof
 
 :ignoreCtrlC

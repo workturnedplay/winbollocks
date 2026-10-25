@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -148,11 +149,25 @@ func isStubbornSendToBack(target windows.Handle) bool {
 // TOTALCMD64.EXE creates a top-level window of class "WorkerW". A failed class
 // or process lookup is treated as "no".
 func isDesktopHostWindow(hwnd windows.Handle) bool {
+	return isExplorerWindowOfClass(hwnd, "Progman", "WorkerW")
+}
+
+// isExplorerShellSurface reports whether hwnd is one of explorer's desktop-host
+// or taskbar windows: surfaces no gesture may ever move, resize or z-order.
+func isExplorerShellSurface(hwnd windows.Handle) bool {
+	return isExplorerWindowOfClass(hwnd, "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+}
+
+// isExplorerWindowOfClass reports whether hwnd's class is one of classes AND it
+// belongs to explorer.exe (class names alone are not enough, see
+// isDesktopHostWindow's doc comment). A failed class or process lookup is
+// treated as "no".
+func isExplorerWindowOfClass(hwnd windows.Handle, classes ...string) bool {
 	class, res := wincoe.GetClassName(hwnd)
 	if res.Failed() {
 		return false
 	}
-	if class != "Progman" && class != "WorkerW" {
+	if !slices.Contains(classes, class) {
 		return false
 	}
 	pid := getWindowPID(hwnd)

@@ -198,10 +198,10 @@ set "failcode=!errorlevel!"
 if "!failcode!"=="0" set "failcode=1"
 echo.
 echo ########################################
-echo ERROR: !stage! failed with exit code !errorlevel!.
+echo ERROR: !stage! failed with exit code !failcode!.
 echo ########################################
 pause
-exit /b !errorlevel!
+exit /b !failcode!
 
 
 rem shouldn't be reached:

@@ -2662,12 +2662,13 @@ func initTray() error {
 }
 
 func cleanupTray() {
+	trayIconMu.Lock()
+	defer trayIconMu.Unlock()
+
 	if trayIcon.HWnd == 0 {
 		// Never initialized or window creation failed — nothing to clean
 		return
 	}
-	trayIconMu.Lock()
-	defer trayIconMu.Unlock()
 
 	// Use the same trayIcon struct from initTray
 	trayIcon.UFlags = 0 // NIM_DELETE ignores most fields, but set to be safe
@@ -2976,16 +2977,14 @@ var persistedSettings = []persistedSetting{
 	},
 }
 
-// persistedSettingName returns the on-disk name registered for v, for the
-// "user changed ..." reason recorded in the settings file.
-func persistedSettingName(v *atomic.Bool) string {
+// findPersistedSetting returns the persistedSettings entry registered for v, or nil.
+func findPersistedSetting(v *atomic.Bool) *persistedSetting {
 	for i := range persistedSettings {
 		if persistedSettings[i].v == v {
-			return persistedSettings[i].name
+			return &persistedSettings[i]
 		}
 	}
-	logf("persistedSettingName: BUG: toggled setting isn't registered in persistedSettings, so it won't survive a restart")
-	return "<unregistered setting>"
+	return nil
 }
 
 // toggleAndPersist flips v and immediately persists all current settings to
@@ -2994,7 +2993,20 @@ func persistedSettingName(v *atomic.Bool) string {
 // there's no separate "save on exit" step to miss.
 func toggleAndPersist(v *atomic.Bool) {
 	v.Store(!v.Load())
-	saveSettings("user changed " + persistedSettingName(v))
+	s := findPersistedSetting(v)
+	if s == nil {
+		logf("toggleAndPersist: BUG: toggled setting isn't registered in persistedSettings, so it won't survive a restart")
+		saveSettings("user changed <unregistered setting>")
+		return
+	}
+	if s.skip != nil && s.skip() {
+		// The user just deliberately toggled a setting that an explicit
+		// command-line flag was overriding for this run: that's now a real
+		// choice and must be persisted like any other, so end the one-run
+		// override (valueToPersist then returns the live value).
+		s.skip = nil
+	}
+	saveSettings("user changed " + s.name)
 }
 
 // saveSettings serializes every entry in persistedSettings to
@@ -3087,7 +3099,7 @@ func loadSettings() settingsLoadResult {
 
 	data, err := os.ReadFile(settingsFilePath) //nolint:gosec // G304: settingsFilePath is a fixed, hardcoded constant, never derived from user/network input
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return result // first run; reconcileSettingsFile creates the file from the defaults
 		}
 		result.readFailed = true
@@ -3755,7 +3767,7 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 		return false, false
 	}
 
-	if shouldBypassGestureNow(wantTargetWnd) {
+	if shouldBypassGestureOn(wantTargetWnd) {
 		return false, true
 	}
 
@@ -3827,7 +3839,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		return false, false
 	}
 
-	if shouldBypassGestureNow(wantTargetWnd) {
+	if shouldBypassGestureOn(wantTargetWnd) {
 		return false, true
 	}
 
@@ -3934,8 +3946,8 @@ func tryPerformMMBGestureAt(
 			return false, false
 		}
 
-		if shouldBypassGestureNow(hwnd) {
-			return false, true // foreground is fullscreen; let event through
+		if shouldBypassGestureOn(hwnd) {
+			return false, true // fullscreen target or explorer shell surface; let event through
 		}
 
 		if ShouldThrottle() { //every 10ms or more, else drop it
@@ -4667,7 +4679,22 @@ func shouldBypassGestureNow(hwnd windows.Handle) bool {
 	return should
 }
 
+// shouldBypassGestureOn is shouldBypassGestureNow plus an unconditional bypass for
+// explorer's desktop-host and taskbar windows, which must never be moved, resized
+// or z-ordered by a gesture (doing so desyncs the shell until explorer restarts).
+// true means: let the originating input event through unswallowed.
+func shouldBypassGestureOn(hwnd windows.Handle) bool {
+	if isExplorerShellSurface(hwnd) {
+		if rateLimitedLogDue(&lastShellSurfaceLogTime, time.Second) {
+			logf("shouldBypassGestureOn: refusing to gesture on an explorer desktop/taskbar window (log rate-limited to 1/sec) | %s", describeWindow(hwnd))
+		}
+		return true
+	}
+	return shouldBypassGestureNow(hwnd)
+}
+
 var lastFullscreenLogTime atomic.Int64 // Add this with your other globals
+var lastShellSurfaceLogTime atomic.Int64
 
 var lastPaintGateLogTime atomic.Int64
 
@@ -6082,33 +6109,34 @@ func hookWorker() {
 	}
 
 	// 4. The Thread's Private Message Loop
+	pumpMessagesUntilQuit("hookWorker")
+}
+
+// pumpMessagesUntilQuit runs the calling thread's message loop until WM_QUIT is
+// retrieved or GetMessage fails. who is only used in log lines.
+//
+// GetMessage returns 0 (NOT WM_QUIT's message id 0x12) when it retrieves WM_QUIT
+// and -1 on failure. It returns a 32-bit BOOL, so on amd64 only the low 32 bits
+// of R1 are meaningful, hence uint32(res.R1).
+//
+// This is also the call during which WH_MOUSE_LL/WH_KEYBOARD_LL callbacks get
+// invoked on this thread, and it sleeps at 0% CPU while idle.
+func pumpMessagesUntilQuit(who string) {
 	var msg wincoe.MSG
 	for {
-		//exitf(1, "temp. manual panic")
-		// res3 := procGetMessage.Call(
-		// 	uintptr(unsafe.Pointer(&msg)),
-		// 	0, 0, 0,
-		// )
-
-		// const minus1 = ^uintptr(0)
-		// ret == 0 means WM_QUIT was received. ret == -1 aka ^uintptr(0) is an error.
-		//if ret == 0 || ret == minus1 {
-
-		// GetMessage here calls the hook(s), ie. during this GetMessage call the hooks execute!
-		if res3 := wincoe.GetMessage(&msg, 0, 0, 0); res3.Failed() {
-			logf("Hook worker thread got GetMessage error res=%v, exiting and unhooking...", res3)
-			break
-		} else if res3.R1 == 0 /*returns 0 due to receiving WM_QUIT==0x12*/ {
-			logf("Hook worker thread received WM_QUIT(so R1==0), exiting and unhooking...")
-			break
+		res := wincoe.GetMessage(&msg, 0, 0, 0)
+		if res.Failed() {
+			logf("%s: GetMessage failed, res=%v; leaving its message loop", who, res)
+			return
 		}
-
-		// procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		// #nosec G115 -- intentional truncation: GetMessage returns a 32-bit BOOL
+		if uint32(res.R1) == 0 {
+			logf("%s: received WM_QUIT (GetMessage returned 0); leaving its message loop", who)
+			return
+		}
 		_ = wincoe.TranslateMessage(&msg) // nolint:errcheck // don't care
-		// procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		resDis := wincoe.DispatchMessage(&msg)
-		if resDis.CallStatusFailed() {
-			logf("DEBUG: in hookWorker, last GetLastError() seen by DispatchMessage is %v", resDis.CallStatus)
+		if resDis := wincoe.DispatchMessage(&msg); resDis.CallStatusFailed() {
+			logf("DEBUG: %s: last GetLastError() seen by DispatchMessage is %v", who, resDis.CallStatus)
 		}
 	}
 }
@@ -7117,12 +7145,12 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		return 1 // allow
 
 	case wincoe.WM_ENDSESSION:
-		if wParam != 0 {
-			logf("WM_ENDSESSION with wParam!=0 aka system shutdown or restart detected")
-			// ensure flush here if buffered
-		} else {
-			logf("WM_ENDSESSION with wParam == 0 (weird?!)")
+		if wParam == 0 {
+			// The session end that WM_QUERYENDSESSION announced was cancelled (e.g. another app vetoed it): keep running.
+			logf("WM_ENDSESSION with wParam == 0: the session end was cancelled; staying alive")
+			return 0
 		}
+		logf("WM_ENDSESSION with wParam!=0 aka system shutdown or restart detected")
 		exitf(20, "due to WM_ENDSESSION")
 		unreachable()
 		return 0
@@ -9594,45 +9622,7 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 
 	//You should call lockRAM() at the very end of your initialization sequence, but before you enter the main message loop (GetMessage).
 	lockRAM()
-	var msg wincoe.MSG
-	for {
-		/* GetMessage is the "Event-Driven" king.
-		   It puts this thread to sleep at 0% CPU.
-		   It only wakes up if:
-		   1. A real Windows message (Key, Exit, Window Move) arrives.
-		   2. Our Hook sends the WM_WAKE_UP "Doorbell".
-		*/
-		// res3 := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		// if int32(r) <= 0 {
-		if res3 := wincoe.GetMessage(&msg, 0, 0, 0); res3.Failed() /*aka res3.Err < 0*/ || res3.R1 == wincoe.WM_QUIT /*aka WM_QUIT*/ {
-			//WM_QUIT	0x0012	(Not handled in wndProc) This causes GetMessage to return 0.
-			break // Loop breaks because hookWorker sent WM_QUIT, or we did WM_CLOSE or WM_DESTROY on main window which eventually triggered a WM_QUIT !
-		}
-		/*
-					Why Hooks don't need Dispatch
-
-			In a normal window setup, you need DispatchMessage to send a message to a WndProc. But Low-Level Hooks (WH_MOUSE_LL) are not window messages.
-
-			When you install a Low-Level Hook, the OS injects a requirement into your thread: "Whenever the mouse moves, pause the system and run this
-			specific callback function on this thread."
-
-			The OS's Hook Manager doesn't wait for DispatchMessage. Instead, it intercepts your thread while it is inside the GetMessage (or PeekMessage) call.
-
-			    The flow: GetMessage is called → The OS sees there's a mouse event → The OS executes your mouseProc callback directly while the thread is
-				still "inside" the GetMessage syscall → Your callback returns → GetMessage finally returns to your loop with a (potentially unrelated) message.
-		*/
-
-		// Handle System Tray / Window Messages
-		// This ensures your wndProc gets called!
-
-		// procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		_ = wincoe.TranslateMessage(&msg) // nolint:errcheck // don't care
-		// procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		resDis := wincoe.DispatchMessage(&msg)
-		if resDis.CallStatusFailed() {
-			logf("DEBUG: in runApplication, last GetLastError() seen by DispatchMessage is %v", resDis.CallStatus)
-		}
-	}
+	pumpMessagesUntilQuit("main thread")
 
 	// THE LOOP EXITED. Why? Let's check if the hook thread crashed.
 	if p := hookPanicPayload.Load(); p != nil {
@@ -10700,13 +10690,13 @@ func markGestureUsedOnce() {
 //
 // context is only used in the failure log.
 //
-// All current callers of enqueueMoveOrResize (and therefore this) run
-// exclusively on the single, dedicated hook thread -- Windows hook callback
-// delivery for a given hook is itself inherently serialized, and nothing in
-// this codebase calls enqueueMoveOrResize from the main thread or any other
-// goroutine. That single-caller invariant is what makes the plain
-// (non-CAS) rollback below safe: there's no other thread that could race
-// this rollback against a concurrent doorbellPending.CompareAndSwap(false, true).
+// Callers of enqueueMoveOrResize (and therefore this) are the hook thread
+// (mouseProc) and, rarely, the main thread (wndProc's WM_APPLY_SHIFT_MIRROR
+// radial-center branch). The plain (non-CAS) rollback below can therefore
+// theoretically race a concurrent doorbellPending.CompareAndSwap(false, true)
+// from the other thread, but the worst outcome is one skipped wakeup until the
+// very next enqueue (a few ms later, on the next mouse move), and a
+// PostMessage failure to our own window is already a near-impossible event.
 //
 // If the CompareAndSwap wins but the PostMessage attempt itself fails --
 // mainMsgHwnd momentarily 0 (very early startup, or after

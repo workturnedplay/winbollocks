@@ -721,8 +721,10 @@ var (
 	// CheckZero indicates failure if the API returns 0 (useful for counts, lengths, IDs)
 	CheckZero WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == 0 }
 
-	// CheckMinusOne indicates failure if the API returns -1 (specifically for GetMessage)
-	CheckMinusOne WinCheckFunc = func(r1 uintptr, _ error) bool { return r1 == ^uintptr(0) }
+	// CheckMinusOne indicates failure if the API returns -1 (specifically for GetMessage).
+	// GetMessage returns a 32-bit int, so on amd64 its -1 arrives zero-extended
+	// (0x00000000FFFFFFFF) and must be compared as int32, not as a full-width uintptr.
+	CheckMinusOne WinCheckFunc = func(r1 uintptr, _ error) bool { return int32(r1) == -1 }
 
 	// CheckNone never fails. Used for VOID returns or LRESULTs that require manual checking.
 	// XXX: Using anything other than CheckNone and an error outside the 0..255 range happens,
@@ -2000,7 +2002,7 @@ func ExePathFromPID(pid uint32) (string, error) {
 func GetProcessName(pid uint32) (string, error) {
 	snapshot, err := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("GetProcessName: CreateToolhelp32Snapshot failed while looking for PID %d: %w", pid, err)
 	}
 	//defer windows.CloseHandle(snapshot)
 	defer CloseHandleLogged(&snapshot, "GetProcessName:CreateToolhelp32Snapshot snapshot")
@@ -2024,9 +2026,9 @@ func GetProcessName(pid uint32) (string, error) {
 	}
 
 	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
-		return "", err
+		return "", fmt.Errorf("GetProcessName: Process32 enumeration failed while looking for PID %d: %w", pid, err)
 	}
-	return "", fmt.Errorf("not found, err: %w", err)
+	return "", fmt.Errorf("GetProcessName: PID %d not found: %w", pid, err)
 }
 
 // CreateToolhelp32Snapshot creates a snapshot of the specified processes, threads,
@@ -2158,6 +2160,11 @@ func GetServiceNamesFromPIDUncached(targetPID uint32) ([]string, error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("EnumServicesStatusEx wrapped by callWithRetry, failed: %w", err)
+	}
+	if servicesReturned == 0 {
+		// The SCM legitimately reported zero services (callWithRetry may then
+		// legitimately hand back a nil/empty buffer): nothing to parse.
+		return nil, nil
 	}
 	if buffer == nil {
 		return nil, fmt.Errorf("nil buffer from callWithRetry, no error though")
@@ -3205,7 +3212,7 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 	if stagingSuccess {
 		// ReplaceFileW requires the target destination to exist. If this is a first-boot
 		// scenario and the target is missing, we bypass ReplaceFileW and perform a clean rename.
-		if _, statErr := OsStatFunc(filename); os.IsNotExist(statErr) {
+		if _, statErr := OsStatFunc(filename); errors.Is(statErr, os.ErrNotExist) {
 			log.Info("Windows FileWriter: Destination file does not exist, committing via initial rename", slog.String("path", filename))
 
 			renameErr := OsRenameFunc(tmpName, filename)
@@ -3367,7 +3374,7 @@ func openStagingFileSafely(tmpName string, perm os.FileMode) (*os.File, error) {
 	if err == nil {
 		return f, nil
 	}
-	if !os.IsExist(err) {
+	if !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("openStagingFileSafely says that os.OpenFile failed(and not because it doesn't exist) to create %q staging file, with err:%w", tmpName, err) // some other failure (permissions, path issues, etc.) — propagate as-is
 	}
 
