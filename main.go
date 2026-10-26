@@ -3776,7 +3776,7 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 		return false, false
 	}
 
-	if refuseGestureOn(wantTargetWnd) {
+	if refuseGestureOn(wantTargetWnd, gestureKindMoveOrResize) {
 		return false, true
 	}
 
@@ -3848,7 +3848,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 		return false, false
 	}
 
-	if refuseGestureOn(wantTargetWnd) {
+	if refuseGestureOn(wantTargetWnd, gestureKindMoveOrResize) {
 		return false, true
 	}
 
@@ -3955,7 +3955,7 @@ func tryPerformMMBGestureAt(
 			return false, false
 		}
 
-		if refuseGestureOn(hwnd) {
+		if refuseGestureOn(hwnd, gestureKindZOrder) {
 			return false, true // refused; the caller still swallows the click
 		}
 
@@ -4042,7 +4042,7 @@ func tryPerformMMBGestureAt(
 	if restoreID, stackCandidate, ok := reserveSentToBackWindow(); ok {
 		hwnd = stackCandidate
 
-		if refuseGestureOn(hwnd) {
+		if refuseGestureOn(hwnd, gestureKindZOrder) {
 			releaseSentToBackReservation(restoreID)
 			return false, true // refused; the caller still swallows the click
 		}
@@ -4080,7 +4080,7 @@ func tryPerformMMBGestureAt(
 			return false, false
 		}
 
-		if refuseGestureOn(hwnd) {
+		if refuseGestureOn(hwnd, gestureKindZOrder) {
 			return false, true
 		}
 
@@ -4097,6 +4097,11 @@ func tryPerformMMBGestureAt(
 
 	data.Hwnd = hwnd
 	data.InsertAfter = wincoe.HWND_TOP
+	if isTaskbarWindow(hwnd) {
+		// Sending it to HWND_BOTTOM stripped its topmost style; HWND_TOP would bring it back
+		// as an ordinary window that topmost windows (and a re-raised flyout) can cover.
+		data.InsertAfter = wincoe.HWND_TOPMOST
+	}
 	data.Flags =
 		wincoe.SWP_NOMOVE |
 			wincoe.SWP_NOSIZE |
@@ -4700,18 +4705,42 @@ var (
 	refusalOverlayTimerArmed atomic.Bool
 )
 
+// gestureKind says what a gesture would do to its target, since what has to be
+// refused differs between them.
+type gestureKind uint8
+
+const (
+	// gestureKindMoveOrResize: winkey+LMB move and winkey+RMB resize.
+	gestureKindMoveOrResize gestureKind = iota
+	// gestureKindZOrder: winkey+MMB send-to-back and winkey+shift+MMB restore.
+	gestureKindZOrder
+)
+
 // gestureRefusalReason returns why no gesture may act on hwnd (the window the
 // gesture would actually target), or "" if one may. Explorer's desktop-host and
 // taskbar windows are always refused. A fullscreen (exclusive or borderless)
 // window is refused only while bypassGesturesWhenFullscreen is enabled.
 //
+// What is refused depends on kind: move/resize are refused on every explorer
+// desktop-host or taskbar window, but z-order gestures are refused only on the
+// desktop hosts. The taskbar is deliberately allowed for send-to-back: with
+// auto-hide on it can sit over the current window, and sending it to the back
+// is useful.
+//
 // The fullscreen check is done live via isWindowFullscreenOnMonitor against that
 // specific hwnd, rather than against a foreground-change WinEvent cache, since
 // such a cache only refreshes on foreground transitions and can lag behind
 // whichever window a gesture is actually about to act on.
-func gestureRefusalReason(hwnd windows.Handle) string {
-	if isExplorerShellSurface(hwnd) {
-		return "explorer's desktop/taskbar windows are never moved, resized or sent to back"
+func gestureRefusalReason(hwnd windows.Handle, kind gestureKind) string {
+	switch kind {
+	case gestureKindMoveOrResize:
+		if isExplorerShellSurface(hwnd) {
+			return "explorer's desktop/taskbar windows are never moved or resized"
+		}
+	case gestureKindZOrder:
+		if isDesktopHostWindow(hwnd) {
+			return "explorer's desktop windows are never sent to back or restored"
+		}
 	}
 	if bypassGesturesWhenFullscreen.Load() && isWindowFullscreenOnMonitor(hwnd) {
 		return "the target window is fullscreen and the systray option \"" + bypassFullscreenOptionName + "\" is on"
@@ -4722,8 +4751,8 @@ func gestureRefusalReason(hwnd windows.Handle) string {
 // refuseGestureOn reports whether a gesture must be refused for hwnd and, if so,
 // asks the main thread to show the red notice. Callers must still swallow the
 // originating input event (and its matching up).
-func refuseGestureOn(hwnd windows.Handle) bool {
-	reason := gestureRefusalReason(hwnd)
+func refuseGestureOn(hwnd windows.Handle, kind gestureKind) bool {
+	reason := gestureRefusalReason(hwnd, kind)
 	if reason == "" {
 		return false
 	}

@@ -143,19 +143,34 @@ func isStubbornSendToBack(target windows.Handle) bool {
 	return ok
 }
 
+// explorer's desktop-host and taskbar window classes, shared by the
+// isDesktopHostWindow/isTaskbarWindow/isExplorerShellSurface checks.
+var (
+	desktopHostClasses  = []string{"Progman", "WorkerW"}
+	taskbarClasses      = []string{"Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+	shellSurfaceClasses = slices.Concat(desktopHostClasses, taskbarClasses)
+)
+
 // isDesktopHostWindow reports whether hwnd is one of explorer's desktop host
 // windows (Progman/WorkerW), which legitimately stay below everything else even
 // after an HWND_BOTTOM. The class name alone is NOT enough: observed,
 // TOTALCMD64.EXE creates a top-level window of class "WorkerW". A failed class
 // or process lookup is treated as "no".
 func isDesktopHostWindow(hwnd windows.Handle) bool {
-	return isExplorerWindowOfClass(hwnd, "Progman", "WorkerW")
+	return isExplorerWindowOfClass(hwnd, desktopHostClasses...)
+}
+
+// isTaskbarWindow reports whether hwnd is one of explorer's taskbars (primary or
+// secondary monitor). The taskbar is topmost, so HWND_BOTTOM also strips that
+// style (see tryPerformMMBGestureAt's restore path).
+func isTaskbarWindow(hwnd windows.Handle) bool {
+	return isExplorerWindowOfClass(hwnd, taskbarClasses...)
 }
 
 // isExplorerShellSurface reports whether hwnd is one of explorer's desktop-host
 // or taskbar windows: surfaces no gesture may ever move, resize or z-order.
 func isExplorerShellSurface(hwnd windows.Handle) bool {
-	return isExplorerWindowOfClass(hwnd, "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+	return isExplorerWindowOfClass(hwnd, shellSurfaceClasses...)
 }
 
 // isExplorerWindowOfClass reports whether hwnd's class is one of classes AND it
@@ -264,6 +279,10 @@ func verifySentToBackOrMinimize(target windows.Handle) {
 		return
 	}
 	logf("WARNING: HWND=0x%X could not be sent to the very back by any known method: %v | %s", target, err, describeWindow(target))
+	if isExplorerShellSurface(target) {
+		logf("verifySentToBackOrMinimize: not minimizing HWND=0x%X: it's an explorer desktop/taskbar window, which must never be minimized (explorer probably re-raised it)", target)
+		return
+	}
 	if !minimizeWhenCantSendToBack.Load() {
 		logf("verifySentToBackOrMinimize: the minimize workaround is disabled (systray toggle); leaving HWND=0x%X where it is", target)
 		return
