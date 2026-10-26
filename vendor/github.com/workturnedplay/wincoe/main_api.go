@@ -3206,6 +3206,12 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 		log.Debug("Windows FileWriter: Staged recovery file written and flushed successfully", slog.String("tempfilename", tmpName))
 	} else {
 		log.Warn("Windows FileWriter: Directory ACLs or disk issues blocked staging file creation; skipping to in-place fallback", SafeErr(stagingErr))
+		// A half-written staging file would make the next boot panic.
+		neutralizeOrPanic(
+			tmpName, perm, maxAttempts, backoffDuration, log, stagingErr,
+			"Failed staging write left un-neutralized garbage bytes!",
+			"",
+		)
 	}
 
 	// Step 2: Attempt native atomic Win32 transaction
@@ -3484,7 +3490,15 @@ func inspectExistingStagingFile(path string) (safeToReclaim bool, reason string,
 // It attempts deletion first. If deletion fails, it forces a truncation down to 0 bytes
 // to neutralize any partial garbage data that would trip up the next boot.
 func neutralizeOrPanic(tmpName string, perm os.FileMode, maxAttempts int, backoff time.Duration, log *slog.Logger, actionErr error, title, extraPanicMsg string) {
-	ondeleteErr := RetryFileOp(maxAttempts, backoff, func() error { return OsRemoveFunc(tmpName) })
+	ondeleteErr := RetryFileOp(maxAttempts, backoff, func() error {
+		// A staging file that doesn't exist is already neutralized (e.g. its
+		// creation failed because the directory isn't writable); retrying or
+		// truncating a missing file would only end in a bogus critical panic.
+		if err := OsRemoveFunc(tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove staging file %q: %w", tmpName, err)
+		}
+		return nil
+	})
 	if ondeleteErr == nil {
 		log.Debug("ExtraSafety: successfully neutralized staging file by deleting it", slog.String("tempfilename", tmpName))
 		// Successful deletion, nothing more to do

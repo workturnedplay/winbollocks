@@ -68,7 +68,7 @@ Right-clicking the `winbollocks` icon in the system tray provides a massive list
 | **Fallback LMB Focus** | Injects a physical Left Mouse Click to force focus if standard activation fails. |
 | **Unfocus Sent to Back** | Automatically shifts focus to the new top window when you send one to the back. |
 | **Coalesce Events** | Ignores historical queue data to keep drags highly responsive, overriding the standard 60fps rate limit. |
-| **Bypass Fullscreen** | Ignores gestures entirely if the foreground app is running in exclusive or borderless fullscreen (great for gaming). |
+| **Refuse gestures on fullscreen windows** | A gesture aimed at an exclusive/borderless-fullscreen window is refused: the click is swallowed (it never reaches the game) and a red notice says why. |
 | **Require WinKey Held** | Instantly stops any active move or resize gesture if the Windows key is released mid-action. |
 | **Immediate Overlay Repaint** | Forces the resize overlay to repaint synchronously, preventing freezes during rapid resizing. |
 | **Missed Gesture Recovery** | Arms the recovery system to catch gestures lost to Admin windows. |

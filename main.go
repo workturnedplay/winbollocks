@@ -214,6 +214,10 @@ var (
 
 	overlayIsShowing atomic.Bool // Tracks overlay visibility to prevent hide spam
 
+	// overlayIsRefusal is true while the overlay shows a red "gesture refused"
+	// notice instead of the green resize text. Main thread only (like overlayText).
+	overlayIsRefusal bool
+
 	// Reusable GDI brushes
 	magentaBrush windows.Handle
 	blackBrush   windows.Handle
@@ -242,6 +246,7 @@ const (
 	WM_CANCEL_GESTURE       = wincoe.WM_USER + 220
 	WM_APPLY_SHIFT_MIRROR   = wincoe.WM_USER + 225
 	WM_APPLY_GESTURE_CURSOR = wincoe.WM_USER + 230
+	WM_SHOW_REFUSAL_OVERLAY = wincoe.WM_USER + 235
 
 	// gestureCursorTimerID is the SetTimer nIDEvent used to reassert SetCursor
 	// while a move/resize is active (fights apps that force a private cursor
@@ -257,6 +262,10 @@ const (
 	// something is actually waiting.
 	moveFlowTimerID = 2
 	moveFlowTimerMs = 16
+
+	// refusalOverlayTimerID/Ms: one-shot timer hiding the red "gesture refused" notice.
+	refusalOverlayTimerID = 3
+	refusalOverlayMs      = 1500
 )
 const (
 	MENU_EXIT                                      = 1
@@ -3748,26 +3757,26 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe
 // If a ModeResize session is active instead, this is a no-op (finish the
 // resize first), matching prior behavior.
 //
-// Returns (started, bypassed). bypassed is true only when the target window
-// under pt is fullscreen and bypassGesturesWhenFullscreen is enabled (see
-// shouldBypassGestureNow); callers must treat that case as "let the
-// originating input event pass through unswallowed" rather than as an
-// ordinary failure. started is false for any other reason nothing began (no
-// window under pt, a resize is already running, startDrag failed, etc.) —
-// callers should still swallow the originating input in that case.
+// Returns (started, refused). refused is true when refuseGestureOn declined
+// the target under pt (explorer shell surface, or fullscreen with the systray
+// option on); the red notice was already requested and callers must STILL
+// swallow the originating input event and treat the gesture as used (so the
+// Start menu doesn't pop). started is false for any other reason nothing began
+// (no window under pt, a resize is already running, startDrag failed, etc.),
+// and callers should swallow the originating input then too.
 //
 // viaMissedGestureRecovery must be true only when called from the
 // missed-gesture recovery path (we never saw/swallowed the real LMB-down),
 // and false when called from the real WM_LBUTTONDOWN handler (we did). It's
-// stored on the resulting dragSession — see dragSession.viaMissedGestureRecover
-func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (started, bypassed bool) {
+// stored on the resulting dragSession — see dragSession.viaMissedGestureRecovery.
+func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (started, refused bool) {
 	wantTargetWnd, res1 := wincoe.RootWindowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window(tryBeginMoveGestureAt:RootWindowFromPoint res:%v), window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)", res1)
 		return false, false
 	}
 
-	if shouldBypassGestureOn(wantTargetWnd) {
+	if refuseGestureOn(wantTargetWnd) {
 		return false, true
 	}
 
@@ -3825,21 +3834,21 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 // tryBeginResizeGestureAt is tryBeginMoveGestureAt's ModeResize counterpart,
 // used by both the real WM_RBUTTONDOWN handler and the missed-gesture
 // recovery path from WM_MOUSEMOVE. See tryBeginMoveGestureAt's doc comment
-// for the (started, bypassed) return-value contract.
+// for the (started, refused) return-value contract.
 //
 // shiftDown is the caller's already-sampled Shift state at the moment the
 // gesture is requested (e.g. from modifierKeyState on WM_RBUTTONDOWN). When
 // true and the hit zone is ZONE_CENTER with radial mode on, the new session
 // starts with centerShrinkActive set so the drag shrinks without requiring
 // a later Shift key-transition event.
-func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDown bool) (started, bypassed bool) {
+func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDown bool) (started, refused bool) {
 	wantTargetWnd, res0 := wincoe.RootWindowFromPoint(pt)
 	if wantTargetWnd == 0 {
 		logf("Invalid window(tryBeginResizeGestureAt:RootWindowFromPoint res:%v), window-resize gesture skipped but RMB eaten and start menu will still be prevented(now even if you RMB on a higher integrity eg. admin window before you release winkey)", res0)
 		return false, false
 	}
 
-	if shouldBypassGestureOn(wantTargetWnd) {
+	if refuseGestureOn(wantTargetWnd) {
 		return false, true
 	}
 
@@ -3919,7 +3928,7 @@ func tryBeginResizeGestureAt(pt wincoe.POINT, viaMissedGestureRecovery, shiftDow
 func tryPerformMMBGestureAt(
 	pt wincoe.POINT,
 	shiftDown bool,
-) (started, bypassed bool) {
+) (started, refused bool) {
 	var (
 		hwnd windows.Handle
 		data WindowMoveData // stack allocated — zero cost
@@ -3946,8 +3955,8 @@ func tryPerformMMBGestureAt(
 			return false, false
 		}
 
-		if shouldBypassGestureOn(hwnd) {
-			return false, true // fullscreen target or explorer shell surface; let event through
+		if refuseGestureOn(hwnd) {
+			return false, true // refused; the caller still swallows the click
 		}
 
 		if ShouldThrottle() { //every 10ms or more, else drop it
@@ -4033,9 +4042,9 @@ func tryPerformMMBGestureAt(
 	if restoreID, stackCandidate, ok := reserveSentToBackWindow(); ok {
 		hwnd = stackCandidate
 
-		if shouldBypassGestureNow(hwnd) {
+		if refuseGestureOn(hwnd) {
 			releaseSentToBackReservation(restoreID)
-			return false, true // foreground is fullscreen; let event through
+			return false, true // refused; the caller still swallows the click
 		}
 
 		if ShouldThrottle() {
@@ -4071,7 +4080,7 @@ func tryPerformMMBGestureAt(
 			return false, false
 		}
 
-		if shouldBypassGestureNow(hwnd) {
+		if refuseGestureOn(hwnd) {
 			return false, true
 		}
 
@@ -4523,8 +4532,15 @@ func overlayWndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uin
 		}
 
 		// 3. Draw Text
-		// Green text
-		if res4 := wincoe.GdiSetTextColor(hdc, wincoe.ColorGreen); res4.Failed() {
+		// Green single-line text for the resize overlay; red word-wrapped text for a refusal notice.
+		textColor, drawFlags := wincoe.ColorGreen, wincoe.DT_CENTER|wincoe.DT_VCENTER|wincoe.DT_SINGLELINE
+		if overlayIsRefusal {
+			textColor, drawFlags = colorRefusalRed, wincoe.DT_CENTER|wincoe.DT_WORDBREAK
+			rect.Left += refusalOverlayPaddingPx
+			rect.Right -= refusalOverlayPaddingPx
+			rect.Top += refusalOverlayPaddingPx
+		}
+		if res4 := wincoe.GdiSetTextColor(hdc, textColor); res4.Failed() {
 			logf("WM_PAINT in overlayWndProc, GdiSetTextColor() failed, err: %v, ignoring the rest of the paint.", res4.Err)
 			return 0 //handled
 		}
@@ -4543,7 +4559,7 @@ func overlayWndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uin
 			textPtr,
 			wincoe.DrawTextLengthNullTerminated, // or -1
 			&rect,
-			wincoe.DT_CENTER|wincoe.DT_VCENTER|wincoe.DT_SINGLELINE,
+			drawFlags,
 		); res6.Failed() {
 			logf("WM_PAINT in overlayWndProc, DrawText() failed, err: %v, ignoring the rest of the paint.", res6.Err)
 			return 0 //handled
@@ -4560,45 +4576,41 @@ func overlayWndProc(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uin
 	return res8.R1 //LRESULT
 }
 
+const (
+	overlayDefaultWidth     int32 = 300
+	overlayDefaultHeight    int32 = 50
+	refusalOverlayWidth     int32 = 520
+	refusalOverlayHeight    int32 = 100
+	refusalOverlayPaddingPx int32 = 8
+
+	// colorRefusalRed is a COLORREF (0x00bbggrr).
+	colorRefusalRed uint32 = 0x000000FF
+)
+
 func updateOverlay(x, y, w, h, startW, startH int32) {
+	text := fmt.Sprintf("Size: %dx%d (delta: %d, %d)", w, h, w-startW, h-startH)
+	// Center the overlay over the window being resized
+	showOverlayCentered(x+w/2, y+h/2, overlayDefaultWidth, overlayDefaultHeight, text, false)
+}
+
+// showOverlayCentered shows the shared overlay window ow x oh, centered on (cx,cy).
+// refusal selects the red word-wrapped look. Main thread only.
+func showOverlayCentered(cx, cy, ow, oh int32, text string, refusal bool) {
 	if overlayHwnd == 0 {
 		return
 	}
-
-	diffW := w - startW
-	diffH := h - startH
-	overlayText = fmt.Sprintf("Size: %dx%d (delta: %d, %d)", w, h, diffW, diffH)
-
-	// Center the overlay over the window being resized
-	ox := x + (w / 2) - 150
-	oy := y + (h / 2) - 25
-
-	// res1 := procSetWindowPos.Call( //doneTODO: handle errors/returns here
-	// 	uintptr(overlayHwnd),
-	// 	HWND_TOPMOST,
-	// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-	// 	uintptr(ox),
-	// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
-	// 	uintptr(oy),
-	// 	300, 50,
-	// 	SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
-	// )
-
+	overlayText = text
+	overlayIsRefusal = refusal
 	overlayIsShowing.Store(true) // Mark as showing before we ask Windows to show it
 
-	//Combining SWP_SHOWWINDOW and SWP_NOACTIVATE will successfully unhide (display) a window that was hidden using SW_HIDE,
-	//  and it will do so without stealing input focus or bringing the window to the foreground.
-	//SWP_SHOWWINDOW (0x0040): Overrides the hidden state, turns the WS_VISIBLE style back on, and makes the window appear on screen.
-	//SWP_NOACTIVATE (0x0010): Tells Windows: "Show the window, but do not give it keyboard focus and do not make it the active foreground window."
-	if res1 := wincoe.SetWindowPos(overlayHwnd, wincoe.HWND_TOPMOST, ox, oy, 300, 50, wincoe.SWP_NOACTIVATE|wincoe.SWP_SHOWWINDOW); res1.Failed() {
-		logf("in updateOverlay, failed to SetWindowPos of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res1.Err, res1.CallStatus)
+	// SWP_SHOWWINDOW|SWP_NOACTIVATE unhides without stealing focus.
+	if res1 := wincoe.SetWindowPos(overlayHwnd, wincoe.HWND_TOPMOST, cx-ow/2, cy-oh/2, ow, oh, wincoe.SWP_NOACTIVATE|wincoe.SWP_SHOWWINDOW); res1.Failed() {
+		logf("in showOverlayCentered, failed to SetWindowPos of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res1.Err, res1.CallStatus)
+	}
+	if res2 := wincoe.InvalidateRect(overlayHwnd, nil, true); res2.Failed() {
+		logf("in showOverlayCentered, failed to InvalidateRect of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
 	}
 
-	// Force redraw, well the redraw is queued, whenever Windows gets around to it.
-	// res2 := procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
-	if res2 := wincoe.InvalidateRect(overlayHwnd, nil, true); res2.Failed() {
-		logf("in updateOverlay, failed to InvalidateRect of overlayHwnd:0x%X (meant to eventually cause a repaint), err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
-	}
 	/*
 		(press alt+z to temporarily toggle wordwrap to read this)
 
@@ -4630,12 +4642,10 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 
 		InvalidateRect does not draw anything. It simply tells Windows: "Hey, mark this area as dirty. Next time you have absolutely nothing else to do and the queue is empty, please send me a WM_PAINT." Because your main thread is busy aggressively draining the moveDataChan and calling SetWindowPos for the target window, the queue is never empty. Your overlay's WM_PAINT is starved until you stop dragging the mouse.
 	*/
-	//doneTODO: do I want this to happen unconditionally? or should it be in a systray bool like others?!
-	if immediateOverlayRepaint.Load() {
-		//res3 := procUpdateWindow.Call(uintptr(overlayHwnd))
-
-		if res3 := wincoe.UpdateWindow(overlayHwnd); res3.Failed() { // <--- Forces immediate synchronous repaint
-			logf("in updateOverlay, failed to UpdateWindow aka repaint of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res3.Err, res3.CallStatus)
+	// <-- the existing long comment block goes here -->
+	if immediateOverlayRepaint.Load() || refusal {
+		if res3 := wincoe.UpdateWindow(overlayHwnd); res3.Failed() {
+			logf("in showOverlayCentered, failed to UpdateWindow of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res3.Err, res3.CallStatus)
 		}
 	}
 }
@@ -4650,51 +4660,96 @@ func hideOverlay() {
 	}
 }
 
-// shouldBypassGestureNow returns true when gesture processing for hwnd (the
-// window the gesture would actually target) should be skipped because it's
-// fullscreen (exclusive or borderless) on its monitor and the bypass feature
-// is enabled. The check is done live via isWindowFullscreenOnMonitor against
-// that specific hwnd, rather than against a foreground-change WinEvent
-// cache, since such a cache only refreshes on foreground transitions and can
-// lag behind whichever window a gesture is actually about to act on.
-//
-// Callers that can distinguish "bypassed" from "failed for another reason"
-// (tryBeginMoveGestureAt, tryBeginResizeGestureAt, tryPerformMMBGestureAt)
-// must propagate that distinction back up to mouseProc's switch, since only
-// a bypass should let the originating mouse event pass through unswallowed —
-// any other failure still swallows it, matching each gesture's prior
-// behavior before this bypass feature existed.
-func shouldBypassGestureNow(hwnd windows.Handle) bool {
-	if !bypassGesturesWhenFullscreen.Load() {
+// bypassFullscreenOptionName is shared by the systray text and the refusal reason.
+const bypassFullscreenOptionName = "Refuse gestures on fullscreen windows"
+const bypassFullscreenMenuText = bypassFullscreenOptionName + " (the click is swallowed and a red notice is shown, so a gesture never leaks into e.g. a game)"
+
+var (
+	lastGestureRefusalLogTime atomic.Int64
+
+	// pendingRefusalReason hands the reason from the hook thread (which decides
+	// to refuse) to the main thread (which owns the overlay).
+	pendingRefusalMu     sync.Mutex
+	pendingRefusalReason string
+
+	refusalOverlayTimerArmed atomic.Bool
+)
+
+// gestureRefusalReason returns why no gesture may act on hwnd, or "" if one may.
+func gestureRefusalReason(hwnd windows.Handle) string {
+	if isExplorerShellSurface(hwnd) {
+		return "explorer's desktop/taskbar windows are never moved, resized or sent to back"
+	}
+	if bypassGesturesWhenFullscreen.Load() && isWindowFullscreenOnMonitor(hwnd) {
+		return "the target window is fullscreen and the systray option \"" + bypassFullscreenOptionName + "\" is on"
+	}
+	return ""
+}
+
+// refuseGestureOn reports whether a gesture must be refused for hwnd and, if so,
+// asks the main thread to show the red notice. Callers must still swallow the
+// originating input event (and its matching up).
+func refuseGestureOn(hwnd windows.Handle) bool {
+	reason := gestureRefusalReason(hwnd)
+	if reason == "" {
 		return false
 	}
-	should := isWindowFullscreenOnMonitor(hwnd)
-	if should {
-		//logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray)")
-		const everyXSeconds = 1
-		if rateLimitedLogDue(&lastFullscreenLogTime, everyXSeconds*time.Second) {
-			logf("Target window is fullscreen, refusing to trigger gesture. (toggle this behaviour from systray) (this logline is rate-limited to 1 per %d second(s))", everyXSeconds)
-		}
+	if rateLimitedLogDue(&lastGestureRefusalLogTime, time.Second) {
+		logf("refuseGestureOn: refusing a gesture on HWND=0x%X: %s (log rate-limited to 1/sec) | %s", hwnd, reason, describeWindow(hwnd))
 	}
-	return should
+	postRefusalNotice(hwnd, reason)
+	return true
 }
 
-// shouldBypassGestureOn is shouldBypassGestureNow plus an unconditional bypass for
-// explorer's desktop-host and taskbar windows, which must never be moved, resized
-// or z-ordered by a gesture (doing so desyncs the shell until explorer restarts).
-// true means: let the originating input event through unswallowed.
-func shouldBypassGestureOn(hwnd windows.Handle) bool {
-	if isExplorerShellSurface(hwnd) {
-		if rateLimitedLogDue(&lastShellSurfaceLogTime, time.Second) {
-			logf("shouldBypassGestureOn: refusing to gesture on an explorer desktop/taskbar window (log rate-limited to 1/sec) | %s", describeWindow(hwnd))
-		}
-		return true
+// postRefusalNotice runs on the hook thread: it only stores the reason and posts.
+func postRefusalNotice(target windows.Handle, reason string) {
+	pendingRefusalMu.Lock()
+	pendingRefusalReason = reason
+	pendingRefusalMu.Unlock()
+
+	msgHwnd := loadMainMsgHwnd()
+	if msgHwnd == 0 {
+		logf("postRefusalNotice: mainMsgHwnd is 0; the red refusal notice for HWND=0x%X (%s) won't be shown", target, reason)
+		return
 	}
-	return shouldBypassGestureNow(hwnd)
+	if res := wincoe.PostMessage(msgHwnd, WM_SHOW_REFUSAL_OVERLAY, uintptr(target), 0); res.Failed() {
+		logf("postRefusalNotice: PostMessage WM_SHOW_REFUSAL_OVERLAY for HWND=0x%X failed: %v", target, res.Err)
+	}
 }
 
-var lastFullscreenLogTime atomic.Int64 // Add this with your other globals
-var lastShellSurfaceLogTime atomic.Int64
+// showRefusalOverlay shows the red notice centered on target (clamped into its
+// monitor's work area), then (re)starts the one-shot hide timer. Main thread only.
+func showRefusalOverlay(target windows.Handle) {
+	if isAnyGestureActive() {
+		logf("showRefusalOverlay: not showing the refusal notice for HWND=0x%X because a gesture is in progress (the overlay is in use)", target)
+		return
+	}
+	pendingRefusalMu.Lock()
+	reason := pendingRefusalReason
+	pendingRefusalMu.Unlock()
+
+	var cx, cy int32
+	var r wincoe.RECT
+	if res := wincoe.GetWindowRect(target, &r); res.Succeeded() {
+		cx, cy = r.Left+(r.Right-r.Left)/2, r.Top+(r.Bottom-r.Top)/2
+	} else {
+		var pt wincoe.POINT
+		if res2 := wincoe.GetCursorPos(&pt); res2.Failed() {
+			logf("showRefusalOverlay: neither GetWindowRect (%v) nor GetCursorPos (%v) worked for HWND=0x%X; not showing the notice", res.Err, res2.Err, target)
+			return
+		}
+		cx, cy = pt.X, pt.Y
+	}
+	if work, ok := monitorWorkAreaFor(target); ok {
+		cx = max(work.Left+refusalOverlayWidth/2, min(cx, work.Right-refusalOverlayWidth/2))
+		cy = max(work.Top+refusalOverlayHeight/2, min(cy, work.Bottom-refusalOverlayHeight/2))
+	}
+	showOverlayCentered(cx, cy, refusalOverlayWidth, refusalOverlayHeight, "Gesture refused: "+reason, true)
+
+	// Restart (not just keep) the timer so a repeated refusal gets a full 1.5s again.
+	disarmMainThreadTimer(refusalOverlayTimerID, &refusalOverlayTimerArmed, "refusal overlay")
+	armMainThreadTimer(refusalOverlayTimerID, refusalOverlayMs, &refusalOverlayTimerArmed, "refusal overlay")
+}
 
 var lastPaintGateLogTime atomic.Int64
 
@@ -5248,13 +5303,13 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// var ctrlDown bool = keyDown(VK_CONTROL)
 		// var altDown bool = keyDown(VK_MENU)
 		if winDown && !shiftDown && !altDown && !ctrlDown { // only if winkey without any modifiers
-			started, bypassed := tryBeginMoveGestureAt(info.Pt, false)
-			if bypassed {
-				break // target is fullscreen; let event through
-			}
+			started, refused := tryBeginMoveGestureAt(info.Pt, false)
+			// A refused gesture is still swallowed and still "used": the user did press
+			// winkey+LMB, so the target must not see the click and the Start menu must
+			// not pop on winkey-up.
 			markGestureUsedOnce()
 
-			if !started {
+			if !started && !refused {
 				logf("failed to begin Move gesture(the why should be above ^) on winkey+LMB pressed")
 			}
 
@@ -5286,9 +5341,9 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 					if winDown && !ctrlDown && !altDown {
 						switch {
 						case !shiftDown && keyDown(wincoe.VK_LBUTTON):
-							started, bypassed := tryBeginMoveGestureAt(info.Pt, true)
-							if bypassed {
-								break // target is fullscreen; nothing to recover this time
+							started, refused := tryBeginMoveGestureAt(info.Pt, true)
+							if refused {
+								break // refused (notice already requested); nothing to recover this time
 							}
 							markGestureUsedOnce()
 							logf("Recovering a missed winkey+LMB drag-move gesture that started while our hooks were blind due to a higher-integrity foreground window. Run as Administrator to avoid the need to do this for normal windows.")
@@ -5328,8 +5383,8 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 							// Shift may already be held (shift+winkey+RMB) when
 							// allowShiftHeldBeforeResizeGesture is on; same as
 							// the real WM_RBUTTONDOWN path below.
-							started, bypassed := tryBeginResizeGestureAt(info.Pt, true, shiftDown)
-							if bypassed {
+							started, refused := tryBeginResizeGestureAt(info.Pt, true, shiftDown)
+							if refused {
 								break // target is fullscreen; nothing to recover this time
 							}
 							markGestureUsedOnce()
@@ -5358,8 +5413,8 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 								logf("Failed to begin Resize gesture (reason why should be above ^) while trying to start it as recovery.")
 							}
 						case keyDown(wincoe.VK_MBUTTON): //this doesn't get hit, doh! unless you hold it during mouse move, which is unlikely for you to do!
-							started, bypassed := tryPerformMMBGestureAt(info.Pt, shiftDown)
-							if bypassed {
+							started, refused := tryPerformMMBGestureAt(info.Pt, shiftDown)
+							if refused {
 								break // target is fullscreen; nothing to recover this time
 							}
 							markGestureUsedOnce()
@@ -5726,15 +5781,12 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 		// disqualify so we don't steal e.g. Win+Shift+Ctrl chords.
 		shiftOk := !shiftDown || allowShiftHeldBeforeResizeGesture.Load()
 		if winDown && !altDown && !ctrlDown && shiftOk {
-			started, bypassed := tryBeginResizeGestureAt(info.Pt, false, shiftDown)
-			if bypassed {
-				break // target is fullscreen; let event through
-			}
-			markGestureUsedOnce()
+			started, refused := tryBeginResizeGestureAt(info.Pt, false, shiftDown)
+			markGestureUsedOnce() // see the identical comment in the WM_LBUTTONDOWN case
 
-			if !started {
+			if !started && !refused {
 				logf("Failed to begin Resize gesture (reason why should be above ^) on winkey+RMB pressed")
-			} else if shiftDown {
+			} else if started && shiftDown {
 				// Edge/corner: apply shift-mirror as if Shift was pressed
 				// after winkey+RMB. Center+radial already seeded
 				// centerShrinkActive inside tryBeginResizeGestureAt so the
@@ -5766,13 +5818,10 @@ func mouseProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 
 		if winDown && !ctrlDown && !altDown {
 			//winDOWN and MMB pressed without ctrl/alt but maybe or not shiftDOWN too, it's a gesture of ours:
-			started, bypassed := tryPerformMMBGestureAt(info.Pt, shiftDown)
-			if bypassed {
-				break // target is fullscreen; let event through
-			}
-			markGestureUsedOnce()
+			started, refused := tryPerformMMBGestureAt(info.Pt, shiftDown)
+			markGestureUsedOnce() // see the identical comment in the WM_LBUTTONDOWN case
 
-			if !started {
+			if !started && !refused {
 				logf("Failed to perform winkey+MMB gesture (reason why should be above ^, if any)")
 			}
 
@@ -6943,11 +6992,22 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		case moveFlowTimerID:
 			pumpMoveFlow(false)
 			return 0
+		case refusalOverlayTimerID:
+			disarmMainThreadTimer(refusalOverlayTimerID, &refusalOverlayTimerArmed, "refusal overlay")
+			// Only hide our own notice; a resize overlay may have replaced it meanwhile.
+			if overlayIsRefusal && overlayIsShowing.CompareAndSwap(true, false) {
+				hideOverlay()
+			}
+			return 0
 		}
 		return wincoe.DefWindowProc(hwnd, msg, wParam, lParam).R1
 
 	case WM_HIDE_OVERLAY:
 		hideOverlay()
+		return 0
+
+	case WM_SHOW_REFUSAL_OVERLAY:
+		showRefusalOverlay(windows.Handle(wParam))
 		return 0
 
 	case WM_BRING_TO_FRONT:
@@ -7492,7 +7552,7 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 				if bypassGesturesWhenFullscreen.Load() {
 					bypassWhenFullscreenFlags |= wincoe.MF_CHECKED
 				}
-				bypassWhenFullscreenText := "Bypass all gestures when foreground window is fullscreen or borderless-fullscreen (reduces hook overhead while gaming)"
+				bypassWhenFullscreenText := bypassFullscreenMenuText
 
 				appendMenuChecked(hMenu, bypassWhenFullscreenFlags,
 					MENU_TOGGLE_BYPASS_GESTURES_WHEN_FULLSCREEN, bypassWhenFullscreenText)
@@ -7786,7 +7846,11 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		return 0
 
 	case wincoe.WM_DESTROY:
-		// _ = procPostQuitMessage.Call(0)
+		// Remove the tray icon while its owner window still (barely) exists, and
+		// stop other threads from posting to a dead handle. cleanupTray is
+		// idempotent, so deinit()'s later call is a harmless no-op.
+		cleanupTray()
+		mainMsgHwndAtomic.CompareAndSwap(uintptr(hwnd), 0)
 		wincoe.PostQuitMessage(0 /*exit code*/)
 		return 0
 
