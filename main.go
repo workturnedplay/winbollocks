@@ -836,7 +836,7 @@ const maxSentToBackStackDepth = 64
 // whose resolved target window is fullscreen (exclusive or
 // borderless-fullscreen) on its monitor. Checked live via
 // isWindowFullscreenOnMonitor against that specific target at gesture-start
-// time (see shouldBypassGestureNow) rather than against a cached
+// time (see gestureRefusalReason; such a gesture is refused: swallowed, with a red notice) rather than against a cached
 // foreground-change snapshot, so toggling this setting or switching targets
 // mid-session is always reflected immediately instead of lagging behind the
 // last EVENT_SYSTEM_FOREGROUND WinEvent.
@@ -4594,23 +4594,45 @@ func updateOverlay(x, y, w, h, startW, startH int32) {
 }
 
 // showOverlayCentered shows the shared overlay window ow x oh, centered on (cx,cy).
-// refusal selects the red word-wrapped look. Main thread only.
+// refusal selects the red word-wrapped look (see overlayWndProc). Main thread only.
 func showOverlayCentered(cx, cy, ow, oh int32, text string, refusal bool) {
 	if overlayHwnd == 0 {
 		return
 	}
+
 	overlayText = text
 	overlayIsRefusal = refusal
+
+	// Center the overlay over (cx,cy)
+	ox := cx - (ow / 2)
+	oy := cy - (oh / 2)
+
+	// res1 := procSetWindowPos.Call( //doneTODO: handle errors/returns here
+	// 	uintptr(overlayHwnd),
+	// 	HWND_TOPMOST,
+	// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+	// 	uintptr(ox),
+	// 	// #nosec G115 -- safe: Win32 coordinates are sign-extended from int32 into uintptr
+	// 	uintptr(oy),
+	// 	300, 50,
+	// 	SWP_NOACTIVATE|0x0040, // SWP_SHOWWINDOW
+	// )
+
 	overlayIsShowing.Store(true) // Mark as showing before we ask Windows to show it
 
-	// SWP_SHOWWINDOW|SWP_NOACTIVATE unhides without stealing focus.
-	if res1 := wincoe.SetWindowPos(overlayHwnd, wincoe.HWND_TOPMOST, cx-ow/2, cy-oh/2, ow, oh, wincoe.SWP_NOACTIVATE|wincoe.SWP_SHOWWINDOW); res1.Failed() {
+	//Combining SWP_SHOWWINDOW and SWP_NOACTIVATE will successfully unhide (display) a window that was hidden using SW_HIDE,
+	//  and it will do so without stealing input focus or bringing the window to the foreground.
+	//SWP_SHOWWINDOW (0x0040): Overrides the hidden state, turns the WS_VISIBLE style back on, and makes the window appear on screen.
+	//SWP_NOACTIVATE (0x0010): Tells Windows: "Show the window, but do not give it keyboard focus and do not make it the active foreground window."
+	if res1 := wincoe.SetWindowPos(overlayHwnd, wincoe.HWND_TOPMOST, ox, oy, ow, oh, wincoe.SWP_NOACTIVATE|wincoe.SWP_SHOWWINDOW); res1.Failed() {
 		logf("in showOverlayCentered, failed to SetWindowPos of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res1.Err, res1.CallStatus)
 	}
-	if res2 := wincoe.InvalidateRect(overlayHwnd, nil, true); res2.Failed() {
-		logf("in showOverlayCentered, failed to InvalidateRect of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
-	}
 
+	// Force redraw, well the redraw is queued, whenever Windows gets around to it.
+	// res2 := procInvalidateRect.Call(uintptr(overlayHwnd), 0, 1)
+	if res2 := wincoe.InvalidateRect(overlayHwnd, nil, true); res2.Failed() {
+		logf("in showOverlayCentered, failed to InvalidateRect of overlayHwnd:0x%X (meant to eventually cause a repaint), err:%v, callStatus:%v", overlayHwnd, res2.Err, res2.CallStatus)
+	}
 	/*
 		(press alt+z to temporarily toggle wordwrap to read this)
 
@@ -4642,10 +4664,13 @@ func showOverlayCentered(cx, cy, ow, oh int32, text string, refusal bool) {
 
 		InvalidateRect does not draw anything. It simply tells Windows: "Hey, mark this area as dirty. Next time you have absolutely nothing else to do and the queue is empty, please send me a WM_PAINT." Because your main thread is busy aggressively draining the moveDataChan and calling SetWindowPos for the target window, the queue is never empty. Your overlay's WM_PAINT is starved until you stop dragging the mouse.
 	*/
-	// <-- the existing long comment block goes here -->
+	//doneTODO: do I want this to happen unconditionally? or should it be in a systray bool like others?!
+	// A refusal notice is a one-shot (no stream of resize events to trigger later repaints), so it always repaints immediately.
 	if immediateOverlayRepaint.Load() || refusal {
-		if res3 := wincoe.UpdateWindow(overlayHwnd); res3.Failed() {
-			logf("in showOverlayCentered, failed to UpdateWindow of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res3.Err, res3.CallStatus)
+		//res3 := procUpdateWindow.Call(uintptr(overlayHwnd))
+
+		if res3 := wincoe.UpdateWindow(overlayHwnd); res3.Failed() { // <--- Forces immediate synchronous repaint
+			logf("in showOverlayCentered, failed to UpdateWindow aka repaint of overlayHwnd:0x%X, err:%v, callStatus:%v", overlayHwnd, res3.Err, res3.CallStatus)
 		}
 	}
 }
@@ -4675,7 +4700,15 @@ var (
 	refusalOverlayTimerArmed atomic.Bool
 )
 
-// gestureRefusalReason returns why no gesture may act on hwnd, or "" if one may.
+// gestureRefusalReason returns why no gesture may act on hwnd (the window the
+// gesture would actually target), or "" if one may. Explorer's desktop-host and
+// taskbar windows are always refused. A fullscreen (exclusive or borderless)
+// window is refused only while bypassGesturesWhenFullscreen is enabled.
+//
+// The fullscreen check is done live via isWindowFullscreenOnMonitor against that
+// specific hwnd, rather than against a foreground-change WinEvent cache, since
+// such a cache only refreshes on foreground transitions and can lag behind
+// whichever window a gesture is actually about to act on.
 func gestureRefusalReason(hwnd windows.Handle) string {
 	if isExplorerShellSurface(hwnd) {
 		return "explorer's desktop/taskbar windows are never moved, resized or sent to back"
@@ -8370,6 +8403,22 @@ func logf(format string, args ...any) {
 // 	}
 // }
 
+// otherShiftKeyHeld reports whether the Shift key OPPOSITE to releasedVk is
+// still physically down. Called while handling releasedVk's key-up inside the
+// low-level hook: GetAsyncKeyState is stale for releasedVk itself (see the
+// notes in keyboardProc) but accurate for the other key. The generic VK_SHIFT
+// can't be attributed to a side, so it is treated as "no other Shift held".
+func otherShiftKeyHeld(releasedVk uint32) bool {
+	switch releasedVk {
+	case wincoe.VK_LSHIFT:
+		return keyDown(wincoe.VK_RSHIFT)
+	case wincoe.VK_RSHIFT:
+		return keyDown(wincoe.VK_LSHIFT)
+	default:
+		return false
+	}
+}
+
 /*
 5️⃣ Why this wiring is correct (sanity check)
 
@@ -8554,7 +8603,10 @@ func keyboardProc(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 			return 1 // balance the ESC down we swallowed
 		}
 		if vk == wincoe.VK_SHIFT || vk == wincoe.VK_LSHIFT || vk == wincoe.VK_RSHIFT {
-			postShiftMirrorToggleIfNeeded(false)
+			// Only the release of the LAST held Shift ends the Shift effect.
+			if !otherShiftKeyHeld(vk) {
+				postShiftMirrorToggleIfNeeded(false)
+			}
 		}
 		switch vk {
 		case wincoe.VK_LWIN, wincoe.VK_RWIN:
@@ -9618,6 +9670,11 @@ func runApplication(_token theILockedMainThreadToken) error { //XXX: must be cal
 		logf("WTSRegisterSessionNotification failed, err: %v; lock/unlock-triggered stale-session cleanup (see WM_WTSSESSION_CHANGE in wndProc) will be unavailable this run.", res.Err)
 	} else {
 		defer func() {
+			if !wincoe.IsWindow(hwnd) {
+				// Already destroyed (normal exit goes through WM_DESTROY); destroying the window
+				// unregistered it implicitly, so unregistering again would only log a bogus failure.
+				return
+			}
 			// if res2 := procWTSUnRegisterSessionNotification.Call(uintptr(mainMsgHwnd)); res2.Failed() {
 			if res2 := wincoe.WTSUnRegisterSessionNotification(hwnd); res2.Failed() {
 				logf("WTSUnRegisterSessionNotification failed, err: %v", res2.Err)
