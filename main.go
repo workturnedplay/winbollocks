@@ -3689,6 +3689,18 @@ func startDrag(hwnd windows.Handle, pt wincoe.POINT, viaMissedGestureRecovery bo
 	return startManualDrag(hwnd, pt, viaMissedGestureRecovery, wasMaximized, r)
 }
 
+// postBringToFront posts WM_BRING_TO_FRONT for targetWnd (handled on the main
+// thread). callerName is only used in the failure logs.
+func postBringToFront(msgHwnd, targetWnd windows.Handle, callerName string) {
+	if msgHwnd == 0 {
+		logf("%s: postBringToFront for HWND=0x%X failed due to mainMsgHwnd is 0", callerName, targetWnd)
+		return
+	}
+	if res := wincoe.PostMessage(msgHwnd, WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
+		logf("%s: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", callerName, targetWnd, res.Err)
+	}
+}
+
 // applyFocusAndBringToFrontOnGestureStart optionally brings targetWnd to the
 // front of the Z-order and/or focuses it, right after a move or resize
 // gesture has successfully started. bringToFront and focus are the
@@ -3709,9 +3721,7 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe
 		// the move channel, which would be coalesced away by move events for
 		// the same HWND.
 		//if res := wincoe.PostMessage(uintptr(mainMsgHwnd), WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
-		if res := wincoe.PostMessage(msgHwnd, WM_BRING_TO_FRONT, uintptr(targetWnd), 0); res.Failed() {
-			logf("%s: PostMessage WM_BRING_TO_FRONT for HWND=0x%X failed: %v", callerName, targetWnd, res.Err)
-		}
+		postBringToFront(msgHwnd, targetWnd, callerName)
 	}
 	if focus.Load() && !isWindowForeground(targetWnd) { //TODO: should I move this in startDrag?
 		//doneFIXME: should probably embed the targetWnd into the message instead of using whichever the current dragged window is, otherwise it might miss focusing the clicked window due to delays in processing if a new window was quick-engouh clicked since!
@@ -3764,6 +3774,8 @@ func applyFocusAndBringToFrontOnGestureStart(targetWnd windows.Handle, pt wincoe
 // Start menu doesn't pop). started is false for any other reason nothing began
 // (no window under pt, a resize is already running, startDrag failed, etc.),
 // and callers should swallow the originating input then too.
+// refused is also true, without any notice, when the gesture was handled in a
+// different way instead (winkey+LMB on the taskbar raises it rather than dragging it).
 //
 // viaMissedGestureRecovery must be true only when called from the
 // missed-gesture recovery path (we never saw/swallowed the real LMB-down),
@@ -3774,6 +3786,16 @@ func tryBeginMoveGestureAt(pt wincoe.POINT, viaMissedGestureRecovery bool) (star
 	if wantTargetWnd == 0 {
 		logf("Invalid window(tryBeginMoveGestureAt:RootWindowFromPoint res:%v), window-move gesture skipped but LMB eaten and start menu will still be prevented(now even if you LMB on a higher integrity eg. admin window before you release winkey)", res1)
 		return false, false
+	}
+
+	if isTaskbarWindow(wantTargetWnd) {
+		// The taskbar must never be dragged, but winkey+LMB is THE way to bring a window to
+		// the front without clicking it, which for a sent-to-back taskbar is exactly wanted.
+		// Reported as refused (= consumed: the click is swallowed and the gesture counts as
+		// used) but with no red notice, since something useful happened instead.
+		logf("tryBeginMoveGestureAt: winkey+LMB on the taskbar HWND=0x%X: bringing it to the front instead of dragging it", wantTargetWnd)
+		postBringToFront(loadMainMsgHwnd(), wantTargetWnd, "tryBeginMoveGestureAt")
+		return false, true
 	}
 
 	if refuseGestureOn(wantTargetWnd, gestureKindMoveOrResize) {
@@ -4096,12 +4118,7 @@ func tryPerformMMBGestureAt(
 	}
 
 	data.Hwnd = hwnd
-	data.InsertAfter = wincoe.HWND_TOP
-	if isTaskbarWindow(hwnd) {
-		// Sending it to HWND_BOTTOM stripped its topmost style; HWND_TOP would bring it back
-		// as an ordinary window that topmost windows (and a re-raised flyout) can cover.
-		data.InsertAfter = wincoe.HWND_TOPMOST
-	}
+	data.InsertAfter = insertAfterForRaise(hwnd) // HWND_TOP, or HWND_TOPMOST for the taskbar
 	data.Flags =
 		wincoe.SWP_NOMOVE |
 			wincoe.SWP_NOSIZE |
@@ -4803,6 +4820,13 @@ func showRefusalOverlay(target windows.Handle) {
 		cx, cy = pt.X, pt.Y
 	}
 	if work, ok := monitorWorkAreaFor(target); ok {
+		if isExplorerShellSurface(target) {
+			// The taskbar is topmost and re-asserts itself over our (also topmost) notice, so
+			// centering on it hides all but the first line; the desktop hosts span everything.
+			// Center on the monitor's work area instead.
+			cx = work.Left + (work.Right-work.Left)/2
+			cy = work.Top + (work.Bottom-work.Top)/2
+		}
 		cx = max(work.Left+refusalOverlayWidth/2, min(cx, work.Right-refusalOverlayWidth/2))
 		cy = max(work.Top+refusalOverlayHeight/2, min(cy, work.Bottom-refusalOverlayHeight/2))
 	}
@@ -6916,6 +6940,7 @@ func executeMoveOrResize(data WindowMoveData) {
 			// Remove the undo entry only after HWND_TOP succeeds.
 			completeSentToBackRestoration(data.SentToBackRestoreID)
 			focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+			cancelShellSendToBackRecheck(target)
 
 			restoreIfMinimized(target)
 
@@ -6929,6 +6954,7 @@ func executeMoveOrResize(data WindowMoveData) {
 
 		case zOrderActionRestoreFocused:
 			focusedSentToBackHwnd.CompareAndSwap(uintptr(target), 0)
+			cancelShellSendToBackRecheck(target)
 
 			if !forceForeground(target) {
 				logf(
@@ -6945,6 +6971,9 @@ func executeMoveOrResize(data WindowMoveData) {
 		} //switch
 		if data.ZOrderAction == zOrderActionSendToBack {
 			verifySentToBackOrMinimize(target)
+			if isTaskbarWindow(target) {
+				scheduleShellSendToBackRecheck(target)
+			}
 		}
 	} //else
 } //func
@@ -7054,6 +7083,9 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 		case moveFlowTimerID:
 			pumpMoveFlow(false)
 			return 0
+		case shellSendToBackRecheckTimerID:
+			runShellSendToBackRecheck()
+			return 0
 		case refusalOverlayTimerID:
 			disarmMainThreadTimer(refusalOverlayTimerID, &refusalOverlayTimerArmed, "refusal overlay")
 			// Only hide our own notice; a resize overlay may have replaced it meanwhile.
@@ -7080,10 +7112,11 @@ var wndProc = windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, 
 			return 0
 		}
 
-		if res := wincoe.SetWindowPos(target, wincoe.HWND_TOP, 0, 0, 0, 0,
+		cancelShellSendToBackRecheck(target) // the user brought it back on purpose; don't undo that
+		if res := wincoe.SetWindowPos(target, insertAfterForRaise(target), 0, 0, 0, 0,
 			wincoe.SWP_NOMOVE|wincoe.SWP_NOSIZE|wincoe.SWP_NOACTIVATE,
 		); res.Failed() {
-			logf("WM_BRING_TO_FRONT: SetWindowPos(HWND_TOP) on HWND=0x%X failed: %v", target, res.Err)
+			logf("WM_BRING_TO_FRONT: SetWindowPos(insertAfter=0x%X) on HWND=0x%X failed: %v", insertAfterForRaise(target), target, res.Err)
 		}
 		return 0
 

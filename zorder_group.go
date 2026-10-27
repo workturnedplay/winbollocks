@@ -695,3 +695,85 @@ func ensureSentToBack(target windows.Handle, phase string) error {
 	}
 	return fmt.Errorf("ensureSentToBack(%s): every stage failed for HWND=0x%X: %w", phase, target, errSendToBackFailed)
 }
+
+// shellSendToBackRecheck* implement a short re-check-and-re-send for the taskbar
+// after winkey+MMB sends it to the back: the send itself succeeds and verifies, but
+// shifting focus away from the (previously foreground) taskbar makes explorer
+// re-raise it a moment LATER, asynchronously (seen as a one-frame flash, and a
+// second winkey+MMB being needed). The second press works because the taskbar is
+// then no longer foreground, so no focus change follows. Main thread only.
+const (
+	shellSendToBackRecheckTimerID = 4
+	shellSendToBackRecheckMs      = 120
+	shellSendToBackRecheckCount   = 3
+)
+
+var (
+	shellSendToBackRecheckTarget     windows.Handle
+	shellSendToBackRechecksLeft      int
+	shellSendToBackRecheckTimerArmed atomic.Bool
+)
+
+// insertAfterForRaise returns the hwndInsertAfter that brings hwnd back to the
+// top: HWND_TOP, except for the taskbar, which is topmost: sending it to
+// HWND_BOTTOM stripped that style, and HWND_TOP would bring it back as an
+// ordinary window that topmost windows (and a re-raised flyout) can cover.
+func insertAfterForRaise(hwnd windows.Handle) windows.Handle {
+	if isTaskbarWindow(hwnd) {
+		return wincoe.HWND_TOPMOST
+	}
+	return wincoe.HWND_TOP
+}
+
+// scheduleShellSendToBackRecheck starts the re-check ticks for target.
+func scheduleShellSendToBackRecheck(target windows.Handle) {
+	shellSendToBackRecheckTarget = target
+	shellSendToBackRechecksLeft = shellSendToBackRecheckCount
+	armMainThreadTimer(shellSendToBackRecheckTimerID, shellSendToBackRecheckMs, &shellSendToBackRecheckTimerArmed, "shell send-to-back recheck")
+}
+
+// stopShellSendToBackRecheck ends the re-check unconditionally. Idempotent.
+func stopShellSendToBackRecheck() {
+	shellSendToBackRecheckTarget = 0
+	shellSendToBackRechecksLeft = 0
+	disarmMainThreadTimer(shellSendToBackRecheckTimerID, &shellSendToBackRecheckTimerArmed, "shell send-to-back recheck")
+}
+
+// cancelShellSendToBackRecheck ends the re-check only if it is for target, so the
+// user bringing the taskbar back is never undone by a pending re-send.
+func cancelShellSendToBackRecheck(target windows.Handle) {
+	if shellSendToBackRecheckTarget != target {
+		return
+	}
+	stopShellSendToBackRecheck()
+}
+
+// runShellSendToBackRecheck is one timer tick: if the target has been re-raised
+// (a visible foreign window is below it again), re-send it to HWND_BOTTOM.
+func runShellSendToBackRecheck() {
+	target := shellSendToBackRecheckTarget
+	if target == 0 {
+		stopShellSendToBackRecheck()
+		return
+	}
+	shellSendToBackRechecksLeft--
+	if shellSendToBackRechecksLeft <= 0 {
+		defer stopShellSendToBackRecheck() // last tick
+	}
+	if !wincoe.IsWindow(target) {
+		return
+	}
+	blockers, err := visibleForeignWindowsBelow(target, maxBlockersLogged)
+	if err != nil {
+		logf("runShellSendToBackRecheck: couldn't verify z-order of HWND=0x%X: %v", target, err)
+		return
+	}
+	if len(blockers) == 0 {
+		return // still at the back
+	}
+	logf("runShellSendToBackRecheck: HWND=0x%X was re-raised after being sent to the back (explorer re-asserting it?); re-sending it to HWND_BOTTOM", target)
+	logBlockingWindows("shell recheck", target, blockers)
+	if err := stagePlainBottom(target); err != nil {
+		logf("runShellSendToBackRecheck: %v", err)
+	}
+}
