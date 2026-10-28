@@ -26,6 +26,11 @@ rem go env CC
 rem go env GOARCH
 rem go env GORACE
 gcc --version
+if errorlevel 1 (
+  echo ERROR: gcc not found in PATH, the race detector needs cgo.
+  pause
+  exit /b 1
+)
 rem gcc (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r7) 15.2.0
 
 set "BUILD_WITH_RACE_DETECTOR=-race"

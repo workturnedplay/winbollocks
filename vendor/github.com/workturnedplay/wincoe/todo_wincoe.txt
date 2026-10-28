@@ -1,5 +1,6 @@
 todo:
 
+* "CheckWinResult prefers a non-zero callErr (GetLastError()) over r1. That is wrong for the CheckErrno APIs (iphlpapi), where r1 is the authoritative error code. If any of those APIs happens to SetLastError something unrelated internally, e.g. GetExtendedUdpTable returning ERROR_INSUFFICIENT_BUFFER in r1, callWithRetry would never see it. Fixing it means a check function that can choose the error source, which changes WinCheckFunc’s shape and the “prefers callErr over r1” test case you wrote on purpose." - Claude Sonnet 5.5 High
 
 dontfix:
 

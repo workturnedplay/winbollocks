@@ -148,6 +148,14 @@ type BoundProcN struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProcN/NewLazyBoundProcN (ie. it's a zero value with nil proc/check).
+func (b *BoundProcN) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProcN." + who + ": uninitialized BoundProcN, it must be created via NewBoundProcN or NewLazyBoundProcN")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -169,12 +177,14 @@ type BoundProcN struct {
 //
 //go:uintptrescapes
 func (b *BoundProcN) Call(args ...uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCallN(b.proc, b.check, args...)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProcN) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProcN:Find says that LazyProcishWrapperForMocksN/LazyProc.Find() failed, err: %w", err)
 	}
@@ -389,17 +399,27 @@ type BoundProc0 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc0/NewLazyBoundProc0 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc0) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc0." + who + ": uninitialized BoundProc0, it must be created via NewBoundProc0 or NewLazyBoundProc0")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // This arity (0) takes no arguments at all, so there is nothing that
 // could alias a Go pointer and no need for an escape-pinning compiler directive here.
 func (b *BoundProc0) Call() WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall0(b.proc, b.check)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc0) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc0:Find says that LazyProcishWrapperForMocks0/LazyProc.Find() failed, err: %w", err)
 	}
@@ -611,6 +631,14 @@ type BoundProc1 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc1/NewLazyBoundProc1 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc1) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc1." + who + ": uninitialized BoundProc1, it must be created via NewBoundProc1 or NewLazyBoundProc1")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -632,12 +660,14 @@ type BoundProc1 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc1) Call(a1 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall1(b.proc, b.check, a1)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc1) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc1:Find says that LazyProcishWrapperForMocks1/LazyProc.Find() failed, err: %w", err)
 	}
@@ -856,6 +886,14 @@ type BoundProc2 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc2/NewLazyBoundProc2 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc2) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc2." + who + ": uninitialized BoundProc2, it must be created via NewBoundProc2 or NewLazyBoundProc2")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -877,12 +915,14 @@ type BoundProc2 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc2) Call(a1, a2 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall2(b.proc, b.check, a1, a2)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc2) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc2:Find says that LazyProcishWrapperForMocks2/LazyProc.Find() failed, err: %w", err)
 	}
@@ -1101,6 +1141,14 @@ type BoundProc3 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc3/NewLazyBoundProc3 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc3) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc3." + who + ": uninitialized BoundProc3, it must be created via NewBoundProc3 or NewLazyBoundProc3")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -1122,12 +1170,14 @@ type BoundProc3 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc3) Call(a1, a2, a3 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall3(b.proc, b.check, a1, a2, a3)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc3) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc3:Find says that LazyProcishWrapperForMocks3/LazyProc.Find() failed, err: %w", err)
 	}
@@ -1346,6 +1396,14 @@ type BoundProc4 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc4/NewLazyBoundProc4 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc4) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc4." + who + ": uninitialized BoundProc4, it must be created via NewBoundProc4 or NewLazyBoundProc4")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -1367,12 +1425,14 @@ type BoundProc4 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc4) Call(a1, a2, a3, a4 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall4(b.proc, b.check, a1, a2, a3, a4)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc4) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc4:Find says that LazyProcishWrapperForMocks4/LazyProc.Find() failed, err: %w", err)
 	}
@@ -1591,6 +1651,14 @@ type BoundProc5 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc5/NewLazyBoundProc5 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc5) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc5." + who + ": uninitialized BoundProc5, it must be created via NewBoundProc5 or NewLazyBoundProc5")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -1612,12 +1680,14 @@ type BoundProc5 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc5) Call(a1, a2, a3, a4, a5 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall5(b.proc, b.check, a1, a2, a3, a4, a5)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc5) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc5:Find says that LazyProcishWrapperForMocks5/LazyProc.Find() failed, err: %w", err)
 	}
@@ -1836,6 +1906,14 @@ type BoundProc6 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc6/NewLazyBoundProc6 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc6) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc6." + who + ": uninitialized BoundProc6, it must be created via NewBoundProc6 or NewLazyBoundProc6")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -1857,12 +1935,14 @@ type BoundProc6 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc6) Call(a1, a2, a3, a4, a5, a6 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall6(b.proc, b.check, a1, a2, a3, a4, a5, a6)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc6) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc6:Find says that LazyProcishWrapperForMocks6/LazyProc.Find() failed, err: %w", err)
 	}
@@ -2081,6 +2161,14 @@ type BoundProc7 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc7/NewLazyBoundProc7 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc7) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc7." + who + ": uninitialized BoundProc7, it must be created via NewBoundProc7 or NewLazyBoundProc7")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -2102,12 +2190,14 @@ type BoundProc7 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc7) Call(a1, a2, a3, a4, a5, a6, a7 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall7(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc7) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc7:Find says that LazyProcishWrapperForMocks7/LazyProc.Find() failed, err: %w", err)
 	}
@@ -2326,6 +2416,14 @@ type BoundProc8 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc8/NewLazyBoundProc8 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc8) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc8." + who + ": uninitialized BoundProc8, it must be created via NewBoundProc8 or NewLazyBoundProc8")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -2347,12 +2445,14 @@ type BoundProc8 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc8) Call(a1, a2, a3, a4, a5, a6, a7, a8 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall8(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7, a8)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc8) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc8:Find says that LazyProcishWrapperForMocks8/LazyProc.Find() failed, err: %w", err)
 	}
@@ -2571,6 +2671,14 @@ type BoundProc9 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc9/NewLazyBoundProc9 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc9) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc9." + who + ": uninitialized BoundProc9, it must be created via NewBoundProc9 or NewLazyBoundProc9")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -2592,12 +2700,14 @@ type BoundProc9 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc9) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall9(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7, a8, a9)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc9) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc9:Find says that LazyProcishWrapperForMocks9/LazyProc.Find() failed, err: %w", err)
 	}
@@ -2816,6 +2926,14 @@ type BoundProc10 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc10/NewLazyBoundProc10 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc10) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc10." + who + ": uninitialized BoundProc10, it must be created via NewBoundProc10 or NewLazyBoundProc10")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -2837,12 +2955,14 @@ type BoundProc10 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc10) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall10(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc10) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc10:Find says that LazyProcishWrapperForMocks10/LazyProc.Find() failed, err: %w", err)
 	}
@@ -3061,6 +3181,14 @@ type BoundProc11 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc11/NewLazyBoundProc11 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc11) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc11." + who + ": uninitialized BoundProc11, it must be created via NewBoundProc11 or NewLazyBoundProc11")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -3082,12 +3210,14 @@ type BoundProc11 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc11) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall11(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc11) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc11:Find says that LazyProcishWrapperForMocks11/LazyProc.Find() failed, err: %w", err)
 	}
@@ -3306,6 +3436,14 @@ type BoundProc12 struct {
 	check WinCheckFunc
 }
 
+// assertInitialized panics (via panic2, so it gets logged) if b is nil or was not created through
+// NewBoundProc12/NewLazyBoundProc12 (ie. it's a zero value with nil proc/check).
+func (b *BoundProc12) assertInitialized(who string) {
+	if b == nil || b.proc == nil || b.check == nil {
+		panic2("BoundProc12." + who + ": uninitialized BoundProc12, it must be created via NewBoundProc12 or NewLazyBoundProc12")
+	}
+}
+
 // Call executes the underlying Windows procedure with the provided arguments.
 //
 // SECURITY WARNING: This method uses the //go:uintptrescapes compiler directive.
@@ -3327,12 +3465,14 @@ type BoundProc12 struct {
 //
 //go:uintptrescapes
 func (b *BoundProc12) Call(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12 uintptr) WinResult {
+	b.assertInitialized("Call")
 	return internalWinCall12(b.proc, b.check, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12)
 }
 
 // Find attempts to locate the procedure in the DLL.
 // Returns nil if the procedure is successfully found, or an error if it is not.
 func (b *BoundProc12) Find() error {
+	b.assertInitialized("Find")
 	if err := b.proc.Find(); err != nil {
 		return fmt.Errorf("BoundProc12:Find says that LazyProcishWrapperForMocks12/LazyProc.Find() failed, err: %w", err)
 	}

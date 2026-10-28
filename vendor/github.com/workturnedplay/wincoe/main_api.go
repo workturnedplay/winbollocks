@@ -34,9 +34,11 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -336,6 +338,7 @@ func ReadKeySequence() {
 
 // Minimal local copies of the Win32 structs we need.
 type inputRecord struct {
+	_         [0]uint32 // zero-size, forces 4-byte struct alignment so the keyEventRecord view of Event (offset 4) is always aligned
 	EventType uint16
 	_         [2]byte
 	Event     [16]byte
@@ -931,6 +934,9 @@ func CheckWinResult(
 	r1 uintptr,
 	callErr error,
 ) error {
+	if isFailure == nil {
+		panic2(fmt.Sprintf("CheckWinResult: nil WinCheckFunc passed for operation %q", operationNameToIncludeInErrorMessages))
+	}
 	if !isFailure(r1, callErr) {
 		// Success: return nil so 'if err != nil' behaves normally.
 		return nil
@@ -945,8 +951,7 @@ func CheckWinResult(
 	if callErr == nil {
 		// Many Win32 APIs (e.g. GetExtendedUdpTable) return the error in r1.
 		// Only treat r1 as an errno if it's non-zero.
-		if r1 != 0 { // 0 here is exactly windows.ERROR_SUCCESS
-			errno := windows.Errno(r1) //doneTODO: see how we can match against this, I doubt errors.Is still works for this! actually, it seems to, based on the below!
+		if errno, ok := errnoFromR1(r1); ok { // a plausible non-zero Win32 error code in r1 (so never ERROR_SUCCESS)
 
 			//I keep the redundancy of these 2 compile-time asserts(type and var) here, on purpose(and the package level one before this function there as well):
 
@@ -967,14 +972,48 @@ func CheckWinResult(
 		//fmt.Printf("[GoR:%d] !ending   CheckWinResult for %s with truly unknown failure: ret=%d\n", GoRoutineId(), operationNameToIncludeInErrorMessages, r1)
 		// Fallback: truly unknown failure
 		return fmt.Errorf(
-			"%q windows call reported failure (ret=%d) but no usable error was provided",
+			"%q windows call reported failure (ret=%d aka 0x%X) but no usable error was provided",
 			operationNameToIncludeInErrorMessages,
-			r1,
+			r1, r1,
 		)
 	}
 
 	// Normal path: we have a meaningful callErr
 	return fmt.Errorf("%q windows call failed with error: %w", operationNameToIncludeInErrorMessages, callErr)
+}
+
+// errnoFromR1 reports whether r1 (of a call that already failed) can be read as a Win32 error code:
+// either a plain code (Win32 error codes are 16-bit) or HRESULT_FROM_WIN32(code) (0x8007xxxx, possibly sign-extended
+// to 64 bits). Everything else (-1 handles, other HRESULTs, NTSTATUS, ...) is NOT an errno and must not be
+// presented as one.
+func errnoFromR1(r1 uintptr) (windows.Errno, bool) {
+	const (
+		maxWin32Errno      = 0xFFFF
+		hresultWin32Mask   = 0xFFFF0000
+		hresultWin32Prefix = 0x80070000 // severity=1, facility=FACILITY_WIN32
+	)
+	if r1 != 0 && r1 <= maxWin32Errno {
+		return windows.Errno(r1), true
+	}
+	// #nosec G115 -- intentional truncation: only the low 32 bits of an HRESULT are significant
+	if low := uint32(r1); low&hresultWin32Mask == hresultWin32Prefix && low&maxWin32Errno != 0 {
+		return windows.Errno(low & maxWin32Errno), true
+	}
+	return 0, false
+}
+
+// errnoInR1Result is for the Win32 APIs that return their error CODE in r1 (the iphlpapi table getters, route
+// create/delete, GetBestInterface, ...). For those r1 is authoritative, whereas CheckWinResult prefers CallStatus
+// (GetLastError() captured after the call), which is only meaningful if the API itself happened to SetLastError
+// something unrelated. On failure this replaces res.Err with the error derived from r1 (when r1 is a usable errno).
+func errnoInR1Result(op string, res WinResult) WinResult {
+	if res.Succeeded() {
+		return res
+	}
+	if errno, ok := errnoFromR1(res.R1); ok {
+		res.Err = fmt.Errorf("%q windows call failed with error: %w", op, errno)
+	}
+	return res
 }
 
 // // LazyProcishWrapperForMocksN is the minimal interface that WinCall needs from a windows.LazyProc-like object.
@@ -1728,8 +1767,6 @@ func callWithRetry(who string, initialSize uint32, call func(bufPtr *byte, s *ui
 // boolToUintptr performs an explicit conversion from a Go bool to a
 // Windows-compatible BOOL (uintptr(1) for true, uintptr(0) for false).
 // This is required because Go bools cannot be directly cast to numeric types.
-//
-//go:inline
 func boolToUintptr(b bool) uintptr {
 	if b {
 		return 1
@@ -1773,7 +1810,7 @@ func GetExtendedUDPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(UDP_TABLE_OWNER_PID),
 			0,
 		)
-		return res1.Err
+		return errnoInR1Result("GetExtendedUdpTable", res1).Err
 	})
 }
 
@@ -1789,7 +1826,7 @@ func GetExtendedTCPTable(order bool, family uint32) ([]byte, error) {
 			uintptr(TCP_TABLE_OWNER_PID_ALL), // Value 5: Get all states + PID
 			0,
 		)
-		return res1.Err
+		return errnoInR1Result("GetExtendedTcpTable", res1).Err
 	})
 }
 
@@ -2282,88 +2319,27 @@ func utf16StringWithinBounds(strPtr *uint16, bufLastByte unsafe.Pointer) (string
 	return "", false // no null terminator found before buffer end
 }
 
-// func utf16StringWithinBounds4(strPtr *uint16, bufEnd unsafe.Pointer) (string, bool) { // by Gemini 3.6 Thinking
-// 	if strPtr == nil || bufEnd == nil {
-// 		return "", false
-// 	}
+// clientEndpointForTableLookup validates a client's (ip, port) and derives what the extended TCP/UDP table lookups
+// need: the address family, whether to walk the IPv4 or the IPv6 row layout, and the port as uint16.
+func clientEndpointForTableLookup(ip net.IP, port int) (family uint32, isIPv4 bool, port16 uint16, err error) {
+	if len(ip) != net.IPv4len && len(ip) != net.IPv6len {
+		return 0, false, 0, fmt.Errorf("invalid client IP (length %d): %v", len(ip), ip)
+	}
+	if port < 0 || port > math.MaxUint16 {
+		return 0, false, 0, fmt.Errorf("invalid network port: %d", port)
+	}
+	isIPv4 = ip.To4() != nil
+	family = AF_INET
+	if !isIPv4 {
+		family = AF_INET6
+	}
+	return family, isIPv4, uint16(port), nil // #nosec G115 -- range-checked above
+}
 
-// 	startAddr := uintptr(unsafe.Pointer(strPtr))
-// 	endAddr := uintptr(bufEnd)
-
-// 	if startAddr >= endAddr {
-// 		return "", false
-// 	}
-
-// 	// Calculate maximum allowed uint16 elements before bufEnd
-// 	maxUnits := int((endAddr - startAddr) / 2)
-// 	if maxUnits <= 0 {
-// 		return "", false
-// 	}
-
-// 	// unsafe.Slice accepts *uint16 directly—no unsafe.Pointer conversion needed!
-// 	units := unsafe.Slice(strPtr, maxUnits)
-
-// 	for i, u := range units {
-// 		if u == 0 {
-// 			return windows.UTF16ToString(units[:i]), true
-// 		}
-// 	}
-
-// 	return "", false // no null terminator found before bufEnd
-// }
-
-// func utf16StringWithinBounds0(startAddr, endAddr uintptr) (string, bool) { //this was made by Claude Sonnet 5 Extra Thinking
-// 	var units []uint16
-// 	for addr := startAddr; addr+1 < endAddr; addr += 2 {
-// 		//main_api.go:1470:19: possible misuse of unsafe.Pointer
-// 		u := *(*uint16)(unsafe.Pointer(addr)) //nolint:gosec // bounds-checked by the loop condition above
-// 		if u == 0 {
-// 			return windows.UTF16ToString(units), true
-// 		}
-// 		units = append(units, u)
-// 	}
-// 	return "", false // no null terminator found before endAddr
-// }
-
-// func utf16StringWithinBounds1(startAddr, endAddr uintptr) (string, bool) { // by Gemini 3.6 Thinking
-// 	var units []uint16
-// 	basePtr := unsafe.Pointer(startAddr) //possible misuse of unsafe.Pointer
-
-// 	for offset := uintptr(0); startAddr+offset+1 < endAddr; offset += 2 {
-// 		// unsafe.Add performs single-expression pointer arithmetic
-// 		u := *(*uint16)(unsafe.Add(basePtr, offset))
-// 		if u == 0 {
-// 			return windows.UTF16ToString(units), true
-// 		}
-// 		units = append(units, u)
-// 	}
-
-// 	return "", false // no null terminator found before endAddr
-// }
-
-// func utf16StringWithinBounds2(startAddr, endAddr uintptr) (string, bool) { // by Gemini 3.6 Thinking
-// 	if startAddr >= endAddr {
-// 		return "", false
-// 	}
-
-// 	// Calculate the max possible uint16 elements in the memory range
-// 	count := (endAddr - startAddr) / 2
-// 	if count == 0 {
-// 		return "", false
-// 	}
-
-// 	// Create a slice referencing the memory range
-// 	units := unsafe.Slice((*uint16)(unsafe.Pointer(startAddr)), count) //possible misuse of unsafe.Pointer
-
-// 	// Search for null terminator
-// 	for i, u := range units {
-// 		if u == 0 {
-// 			return windows.UTF16ToString(units[:i]), true
-// 		}
-// 	}
-
-// 	return "", false // no null terminator found before endAddr
-// }
+// tablePortToHost converts a dwLocalPort table field (port in network byte order in its low 16 bits) to host order.
+func tablePortToHost(raw uint32) uint16 {
+	return bits.ReverseBytes16(uint16(raw)) // #nosec G115 -- only the low 16 bits are the port
+}
 
 // PidAndExeForUDP returns (pid, exePath_or_exeName, error).
 // clientAddr should be the remote UDP address observed on the server side.
@@ -2374,15 +2350,9 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 	}
 
 	ip := clientAddr.IP
-	if clientAddr.Port < 0 || clientAddr.Port > 65535 {
-		return 0, "", fmt.Errorf("invalid network port: %d", clientAddr.Port)
-	}
-	port := uint16(clientAddr.Port)
-
-	isIPv4 := ip.To4() != nil
-	family := uint32(AF_INET)
-	if !isIPv4 {
-		family = AF_INET6
+	family, isIPv4, port, err := clientEndpointForTableLookup(ip, clientAddr.Port)
+	if err != nil {
+		return 0, "", fmt.Errorf("PidAndExeForUDP: %w", err)
 	}
 
 	buf, err := GetExtendedUDPTable(false, family)
@@ -2422,8 +2392,7 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 			//prepare for next entry
 			offset += rowSize
 			// localPortRaw stores port in network byte order in low 16 bits.
-			localPort := uint16(localPortRaw & 0xFFFF)
-			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8 // convert to host order
+			localPort := tablePortToHost(localPortRaw) // convert to host order
 
 			// convert DWORD IP (little-endian) to net.IP
 			ipb := []byte{
@@ -2459,8 +2428,7 @@ func PidAndExeForUDP(clientAddr *net.UDPAddr) (uint32, string, error) {
 			owningPid := binary.LittleEndian.Uint32(buf[offset+24 : offset+28])
 			offset += rowSize
 
-			localPort := uint16(localPortRaw & 0xFFFF)
-			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+			localPort := tablePortToHost(localPortRaw)
 
 			entryIP := net.IP(localIPBytes)
 
@@ -2485,15 +2453,9 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	}
 
 	ip := clientAddr.IP
-	if clientAddr.Port < 0 || clientAddr.Port > 65535 {
-		return 0, "", fmt.Errorf("invalid network port: %d", clientAddr.Port)
-	}
-	port := uint16(clientAddr.Port)
-
-	isIPv4 := ip.To4() != nil
-	family := uint32(AF_INET)
-	if !isIPv4 {
-		family = AF_INET6
+	family, isIPv4, port, err := clientEndpointForTableLookup(ip, clientAddr.Port)
+	if err != nil {
+		return 0, "", fmt.Errorf("PidAndExeForTCP: %w", err)
 	}
 
 	// Fetch the table using the dynamic address family
@@ -2537,8 +2499,7 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 			offset += rowSize
 
 			// Port conversion (Network Byte Order in low 16 bits)
-			localPort := uint16(localPortRaw & 0xFFFF)
-			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+			localPort := tablePortToHost(localPortRaw)
 
 			if localPort == port {
 				// Convert DWORD IP (little-endian) to net.IP
@@ -2573,8 +2534,7 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 			owningPid := binary.LittleEndian.Uint32(buf[offset+52 : offset+56])
 			offset += rowSize
 
-			localPort := uint16(localPortRaw & 0xFFFF)
-			localPort = (localPort>>8)&0xFF | (localPort&0xFF)<<8
+			localPort := tablePortToHost(localPortRaw)
 
 			if localPort == port {
 				entryIP := net.IP(localIPBytes)
@@ -2593,10 +2553,9 @@ func PidAndExeForTCP(clientAddr *net.TCPAddr) (uint32, string, error) {
 	return 0, "", fmt.Errorf("no TCP owner found for %s", clientAddr.String())
 }
 
-// serviceNameCache caches PID→service-names with a short TTL to avoid
-// hammering EnumServicesStatusEx on every packet under high concurrency.
-// This also eliminates the concurrent unsafe-buffer pressure that caused
-// the STATUS_ACCESS_VIOLATION crash under -race load. No, the cause was this: https://github.com/golang/go/issues/77975
+// serviceCacheEntry is one cached PID→service-names result, valid until expiresAt.
+// serviceCache exists to avoid hammering EnumServicesStatusEx on every packet under high concurrency.
+// (It is NOT a fix for the STATUS_ACCESS_VIOLATION crash under -race load, that was: https://github.com/golang/go/issues/77975)
 type serviceCacheEntry struct {
 	names     []string
 	expiresAt time.Time
@@ -2639,7 +2598,7 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 	// Fast path: check cache under lock.
 	serviceCacheMu.Lock()
 	if entry, ok := serviceCache[targetPID]; ok && time.Now().Before(entry.expiresAt) {
-		names := entry.names
+		names := slices.Clone(entry.names) // callers may mutate their copy; never hand out the cached backing array
 		serviceCacheMu.Unlock()
 		return names, nil
 	}
@@ -2661,7 +2620,7 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 		// instead of starting a duplicate, expensive enumeration ourselves.
 		serviceInFlightMu.Unlock()
 		<-inFlight.done
-		return inFlight.names, inFlight.err
+		return slices.Clone(inFlight.names), inFlight.err
 	}
 	inFlight := &serviceLookupInFlight{done: make(chan struct{})}
 	serviceInFlight[targetPID] = inFlight
@@ -2694,9 +2653,16 @@ func GetServiceNamesFromPIDCached(targetPID uint32) ([]string, error) {
 					delete(serviceCache, pid)
 				}
 			}
+			// Still full of unexpired entries: evict arbitrary ones so the map stays bounded.
+			for pid := range serviceCache {
+				if len(serviceCache) < serviceCacheMaxEntries {
+					break
+				}
+				delete(serviceCache, pid)
+			}
 		}
 		serviceCache[targetPID] = serviceCacheEntry{
-			names:     names,
+			names:     slices.Clone(names), // the leader returns 'names' itself, so the cache needs its own copy
 			expiresAt: time.Now().Add(serviceCacheTTL),
 		}
 		serviceCacheMu.Unlock()
@@ -2757,8 +2723,11 @@ func InjectConsoleKey(vkCode, scanCode uint16, char rune) error {
 		uintptr(1),
 		uintptr(unsafe.Pointer(&written)),
 	)
-	if res1.Failed() || written != 1 {
-		return fmt.Errorf("InjectConsoleKey failed, written %d, err: %w", written, res1.Err)
+	if res1.Failed() {
+		return fmt.Errorf("InjectConsoleKey failed, written %d: %w", written, res1.Err)
+	}
+	if written != 1 {
+		return fmt.Errorf("InjectConsoleKey: WriteConsoleInputW reported success but wrote %d event(s) instead of 1", written)
 	}
 
 	return nil
@@ -2859,7 +2828,16 @@ type GenericSafeFileWriter struct {
 	liveLogger     *atomic.Pointer[slog.Logger]
 }
 
+// sanitizeRetryParams clamps the retry knobs into a sane range: a negative maxRetries would make
+// 1+maxRetries <= 0 (RetryFileOp panics on that) and absurd values would overflow 1+maxRetries or
+// time.Duration(retryBackoffMs)*time.Millisecond.
+func sanitizeRetryParams(maxRetries, retryBackoffMs int) (int, int) {
+	const maxRetriesCap, maxBackoffMsCap = 1000, 60_000
+	return min(max(maxRetries, 0), maxRetriesCap), min(max(retryBackoffMs, 0), maxBackoffMsCap)
+}
+
 func NewGenericSafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	maxRetries, retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 	return &GenericSafeFileWriter{
 		extraSafety:    extraSafety,
 		maxRetries:     maxRetries,
@@ -3228,6 +3206,7 @@ type win11SafeFileWriter struct {
 }
 
 func NewWin11SafeFileWriter(extraSafety bool, maxRetries, retryBackoffMs int, liveLogger *atomic.Pointer[slog.Logger]) FileWriter {
+	maxRetries, retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 	return &win11SafeFileWriter{
 		extraSafety:    extraSafety,
 		maxRetries:     maxRetries,
@@ -3376,15 +3355,13 @@ func (fw *win11SafeFileWriter) SafeWriteFile(filename string, data []byte, perm 
 func (fw *GenericSafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
 	fw.paramsMu.Lock()
 	defer fw.paramsMu.Unlock()
-	fw.maxRetries = maxRetries
-	fw.retryBackoffMs = retryBackoffMs
+	fw.maxRetries, fw.retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 }
 
 func (fw *win11SafeFileWriter) SetRetryParams(maxRetries, retryBackoffMs int) {
 	fw.paramsMu.Lock()
 	defer fw.paramsMu.Unlock()
-	fw.maxRetries = maxRetries
-	fw.retryBackoffMs = retryBackoffMs
+	fw.maxRetries, fw.retryBackoffMs = sanitizeRetryParams(maxRetries, retryBackoffMs)
 }
 
 // Hooks for testing. In production, these point to the standard OS/wincoe functions.
@@ -3419,7 +3396,11 @@ var (
 // A nil h or a zero *h is treated as "nothing to close" and is a silent
 // no-op.
 func CloseHandleLogged(h *windows.Handle, context string) {
-	if h == nil || *h == 0 {
+	if h == nil {
+		return
+	}
+	if *h == 0 || *h == windows.InvalidHandle {
+		*h = 0
 		return
 	}
 	saved := *h
@@ -3738,7 +3719,7 @@ func GetLastError() error {
 	return windows.GetLastError() //nolint:wrapcheck //on-purpose wrapper over this! kept here on purpose but never reached!
 }
 
-// SetLastError wraps windows.GetLastError.
+// SetLastError is a deliberately unusable stub (it always panics).
 //
 // Deprecated: Do not call this. Go erases thread-local error state prior to
 // syscall execution(ie. runs SetLastError(0)). Always read the 3rd return value (err) from LazyProc.Call().
@@ -3762,7 +3743,7 @@ const (
 // Return 1 (TRUE) if the event was handled, or 0 (FALSE) to pass it to the next handler.
 type ConsoleCtrlHandler func(ctrlType uint32) uintptr
 
-// RegisterCtrlHandler registers or unregisters a custom Windows console control handler.
+// setCtrlHandler registers or unregisters a custom Windows console control handler.
 // Pass true to add the handler (equivalent to passing 1), or false to remove it.
 //
 // The handler argument is expected to be a function with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
@@ -3776,12 +3757,10 @@ type ConsoleCtrlHandler func(ctrlType uint32) uintptr
 // is never garbage-collected. Passing dynamic closures will eventually exhaust Go's internal
 // callback pool (~2,000 max) and panic the runtime. Named functions are cached and memory-safe.
 func setCtrlHandler(handler ConsoleCtrlHandler, add bool) WinResult {
-	var addVal uintptr = 0
-	if add {
-		addVal = 1
+	if handler == nil {
+		return WinResult{Err: errors.New("setCtrlHandler: nil handler")}
 	}
-
-	return procSetConsoleCtrlHandler.Call(windows.NewCallback(handler), addVal)
+	return procSetConsoleCtrlHandler.Call(windows.NewCallback(handler), boolToUintptr(add))
 }
 
 // RegisterCtrlHandler registers a custom Windows console control handler.
@@ -4075,8 +4054,6 @@ const DWMWA_CLOAKED = 14
 // to a monitor's work-area edge) should use the difference between this and
 // GetWindowRect rather than GetWindowRect alone, or the alignment will
 // visually undershoot by that padding on three of the four sides.
-//
-//go:uintptrescapes
 func DwmGetExtendedFrameBounds(hwnd windows.Handle) (RECT, error) {
 	var r RECT
 	res := procDwmGetWindowAttribute.Call(
@@ -4226,6 +4203,9 @@ type HookProc func(nCode int32, wParam uintptr, lParam unsafe.Pointer) (LRESULT 
 // is never garbage-collected. Passing dynamic closures will eventually exhaust Go's internal
 // callback pool (~2,000 max) and panic the runtime. Named functions are cached and memory-safe.
 func SetWindowsHookEx(idHook int32, lpfn HookProc, hmod windows.Handle, dwThreadId uint32) (windows.Handle, WinResult) {
+	if lpfn == nil {
+		return 0, WinResult{Err: errors.New("SetWindowsHookEx: nil hook procedure")}
+	}
 	res := procSetWindowsHookEx.Call(
 		// #nosec G115
 		uintptr(idHook),
@@ -4356,7 +4336,10 @@ func WindowFromPoint(pt POINT) windows.Handle {
 	*/
 	//This passes the exact 64-bit bit pattern of X and Y packed together into the CPU register (RCX),
 	//  perfectly matching the C ABI expectation without triggering any heap allocations.
-	res := procWindowFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt))) //it's CheckNone (for good reason) so you can't use res.Failed() here.
+	// Pack X (low dword) and Y (high dword) by value instead of reinterpreting &pt as *uintptr: POINT only has 4-byte
+	// alignment, so that cast can be a misaligned-pointer conversion, which -race/-d=checkptr builds panic on.
+	packed := uintptr(uint32(pt.X)) | uintptr(uint32(pt.Y))<<32 // #nosec G115 -- intentional bit reinterpretation of the signed coordinates
+	res := procWindowFromPoint.Call(packed)                     //it's CheckNone (for good reason) so you can't use res.Failed() here.
 	//XXX: don't need a WindowFromPointRaw because GetLastError() is never set! "According to Microsoft documentation, WindowFromPoint does not set a last-error code on failure."
 
 	return windows.Handle(res.R1)
@@ -4461,11 +4444,7 @@ func DrawText(hdc windows.Handle, text *uint16, length int32, rect *RECT, format
 // 1 (TRUE) tells Windows: "Clear the old drawing/background first so we can draw a fresh frame."
 // * 0 (FALSE) would mean leave whatever is currently drawn on the screen intact underneath, which is typically only used if you are drawing over it completely or doing custom double-buffered rendering where you manage every single pixel yourself.
 func InvalidateRect(hwnd windows.Handle, rect *RECT, erase bool) WinResult {
-	var erasePtr uintptr
-	if erase {
-		erasePtr = 1
-	}
-	return procInvalidateRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)), erasePtr)
+	return procInvalidateRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(rect)), boolToUintptr(erase))
 }
 
 // HasUpdateRegion reports whether hwnd currently has a non-empty update
@@ -5011,13 +4990,10 @@ const (
 // CreateWindowEx creates an overlapped, pop-up, or child window with an extended window style.
 func CreateWindowEx(
 	dwExStyle uint32,
-	lpClassName *uint16,
-	lpWindowName *uint16,
+	lpClassName, lpWindowName *uint16,
 	dwStyle uint32,
 	x, y, nWidth, nHeight int32,
-	hWndParent windows.Handle,
-	hMenu windows.Handle,
-	hInstance windows.Handle,
+	hWndParent, hMenu, hInstance windows.Handle,
 	lpParam unsafe.Pointer,
 ) WinResult {
 	res := procCreateWindowEx.Call(
@@ -5119,8 +5095,8 @@ func TrackPopupMenuWithoutReturnCmd(
 		panic2("BUG: you called TrackPopupMenuWithoutReturnCmd with TPM_RETURNCMD!")
 		panic(nil)
 	}
-	// Ensure TPM_RETURNCMD is NOT set
-	uFlags &^= TPM_RETURNCMD
+	//// Ensure TPM_RETURNCMD is NOT set, it isn't because it panics above if it is!
+	//uFlags &^= TPM_RETURNCMD
 
 	return procTrackPopupMenuBool.Call(
 		uintptr(hMenu),
@@ -5256,14 +5232,10 @@ func InitDPIAwareness(loggerFunction func(format string, args ...any)) {
 //
 // if fAttach is false it means detach.
 func AttachThreadInput(idAttach, idAttachTo uint32, fAttach bool) WinResult {
-	var attach uintptr
-	if fAttach {
-		attach = 1
-	}
 	return procAttachThreadInput.Call(
 		uintptr(idAttach),
 		uintptr(idAttachTo),
-		attach,
+		boolToUintptr(fAttach),
 	)
 }
 
@@ -5724,13 +5696,9 @@ func GetWindowLongPtrW(hwnd windows.Handle, nIndex int32) WinResult { //uintptr 
 //
 // bInitialOwner should be true aka "You must acquire ownership of the mutex before you can release it." otherwise you cannot call ReleaseMutex on it, unless you use WaitForSingleObject (currently not defined in wincoe!)
 func CreateMutex(lpMutexAttributes unsafe.Pointer, bInitialOwner bool, lpName *uint16) (windows.Handle, WinResult) {
-	var initialOwner uintptr
-	if bInitialOwner {
-		initialOwner = 1
-	}
 	res := procCreateMutex.Call(
 		uintptr(lpMutexAttributes),
-		initialOwner,
+		boolToUintptr(bInitialOwner),
 		uintptr(unsafe.Pointer(lpName)),
 	)
 	return windows.Handle(res.R1), res
@@ -5797,8 +5765,12 @@ func QueryWorkingSetEx(hProcess windows.Handle, entries []PSAPI_WORKING_SET_EX_I
 		panic2(fmt.Sprintf("BUG: slice length %d exceeds maximum uint32 size of %d", l, math.MaxUint32))
 	}
 
-	// Automatically calculate total size in bytes for the entire slice
-	cb := uint32(l) * uint32(unsafe.Sizeof(entries[0]))
+	// Automatically calculate total size in bytes for the entire slice (in uint64: l*16 can overflow uint32 even though l fits)
+	totalBytes := uint64(l) * uint64(unsafe.Sizeof(entries[0]))
+	if totalBytes > math.MaxUint32 {
+		panic2(fmt.Sprintf("BUG: QueryWorkingSetEx: %d entries need %d bytes, which exceeds the maximum uint32 size of %d", l, totalBytes, uint64(math.MaxUint32)))
+	}
+	cb := uint32(totalBytes)
 
 	res := QueryWorkingSetExRaw(
 		hProcess,
@@ -5859,13 +5831,9 @@ func AdjustTokenPrivileges(
 	previousState *TOKEN_PRIVILEGES,
 	returnLength *uint32,
 ) WinResult {
-	var disableAll uintptr
-	if disableAllPrivileges {
-		disableAll = 1
-	}
 	return procAdjustTokenPrivileges.Call(
 		uintptr(tokenHandle),
-		disableAll,
+		boolToUintptr(disableAllPrivileges),
 		uintptr(unsafe.Pointer(newState)),
 		uintptr(bufferLength),
 		uintptr(unsafe.Pointer(previousState)),
@@ -6033,6 +6001,9 @@ func SetWinEventHook(
 	pfnWinEventProc WinEventProc,
 	idProcess, idThread, dwFlags uint32,
 ) (windows.Handle, WinResult) {
+	if pfnWinEventProc == nil {
+		return 0, WinResult{Err: errors.New("SetWinEventHook: nil event procedure")}
+	}
 	res := procSetWinEventHook.Call(
 		uintptr(eventMin),
 		uintptr(eventMax),
@@ -6297,32 +6268,32 @@ type MIB_IPADDRTABLE struct {
 
 // GetBestInterface retrieves the index of the interface that has the best route to the specified IPv4 address.
 func GetBestInterface(dwDestAddr uint32, pdwBestIfIndex *uint32) WinResult {
-	return procGetBestInterface.Call(uintptr(dwDestAddr), uintptr(unsafe.Pointer(pdwBestIfIndex)))
+	return errnoInR1Result("GetBestInterface", procGetBestInterface.Call(uintptr(dwDestAddr), uintptr(unsafe.Pointer(pdwBestIfIndex))))
 }
 
 // GetIpForwardTable retrieves the IPv4 routing table.
 func GetIpForwardTable(pIpForwardTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
-	return procGetIPForwardTable.Call(uintptr(pIpForwardTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+	return errnoInR1Result("GetIpForwardTable", procGetIPForwardTable.Call(uintptr(pIpForwardTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder)))
 }
 
 // CreateIpForwardEntry creates a route in the local computer's IPv4 routing table.
 func CreateIpForwardEntry(pRoute unsafe.Pointer) WinResult {
-	return procCreateIPForwardEntry.Call(uintptr(pRoute))
+	return errnoInR1Result("CreateIpForwardEntry", procCreateIPForwardEntry.Call(uintptr(pRoute)))
 }
 
 // DeleteIpForwardEntry deletes an existing route in the local computer's IPv4 routing table.
 func DeleteIpForwardEntry(pRoute unsafe.Pointer) WinResult {
-	return procDeleteIPForwardEntry.Call(uintptr(pRoute))
+	return errnoInR1Result("DeleteIpForwardEntry", procDeleteIPForwardEntry.Call(uintptr(pRoute)))
 }
 
 // GetIfTable retrieves the MIB-II interface table.
 func GetIfTable(pIfTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
-	return procGetIfTable.Call(uintptr(pIfTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+	return errnoInR1Result("GetIfTable", procGetIfTable.Call(uintptr(pIfTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder)))
 }
 
 // GetIpAddrTable retrieves the interface-to-IPv4 address mapping table.
 func GetIpAddrTable(pIpAddrTable unsafe.Pointer, pdwSize *uint32, bOrder bool) WinResult {
-	return procGetIPAddrTable.Call(uintptr(pIpAddrTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder))
+	return errnoInR1Result("GetIpAddrTable", procGetIPAddrTable.Call(uintptr(pIpAddrTable), uintptr(unsafe.Pointer(pdwSize)), boolToUintptr(bOrder)))
 }
 
 // --- SetupAPI Structs and Constants ---
@@ -6431,6 +6402,10 @@ var ReservedFileNames = map[string]struct{}{
 	"COM6": {}, "COM7": {}, "COM8": {}, "COM9": {},
 	"LPT1": {}, "LPT2": {}, "LPT3": {}, "LPT4": {}, "LPT5": {},
 	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
+	"COM0": {}, "LPT0": {},
+	"COM¹": {}, "COM²": {}, "COM³": {},
+	"LPT¹": {}, "LPT²": {}, "LPT³": {},
+	"CONIN$": {}, "CONOUT$": {},
 }
 
 // IsWindowsReservedFileName checks if a filename uses a Windows reserved device name.
@@ -6442,9 +6417,12 @@ func IsWindowsReservedFileName(name string) bool {
 	// Windows device names remain reserved when followed by an extension:
 	// CON.txt, COM1.log, NUL.foo, etc. Only the device-name stem matters.
 	stem := baseName
-	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
-		stem = stem[:dot]
+	// '.' starts an extension and ':' an NTFS alternate data stream ("NUL:foo" is still the NUL device);
+	// trailing spaces before either are stripped by Windows too ("NUL .txt").
+	if cut := strings.IndexAny(stem, ".:"); cut >= 0 {
+		stem = stem[:cut]
 	}
+	stem = strings.TrimRight(stem, " ")
 
 	_, reserved := ReservedFileNames[stem]
 	return reserved
